@@ -53,6 +53,7 @@ pub(crate) fn parse_startup_args() -> Result<LdkUserInfo, AppError> {
 
     let network = args.network;
     let supported_networks = [BitcoinNetwork::Testnet, BitcoinNetwork::Regtest, BitcoinNetwork::Signet];
+    
     if !supported_networks.contains(&network) {
         return Err(AppError::UnsupportedBitcoinNetwork);
     }
