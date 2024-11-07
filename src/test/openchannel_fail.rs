@@ -22,6 +22,33 @@ async fn open_fail() {
 
     let node2_pubkey = node2_info.pubkey;
 
+    // open with unknown asset
+    let payload = OpenChannelRequest {
+        peer_pubkey_and_opt_addr: format!("{}@127.0.0.1:{}", node2_pubkey, NODE2_PEER_PORT),
+        capacity_sat: 100_000,
+        push_msat: 3_500_000,
+        asset_amount: Some(100),
+        asset_id: Some(s!("rgb:EIkAVQvq-WbAb5JG-CYxbUER-oqDNwne-ZNxBDID-p0cpf9U")),
+        public: true,
+        with_anchors: true,
+        fee_base_msat: None,
+        fee_proportional_millionths: None,
+        temporary_channel_id: None,
+    };
+    let res = reqwest::Client::new()
+        .post(format!("http://{}/openchannel", node1_addr))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    check_response_is_nok(
+        res,
+        reqwest::StatusCode::FORBIDDEN,
+        "Unknown RGB contract ID",
+        "UnknownContractId",
+    )
+    .await;
+
     // open with bad asset amount
     let payload = OpenChannelRequest {
         peer_pubkey_and_opt_addr: format!("{}@127.0.0.1:{}", node2_pubkey, NODE2_PEER_PORT),
@@ -45,6 +72,7 @@ async fn open_fail() {
         res,
         reqwest::StatusCode::BAD_REQUEST,
         "Invalid amount: Channel RGB amount must be equal to or higher than 1",
+        "InvalidAmount",
     )
     .await;
 
@@ -76,6 +104,7 @@ async fn open_fail() {
         res,
         reqwest::StatusCode::BAD_REQUEST,
         "Invalid asset ID: bad asset ID",
+        "InvalidAssetID",
     )
     .await;
 
@@ -107,6 +136,7 @@ async fn open_fail() {
         res,
         reqwest::StatusCode::BAD_REQUEST,
         "Invalid amount: Channel amount must be equal to or higher than 5506 sats",
+        "InvalidAmount",
     )
     .await;
 
@@ -138,6 +168,7 @@ async fn open_fail() {
         res,
         reqwest::StatusCode::BAD_REQUEST,
         "Invalid amount: Channel amount must be equal to or less than 16777215 sats",
+        "InvalidAmount",
     )
     .await;
 
@@ -169,6 +200,41 @@ async fn open_fail() {
         res,
         reqwest::StatusCode::BAD_REQUEST,
         "Anchor outputs are required for RGB channels",
+        "AnchorsRequired",
+    )
+    .await;
+
+    let channels_1 = list_channels(node1_addr).await;
+    let channels_2 = list_channels(node2_addr).await;
+    assert_eq!(channels_1.len(), 0);
+    assert_eq!(channels_2.len(), 0);
+
+    // open with insufficient capacity
+    println!("setting MOCK_FEE");
+    *MOCK_FEE.lock().unwrap() = Some(5000);
+    let payload = OpenChannelRequest {
+        peer_pubkey_and_opt_addr: format!("{}@127.0.0.1:{}", node2_pubkey, NODE2_PEER_PORT),
+        capacity_sat: 5506,
+        push_msat: 0,
+        asset_amount: None,
+        asset_id: None,
+        public: true,
+        with_anchors: true,
+        fee_base_msat: None,
+        fee_proportional_millionths: None,
+        temporary_channel_id: None,
+    };
+    let res = reqwest::Client::new()
+        .post(format!("http://{}/openchannel", node1_addr))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    check_response_is_nok(
+        res,
+        reqwest::StatusCode::FORBIDDEN,
+        "Insufficient capacity to cover the commitment transaction fees (9920 sat)",
+        "InsufficientCapacity",
     )
     .await;
 
@@ -196,7 +262,13 @@ async fn open_fail() {
         .send()
         .await
         .unwrap();
-    check_response_is_nok(res, reqwest::StatusCode::FORBIDDEN, "Not enough assets").await;
+    check_response_is_nok(
+        res,
+        reqwest::StatusCode::FORBIDDEN,
+        "Not enough assets",
+        "InsufficientAssets",
+    )
+    .await;
 
     let channels_1 = list_channels(node1_addr).await;
     let channels_2 = list_channels(node2_addr).await;
@@ -225,7 +297,8 @@ async fn open_fail() {
     check_response_is_nok(
         res,
         reqwest::StatusCode::FORBIDDEN,
-        "Cannot open channel: InsufficientAllocationSlots",
+        "No uncolored UTXOs are available (hint: call createutxos)",
+        "NoAvailableUtxos",
     )
     .await;
 
@@ -253,7 +326,13 @@ async fn open_fail() {
         .send()
         .await
         .unwrap();
-    check_response_is_nok(res, reqwest::StatusCode::BAD_REQUEST, "Invalid channel ID").await;
+    check_response_is_nok(
+        res,
+        reqwest::StatusCode::BAD_REQUEST,
+        "Invalid channel ID",
+        "InvalidChannelID",
+    )
+    .await;
 
     let channels_1 = list_channels(node1_addr).await;
     let channels_2 = list_channels(node2_addr).await;
@@ -304,6 +383,7 @@ async fn open_fail() {
         res,
         reqwest::StatusCode::FORBIDDEN,
         "Cannot perform this operation while an open channel operation is in progress",
+        "OpenChannelInProgress",
     )
     .await;
 

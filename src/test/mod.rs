@@ -1,5 +1,6 @@
 use amplify::s;
 use electrum_client::ElectrumApi;
+use lazy_static::lazy_static;
 use lightning_invoice::Bolt11Invoice;
 use once_cell::sync::Lazy;
 use rgb_lib::BitcoinNetwork;
@@ -7,7 +8,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
-use std::sync::{Once, RwLock};
+use std::sync::{Mutex, Once, RwLock};
 use time::OffsetDateTime;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
@@ -87,11 +88,13 @@ async fn check_response_is_nok(
     res: reqwest::Response,
     expected_status: reqwest::StatusCode,
     expected_message: &str,
+    expected_name: &str,
 ) {
     assert_eq!(res.status(), expected_status);
     let api_error_response = res.json::<APIErrorResponse>().await.unwrap();
     assert_eq!(api_error_response.code, expected_status.as_u16());
     assert_eq!(api_error_response.error, expected_message);
+    assert_eq!(api_error_response.name, expected_name);
 }
 
 fn _fund_wallet(address: String) {
@@ -1187,6 +1190,7 @@ async fn send_asset(node_address: SocketAddr, asset_id: &str, amount: u64, recip
         fee_rate: FEE_RATE,
         min_confirmations: 1,
         transport_endpoints: vec![PROXY_ENDPOINT_REGTEST.to_string()],
+        skip_sync: false,
     };
     let res = reqwest::Client::new()
         .post(format!("http://{}/sendasset", node_address))
@@ -1591,6 +1595,20 @@ pub(crate) fn initialize() {
             panic!("failed to start test services");
         }
     });
+}
+
+lazy_static! {
+    static ref MOCK_FEE: Mutex<Option<u32>> = Mutex::new(None);
+}
+
+pub fn mock_fee(fee: u32) -> u32 {
+    let mock = MOCK_FEE.lock().unwrap().take();
+    if let Some(fee) = mock {
+        println!("mocking fee");
+        fee
+    } else {
+        fee
+    }
 }
 
 mod backup_and_restore;

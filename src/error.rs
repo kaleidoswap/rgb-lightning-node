@@ -11,12 +11,13 @@ use serde::{Deserialize, Serialize};
 pub(crate) struct APIErrorResponse {
     pub(crate) error: String,
     pub(crate) code: u16,
+    pub(crate) name: String,
 }
 
 /// The error variants returned by APIs
 #[derive(Debug, thiserror::Error)]
 pub enum APIError {
-    #[error("Allocacations already available")]
+    #[error("Allocations already available")]
     AllocationsAlreadyAvailable,
 
     #[error("Node has already been initialized")]
@@ -33,9 +34,6 @@ pub enum APIError {
 
     #[error("Batch transfer cannot be set to failed status")]
     CannotFailBatchTransfer,
-
-    #[error("Cannot open channel: {0}")]
-    CannotOpenChannel(String),
 
     #[error("Cannot call other APIs while node is changing state")]
     ChangingState,
@@ -91,7 +89,10 @@ pub enum APIError {
     #[error("Not enough assets")]
     InsufficientAssets,
 
-    #[error("Not enough funds, call getaddress and send {0} satoshis")]
+    #[error("Insufficient capacity to cover the commitment transaction fees ({0} sat)")]
+    InsufficientCapacity(u64),
+
+    #[error("Not enough funds, get an address and send {0} sats there")]
     InsufficientFunds(u64),
 
     #[error("Invalid amount: {0}")]
@@ -242,12 +243,20 @@ pub enum APIError {
     WrongPassword,
 }
 
+impl APIError {
+    fn name(&self) -> String {
+        format!("{:?}", self).split('(').next().unwrap().to_string()
+    }
+}
+
 impl IntoResponse for APIError {
     fn into_response(self) -> Response {
-        let (status, error_message) = match self {
-            APIError::JsonExtractorRejection(json_rejection) => {
-                (json_rejection.status(), json_rejection.body_text())
-            }
+        let (status, error, name) = match self {
+            APIError::JsonExtractorRejection(ref json_rejection) => (
+                json_rejection.status(),
+                json_rejection.body_text(),
+                self.name(),
+            ),
             APIError::FailedClosingChannel(_)
             | APIError::FailedInvoiceCreation(_)
             | APIError::FailedIssuingAsset(_)
@@ -260,7 +269,11 @@ impl IntoResponse for APIError {
             | APIError::FailedSendingOnionMessage(_)
             | APIError::FailedStartingLDK(_)
             | APIError::IO(_)
-            | APIError::Unexpected => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
+            | APIError::Unexpected => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                self.to_string(),
+                self.name(),
+            ),
             APIError::AnchorsRequired
             | APIError::ExpiredSwapOffer
             | APIError::IncompleteRGBInfo
@@ -291,20 +304,20 @@ impl IntoResponse for APIError {
             | APIError::MissingSwapPaymentPreimage
             | APIError::OutputBelowDustLimit
             | APIError::UnsupportedBackupVersion { .. } => {
-                (StatusCode::BAD_REQUEST, self.to_string())
+                (StatusCode::BAD_REQUEST, self.to_string(), self.name())
             }
-            APIError::WrongPassword => (StatusCode::UNAUTHORIZED, self.to_string()),
+            APIError::WrongPassword => (StatusCode::UNAUTHORIZED, self.to_string(), self.name()),
             APIError::AllocationsAlreadyAvailable
             | APIError::AlreadyInitialized
             | APIError::BatchTransferNotFound
             | APIError::CannotEstimateFees
             | APIError::CannotFailBatchTransfer
-            | APIError::CannotOpenChannel(_)
             | APIError::ChangingState
             | APIError::FailedBroadcast(_)
             | APIError::FailedBitcoindConnection(_)
             | APIError::Indexer(_)
             | APIError::InsufficientAssets
+            | APIError::InsufficientCapacity(_)
             | APIError::InsufficientFunds(_)
             | APIError::InvalidIndexer(_)
             | APIError::InvalidProxyEndpoint
@@ -322,13 +335,14 @@ impl IntoResponse for APIError {
             | APIError::UnknownContractId
             | APIError::UnknownLNInvoice
             | APIError::UnknownTemporaryChannelId
-            | APIError::UnlockedNode => (StatusCode::FORBIDDEN, self.to_string()),
+            | APIError::UnlockedNode => (StatusCode::FORBIDDEN, self.to_string(), self.name()),
         };
 
         let body = Json(
             serde_json::to_value(APIErrorResponse {
-                error: error_message,
+                error,
                 code: status.as_u16(),
+                name,
             })
             .unwrap(),
         );
