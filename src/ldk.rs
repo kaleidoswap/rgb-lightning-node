@@ -1,4 +1,4 @@
-use amplify::map;
+use amplify::{map, s};
 use bitcoin::blockdata::locktime::absolute::LockTime;
 use bitcoin::network::constants::Network;
 use bitcoin::psbt::Psbt;
@@ -13,6 +13,7 @@ use lightning::ln::channelmanager::{self, PaymentId, RecentPaymentDetails};
 use lightning::ln::channelmanager::{
     ChainParameters, ChannelManagerReadArgs, SimpleArcChannelManager,
 };
+use lightning::ln::msgs::SocketAddress;
 use lightning::ln::peer_handler::{IgnoringMessageHandler, MessageHandler, SimpleArcPeerManager};
 use lightning::ln::{ChannelId, PaymentHash, PaymentPreimage, PaymentSecret};
 use lightning::onion_message::messenger::{DefaultMessageRouter, SimpleArcOnionMessenger};
@@ -55,8 +56,8 @@ use rgb_lib::{
     utils::{get_account_xpub, recipient_id_from_script_buf, script_buf_from_recipient_id},
     wallet::{
         rust_only::{check_indexer_url, AssetColoringInfo, ColoringInfo},
-        AssetIface, DatabaseType, Outpoint, Recipient, TransportEndpoint, Wallet as RgbLibWallet,
-        WalletData, WitnessData,
+        DatabaseType, Outpoint, Recipient, TransportEndpoint, Wallet as RgbLibWallet, WalletData,
+        WitnessData,
     },
     AssetSchema, BitcoinNetwork, ConsignmentExt, ContractId, FileContent, RgbTransfer,
 };
@@ -87,8 +88,8 @@ use crate::rgb::{check_rgb_proxy_endpoint, get_rgb_channel_info_optional, RgbLib
 use crate::routes::{HTLCStatus, SwapStatus, UnlockRequest, DUST_LIMIT_MSAT};
 use crate::swap::SwapData;
 use crate::utils::{
-    connect_peer_if_necessary, do_connect_peer, get_current_timestamp, hex_str, AppState,
-    StaticState, UnlockedAppState, ELECTRUM_URL_REGTEST, ELECTRUM_URL_TESTNET,
+    check_port_is_available, connect_peer_if_necessary, do_connect_peer, get_current_timestamp,
+    hex_str, AppState, StaticState, UnlockedAppState, ELECTRUM_URL_REGTEST, ELECTRUM_URL_TESTNET,
     PROXY_ENDPOINT_REGTEST, PROXY_ENDPOINT_TESTNET,
 };
 
@@ -595,6 +596,7 @@ async fn handle_ldk_events(
             {
                 tracing::error!(
                         "ERROR: Channel went away before we could fund it. The peer disconnected or refused the channel.");
+                *unlocked_state.rgb_send_lock.lock().unwrap() = false;
             }
         }
         Event::PaymentClaimable {
@@ -1014,6 +1016,10 @@ async fn handle_ldk_events(
         Event::DiscardFunding { channel_id, .. } => {
             // A "real" node should probably "lock" the UTXOs spent in funding transactions until
             // the funding transaction either confirms, or this event is generated.
+            tracing::info!(
+                "EVENT: Discarded funding for channel with ID {}",
+                channel_id
+            );
 
             *unlocked_state.rgb_send_lock.lock().unwrap() = false;
 
@@ -1288,7 +1294,6 @@ impl OutputSpender for RgbOutputSpender {
             asset_info_map.insert(
                 contract_id,
                 AssetColoringInfo {
-                    iface: AssetIface::RGB20,
                     output_map: HashMap::from_iter([(vout, amt_rgb)]),
                     input_outpoints,
                     static_blinding: None,
@@ -1378,8 +1383,6 @@ pub(crate) async fn start_ldk(
     let bitcoin_network = static_state.network;
     let network: Network = bitcoin_network.into();
     let ldk_peer_listening_port = static_state.ldk_peer_listening_port;
-    let ldk_announced_listen_addr = static_state.ldk_announced_listen_addr.clone();
-    let ldk_announced_node_name = static_state.ldk_announced_node_name;
 
     // Initialize our bitcoind client.
     let bitcoind_client = match BitcoindClient::new(
@@ -1615,9 +1618,7 @@ pub(crate) async fn start_ldk(
     })
     .await
     .unwrap();
-    let rgb_online = rgb_wallet
-        .go_online(false, indexer_url.to_string())
-        .map_err(|e| APIError::FailedStartingLDK(e.to_string()))?;
+    let rgb_online = rgb_wallet.go_online(false, indexer_url.to_string())?;
     fs::write(
         static_state.storage_dir_path.join(WALLET_FINGERPRINT_FNAME),
         account_xpub.fingerprint().to_string(),
@@ -1719,14 +1720,29 @@ pub(crate) async fn start_ldk(
             ));
         }
 
-        init::synchronize_listeners(
-            bitcoind_client.as_ref(),
-            network,
-            &mut cache,
-            chain_listeners,
-        )
-        .await
-        .unwrap()
+        let mut attempts = 3;
+        loop {
+            match init::synchronize_listeners(
+                bitcoind_client.as_ref(),
+                network,
+                &mut cache,
+                chain_listeners.clone(),
+            )
+            .await
+            {
+                Ok(res) => break res,
+                Err(e) => {
+                    tracing::error!("Error synchronizing chain: {:?}", e);
+                    attempts -= 1;
+                    if attempts == 0 {
+                        return Err(APIError::FailedBitcoindConnection(
+                            e.into_inner().to_string(),
+                        ));
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
     } else {
         polled_chain_tip
     };
@@ -1836,7 +1852,9 @@ pub(crate) async fn start_ldk(
             if stop_listen.load(Ordering::Acquire) {
                 return;
             }
-            spv_client.poll_best_tip().await.unwrap();
+            if let Err(e) = spv_client.poll_best_tip().await {
+                tracing::error!("Error while polling best tip: {:?}", e);
+            }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
@@ -1984,6 +2002,32 @@ pub(crate) async fn start_ldk(
 
     // Regularly broadcast our node_announcement. This is only required (or possible) if we have
     // some public channels.
+    let mut ldk_announced_listen_addr = Vec::new();
+    for addr in unlock_request.announce_addresses {
+        match SocketAddress::from_str(&addr) {
+            Ok(sa) => {
+                ldk_announced_listen_addr.push(sa);
+            }
+            Err(_) => {
+                return Err(APIError::InvalidAnnounceAddresses(format!(
+                    "failed to parse address '{addr}'"
+                )))
+            }
+        }
+    }
+    let ldk_announced_node_name = match unlock_request.announce_alias {
+        Some(s) => {
+            if s.len() > 32 {
+                return Err(APIError::InvalidAnnounceAlias(s!(
+                    "cannot be longer than 32 bytes"
+                )));
+            }
+            let mut bytes = [0; 32];
+            bytes[..s.len()].copy_from_slice(s.as_bytes());
+            bytes
+        }
+        None => [0; 32],
+    };
     let peer_man = Arc::clone(&peer_manager);
     let chan_man = Arc::clone(&channel_manager);
     tokio::spawn(async move {
@@ -2058,12 +2102,9 @@ pub(crate) async fn stop_ldk(app_state: Arc<AppState>) {
     }
 
     // connect to the peer port so it can be released
-    let peer_port = &app_state.static_state.ldk_peer_listening_port;
-    let sock_addr = SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-        *peer_port,
-    );
-    let _ = std::net::TcpStream::connect(sock_addr);
+    let peer_port = app_state.static_state.ldk_peer_listening_port;
+    let sock_addr = SocketAddr::from(([127, 0, 0, 1], peer_port));
+    let _ = check_port_is_available(peer_port);
     // check the peer port has been released
     let t_0 = OffsetDateTime::now_utc();
     loop {

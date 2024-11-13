@@ -3,6 +3,7 @@ use electrum_client::ElectrumApi;
 use lazy_static::lazy_static;
 use lightning_invoice::Bolt11Invoice;
 use once_cell::sync::Lazy;
+use reqwest::Response;
 use rgb_lib::BitcoinNetwork;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -54,8 +55,6 @@ static MINER: Lazy<RwLock<Miner>> = Lazy::new(|| RwLock::new(Miner { no_mine_cou
 impl Default for LdkUserInfo {
     fn default() -> Self {
         Self {
-            ldk_announced_listen_addr: vec![],
-            ldk_announced_node_name: [0; 32],
             network: BitcoinNetwork::Regtest,
             storage_dir_path: PathBuf::from("tmp/test_name/nodeN"),
             daemon_listening_port: 3001,
@@ -77,7 +76,7 @@ fn _bitcoin_cli() -> [String; 7] {
     ]
 }
 
-async fn _check_response_is_ok(res: reqwest::Response) -> reqwest::Response {
+async fn _check_response_is_ok(res: Response) -> Response {
     if res.status() != reqwest::StatusCode::OK {
         panic!("reqwest response is not OK: {:?}", res.text().await);
     }
@@ -85,7 +84,7 @@ async fn _check_response_is_ok(res: reqwest::Response) -> reqwest::Response {
 }
 
 async fn check_response_is_nok(
-    res: reqwest::Response,
+    res: Response,
     expected_status: reqwest::StatusCode,
     expected_message: &str,
     expected_name: &str,
@@ -906,7 +905,7 @@ async fn maker_execute_raw(
     swapstring: String,
     payment_secret: String,
     taker_pubkey: String,
-) -> reqwest::Response {
+) -> Response {
     println!("executing swap {swapstring} from node {node_address}");
     let payload = MakerExecuteRequest {
         swapstring,
@@ -1337,7 +1336,7 @@ async fn taker(node_address: SocketAddr, swapstring: String) -> EmptyResponse {
         .unwrap()
 }
 
-async fn unlock(node_address: SocketAddr, password: &str) {
+async fn unlock_res(node_address: SocketAddr, password: &str) -> Response {
     println!("unlocking node {node_address}");
     let payload = UnlockRequest {
         password: password.to_string(),
@@ -1347,13 +1346,20 @@ async fn unlock(node_address: SocketAddr, password: &str) {
         bitcoind_rpc_port: 18443,
         indexer_url: Some(ELECTRUM_URL_REGTEST.to_string()),
         proxy_endpoint: Some(PROXY_ENDPOINT_REGTEST.to_string()),
+        announce_addresses: vec![],
+        announce_alias: Some(s!("RLN_alias")),
     };
-    let res = reqwest::Client::new()
+    reqwest::Client::new()
         .post(format!("http://{}/unlock", node_address))
         .json(&payload)
         .send()
         .await
-        .unwrap();
+        .unwrap()
+}
+
+async fn unlock(node_address: SocketAddr, password: &str) {
+    println!("unlocking node {node_address}");
+    let res = unlock_res(node_address, password).await;
     _check_response_is_ok(res)
         .await
         .json::<EmptyResponse>()

@@ -2,7 +2,6 @@ use amplify::s;
 use bitcoin::secp256k1::PublicKey;
 use futures::Future;
 use lightning::ln::channelmanager::ChannelDetails;
-use lightning::ln::msgs::SocketAddress;
 use lightning::ln::ChannelId;
 use lightning::routing::router::{
     Payee, PaymentParameters, Route, RouteHint, RouteParameters, Router as _,
@@ -19,7 +18,7 @@ use rgb_lib::{bdk::keys::bip39::Mnemonic, BitcoinNetwork, ContractId};
 use std::{
     fmt::Write,
     fs,
-    net::{SocketAddr, ToSocketAddrs},
+    net::{SocketAddr, TcpStream, ToSocketAddrs},
     path::Path,
     path::PathBuf,
     str::FromStr,
@@ -77,8 +76,6 @@ impl AppState {
 
 pub(crate) struct StaticState {
     pub(crate) ldk_peer_listening_port: u16,
-    pub(crate) ldk_announced_listen_addr: Vec<SocketAddress>,
-    pub(crate) ldk_announced_node_name: [u8; 32],
     pub(crate) network: BitcoinNetwork,
     pub(crate) storage_dir_path: PathBuf,
     pub(crate) ldk_data_dir: PathBuf,
@@ -187,6 +184,13 @@ pub(crate) fn check_channel_id(channel_id_str: &str) -> Result<ChannelId, APIErr
     } else {
         Err(APIError::InvalidChannelID)
     }
+}
+
+pub(crate) fn check_port_is_available(port: u16) -> Result<(), AppError> {
+    if TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port))).is_ok() {
+        return Err(AppError::UnavailablePort(port));
+    }
+    Ok(())
 }
 
 pub(crate) fn get_mnemonic_path(storage_dir_path: &Path) -> PathBuf {
@@ -343,8 +347,6 @@ pub(crate) async fn start_daemon(args: &LdkUserInfo) -> Result<Arc<AppState>, Ap
 
     let static_state = Arc::new(StaticState {
         ldk_peer_listening_port: args.ldk_peer_listening_port,
-        ldk_announced_listen_addr: args.ldk_announced_listen_addr.clone(),
-        ldk_announced_node_name: args.ldk_announced_node_name,
         network: args.network,
         storage_dir_path: args.storage_dir_path.clone(),
         ldk_data_dir,

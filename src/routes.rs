@@ -9,7 +9,6 @@ use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Network, ScriptBuf};
 use hex::DisplayHex;
-use lightning::impl_writeable_tlv_based_enum;
 use lightning::ln::ChannelId;
 use lightning::offers::offer::{self, Offer};
 use lightning::onion_message::messenger::Destination;
@@ -21,6 +20,7 @@ use lightning::routing::gossip::RoutingFees;
 use lightning::routing::router::{Path as LnPath, Route, RouteHint, RouteHintHop};
 use lightning::sign::EntropySource;
 use lightning::util::config::ChannelConfig;
+use lightning::{impl_writeable_tlv_based_enum, ln::channelmanager::ChannelShutdownState};
 use lightning::{
     ln::{
         channelmanager::{PaymentId, RecipientOnionFields, Retry},
@@ -54,8 +54,7 @@ use rgb_lib::{
         Recipient, RecipientInfo, Token as RgbLibToken, TokenLight as RgbLibTokenLight,
         WitnessData,
     },
-    AssetSchema as RgbLibAssetSchema, BitcoinNetwork as RgbLibNetwork, ContractId,
-    Error as RgbLibError, RgbTransport,
+    AssetSchema as RgbLibAssetSchema, BitcoinNetwork as RgbLibNetwork, ContractId, RgbTransport,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -127,6 +126,18 @@ pub(crate) struct AssetBalanceResponse {
     pub(crate) offchain_inbound: u64,
 }
 
+impl From<RgbLibBalance> for AssetBalanceResponse {
+    fn from(value: RgbLibBalance) -> Self {
+        Self {
+            settled: value.settled,
+            future: value.future,
+            spendable: value.spendable,
+            offchain_outbound: 0,
+            offchain_inbound: 0,
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 pub(crate) struct AssetMetadataRequest {
     pub(crate) asset_id: String,
@@ -155,7 +166,7 @@ pub(crate) struct AssetCFA {
     pub(crate) issued_supply: u64,
     pub(crate) timestamp: i64,
     pub(crate) added_at: i64,
-    pub(crate) balance: BtcBalance,
+    pub(crate) balance: AssetBalanceResponse,
     pub(crate) media: Option<Media>,
 }
 
@@ -204,7 +215,7 @@ pub(crate) struct AssetNIA {
     pub(crate) issued_supply: u64,
     pub(crate) timestamp: i64,
     pub(crate) added_at: i64,
-    pub(crate) balance: BtcBalance,
+    pub(crate) balance: AssetBalanceResponse,
     pub(crate) media: Option<Media>,
 }
 
@@ -264,7 +275,7 @@ pub(crate) struct AssetUDA {
     pub(crate) issued_supply: u64,
     pub(crate) timestamp: i64,
     pub(crate) added_at: i64,
-    pub(crate) balance: BtcBalance,
+    pub(crate) balance: AssetBalanceResponse,
     pub(crate) token: Option<TokenLight>,
 }
 
@@ -336,16 +347,6 @@ pub(crate) struct BtcBalance {
     pub(crate) spendable: u64,
 }
 
-impl From<RgbLibBalance> for BtcBalance {
-    fn from(value: RgbLibBalance) -> Self {
-        Self {
-            settled: value.settled,
-            future: value.future,
-            spendable: value.spendable,
-        }
-    }
-}
-
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct BtcBalanceRequest {
     pub(crate) skip_sync: bool,
@@ -370,6 +371,7 @@ pub(crate) struct Channel {
     pub(crate) peer_pubkey: String,
     pub(crate) peer_alias: Option<String>,
     pub(crate) short_channel_id: Option<u64>,
+    pub(crate) status: ChannelStatus,
     pub(crate) ready: bool,
     pub(crate) capacity_sat: u64,
     pub(crate) local_balance_msat: u64,
@@ -382,6 +384,14 @@ pub(crate) struct Channel {
     pub(crate) asset_id: Option<String>,
     pub(crate) asset_local_amount: Option<u64>,
     pub(crate) asset_remote_amount: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) enum ChannelStatus {
+    #[default]
+    Opening,
+    Opened,
+    Closing,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1092,6 +1102,8 @@ pub(crate) struct UnlockRequest {
     pub(crate) bitcoind_rpc_port: u16,
     pub(crate) indexer_url: Option<String>,
     pub(crate) proxy_endpoint: Option<String>,
+    pub(crate) announce_addresses: Vec<String>,
+    pub(crate) announce_alias: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1152,50 +1164,6 @@ impl AppState {
     async fn update_unlocked_app_state(&self, updated: Option<Arc<UnlockedAppState>>) {
         let mut unlocked_app_state = self.get_unlocked_app_state().await;
         *unlocked_app_state = updated;
-    }
-}
-
-impl From<RgbLibError> for APIError {
-    fn from(error: RgbLibError) -> Self {
-        match error {
-            RgbLibError::AllocationsAlreadyAvailable => APIError::AllocationsAlreadyAvailable,
-            RgbLibError::AssetNotFound { .. } => APIError::UnknownContractId,
-            RgbLibError::BatchTransferNotFound { .. } => APIError::BatchTransferNotFound,
-            RgbLibError::CannotEstimateFees => APIError::CannotEstimateFees,
-            RgbLibError::CannotFailBatchTransfer => APIError::CannotFailBatchTransfer,
-            RgbLibError::FailedBroadcast { details } => APIError::FailedBroadcast(details),
-            RgbLibError::FailedIssuance { details } => APIError::FailedIssuingAsset(details),
-            RgbLibError::Indexer { details } => APIError::Indexer(details),
-            RgbLibError::InsufficientAllocationSlots => APIError::NoAvailableUtxos,
-            RgbLibError::InsufficientBitcoins { needed, available } => {
-                APIError::InsufficientFunds(needed - available)
-            }
-            RgbLibError::InsufficientSpendableAssets { .. } => APIError::InsufficientAssets,
-            RgbLibError::InsufficientTotalAssets { .. } => APIError::InsufficientAssets,
-            RgbLibError::InvalidAssetID { asset_id } => APIError::InvalidAssetID(asset_id),
-            RgbLibError::InvalidElectrum { details } => APIError::InvalidIndexer(details),
-            RgbLibError::InvalidFeeRate { details } => APIError::InvalidFeeRate(details),
-            RgbLibError::InvalidIndexer { details } => APIError::InvalidIndexer(details),
-            RgbLibError::InvalidName { details } => APIError::InvalidName(details),
-            RgbLibError::InvalidPrecision { details } => APIError::InvalidPrecision(details),
-            RgbLibError::InvalidProxyProtocol { version } => {
-                APIError::InvalidProxyProtocol(version)
-            }
-            RgbLibError::InvalidRecipientID => APIError::InvalidRecipientID,
-            RgbLibError::InvalidRecipientNetwork => APIError::InvalidRecipientNetwork,
-            RgbLibError::InvalidTicker { details } => APIError::InvalidTicker(details),
-            RgbLibError::InvalidTransportEndpoints { details } => {
-                APIError::InvalidTransportEndpoints(details)
-            }
-            RgbLibError::MinFeeNotMet { txid } => APIError::MinFeeNotMet(txid),
-            RgbLibError::Proxy { details } => APIError::Proxy(details),
-            RgbLibError::RecipientIDAlreadyUsed => APIError::RecipientIDAlreadyUsed,
-            RgbLibError::OutputBelowDustLimit => APIError::OutputBelowDustLimit,
-            _ => {
-                tracing::debug!("Unexpected rgb-lib error: {error:?}");
-                APIError::Unexpected
-            }
-        }
     }
 }
 
@@ -1488,10 +1456,7 @@ pub(crate) async fn decode_rgb_invoice(
 ) -> Result<Json<DecodeRGBInvoiceResponse>, APIError> {
     let _unlocked_app_state = state.get_unlocked_app_state();
 
-    let invoice_data = match RgbLibInvoice::new(payload.invoice) {
-        Err(e) => return Err(APIError::InvalidInvoice(e.to_string())),
-        Ok(v) => v.invoice_data(),
-    };
+    let invoice_data = RgbLibInvoice::new(payload.invoice)?.invoice_data();
 
     Ok(Json(DecodeRGBInvoiceResponse {
         recipient_id: invoice_data.recipient_id,
@@ -1881,15 +1846,65 @@ pub(crate) async fn list_assets(
             .collect(),
     )?;
 
-    let nia = rgb_assets
-        .nia
-        .map(|assets| assets.into_iter().map(|a| a.into()).collect());
-    let uda = rgb_assets
-        .uda
-        .map(|assets| assets.into_iter().map(|a| a.into()).collect());
-    let cfa = rgb_assets
-        .cfa
-        .map(|assets| assets.into_iter().map(|a| a.into()).collect());
+    let mut offchain_balances = HashMap::new();
+    for chan_info in unlocked_state.channel_manager.list_channels() {
+        let info_file_path = get_rgb_channel_info_path(
+            &chan_info.channel_id.0.as_hex().to_string(),
+            &state.static_state.ldk_data_dir,
+            false,
+        );
+        if !info_file_path.exists() {
+            continue;
+        }
+        let rgb_info = parse_rgb_channel_info(&info_file_path);
+        offchain_balances
+            .entry(rgb_info.contract_id.to_string())
+            .and_modify(|(offchain_outbound, offchain_inbound)| {
+                *offchain_outbound += rgb_info.local_rgb_amount;
+                *offchain_inbound += rgb_info.remote_rgb_amount;
+            })
+            .or_insert((rgb_info.local_rgb_amount, rgb_info.remote_rgb_amount));
+    }
+
+    let nia = rgb_assets.nia.map(|assets| {
+        assets
+            .into_iter()
+            .map(|a| {
+                let mut asset: AssetNIA = a.into();
+                (
+                    asset.balance.offchain_outbound,
+                    asset.balance.offchain_inbound,
+                ) = *offchain_balances.get(&asset.asset_id).unwrap_or(&(0, 0));
+                asset
+            })
+            .collect()
+    });
+    let uda = rgb_assets.uda.map(|assets| {
+        assets
+            .into_iter()
+            .map(|a| {
+                let mut asset: AssetUDA = a.into();
+                (
+                    asset.balance.offchain_outbound,
+                    asset.balance.offchain_inbound,
+                ) = *offchain_balances.get(&asset.asset_id).unwrap_or(&(0, 0));
+                asset
+            })
+            .collect()
+    });
+    let cfa = rgb_assets.cfa.map(|assets| {
+        assets
+            .into_iter()
+            .map(|a| {
+                let mut asset: AssetCFA = a.into();
+                (
+                    asset.balance.offchain_outbound,
+                    asset.balance.offchain_inbound,
+                ) = *offchain_balances.get(&asset.asset_id).unwrap_or(&(0, 0));
+                asset
+            })
+            .collect()
+    });
 
     Ok(Json(ListAssetsResponse { nia, uda, cfa }))
 }
@@ -1901,9 +1916,20 @@ pub(crate) async fn list_channels(
 
     let mut channels = vec![];
     for chan_info in unlocked_state.channel_manager.list_channels() {
+        let status = match chan_info.channel_shutdown_state.unwrap() {
+            ChannelShutdownState::NotShuttingDown => {
+                if chan_info.is_channel_ready {
+                    ChannelStatus::Opened
+                } else {
+                    ChannelStatus::Opening
+                }
+            }
+            _ => ChannelStatus::Closing,
+        };
         let mut channel = Channel {
             channel_id: chan_info.channel_id.0.as_hex().to_string(),
             peer_pubkey: hex_str(&chan_info.counterparty.node_id.serialize()),
+            status,
             ready: chan_info.is_channel_ready,
             capacity_sat: chan_info.channel_value_satoshis,
             local_balance_msat: chan_info.balance_msat,
@@ -2644,6 +2670,12 @@ pub(crate) async fn open_channel(
             )));
         }
 
+        if payload.push_msat > payload.capacity_sat * 1000 {
+            return Err(APIError::InvalidAmount(s!(
+                "Channel push amount cannot be higher than the capacity"
+            )));
+        }
+
         if !payload.with_anchors {
             return Err(APIError::AnchorsRequired);
         }
@@ -2829,7 +2861,10 @@ pub(crate) async fn post_asset_media(
             .await
             .map_err(|_| APIError::MediaFileNotProvided)?
         {
-            let file_bytes = field.bytes().await.map_err(|_| APIError::Unexpected)?;
+            let file_bytes = field
+                .bytes()
+                .await
+                .map_err(|e| APIError::Unexpected(format!("Failed to read bytes: {e}")))?;
             if file_bytes.is_empty() {
                 return Err(APIError::MediaFileEmpty);
             }
@@ -3308,7 +3343,10 @@ pub(crate) async fn unlock(
                 drop(unlocked_state);
             }
             Err(e) => {
-                return Err(e);
+                return Err(match e {
+                    APIError::UnlockedNode => APIError::AlreadyUnlocked,
+                    _ => e,
+                });
             }
         }
 

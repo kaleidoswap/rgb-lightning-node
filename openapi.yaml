@@ -1010,7 +1010,7 @@ components:
           type: integer
           example: 1691161979
         balance:
-          $ref: '#/components/schemas/BtcBalance'
+          $ref: '#/components/schemas/AssetBalanceResponse'
         media:
           $ref: '#/components/schemas/Media'
     AssetIface:
@@ -1049,7 +1049,7 @@ components:
           type: integer
           example: 1691161979
         balance:
-          $ref: '#/components/schemas/BtcBalance'
+          $ref: '#/components/schemas/AssetBalanceResponse'
         media:
           $ref: '#/components/schemas/Media'
     AssetSchema:
@@ -1088,7 +1088,7 @@ components:
           type: integer
           example: 1691161979
         balance:
-          $ref: '#/components/schemas/BtcBalance'
+          $ref: '#/components/schemas/AssetBalanceResponse'
         token:
           $ref: '#/components/schemas/TokenLight'
     BackupRequest:
@@ -1169,6 +1169,8 @@ components:
         short_channel_id:
           type: integer
           example: 120946279120896
+        status:
+          $ref: '#/components/schemas/ChannelStatus'
         ready:
           type: boolean
           example: false
@@ -1205,6 +1207,12 @@ components:
         asset_remote_amount:
           type: integer
           example: 0
+    ChannelStatus:
+      type: string
+      enum:
+        - Opening
+        - Opened
+        - Closing
     CheckIndexerUrlRequest:
       type: object
       properties:
@@ -2217,6 +2225,14 @@ components:
         proxy_endpoint:
           type: string
           example: rpc://127.0.0.1:3000/json-rpc
+        announce_addresses:
+          type: array
+          items:
+            type: string
+            example: pub.addr.example.com:9735
+        announce_alias:
+          type: string
+          example: nodeAlias
     Unspent:
       type: object
       properties:
