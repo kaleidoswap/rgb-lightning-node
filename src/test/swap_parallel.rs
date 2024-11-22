@@ -1,5 +1,3 @@
-use self::routes::HTLC_MIN_MSAT;
-
 use tokio::time::Instant;
 
 use super::*;
@@ -15,17 +13,19 @@ async fn swap_parallel() {
     let test_dir_node1 = format!("{TEST_DIR_BASE}node1");
     let test_dir_node2 = format!("{TEST_DIR_BASE}node2");
     let test_dir_node3 = format!("{TEST_DIR_BASE}node3");
+    let test_dir_node4 = format!("{TEST_DIR_BASE}node4");
     let (node1_addr, _) = start_node(&test_dir_node1, NODE1_PEER_PORT, false).await;
     let (node2_addr, _) = start_node(&test_dir_node2, NODE2_PEER_PORT, false).await;
     let (node3_addr, _) = start_node(&test_dir_node3, NODE3_PEER_PORT, false).await;
+    let (node4_addr, _) = start_node(&test_dir_node4, NODE3_PEER_PORT, false).await;
 
     fund_and_create_utxos(node1_addr, None).await;
     fund_and_create_utxos(node2_addr, None).await;
     fund_and_create_utxos(node3_addr, None).await;
+    fund_and_create_utxos(node4_addr, None).await;
 
     let asset_id = issue_asset_nia(node1_addr).await.asset_id;
 
-    let node1_pubkey = node_info(node1_addr).await.pubkey;
     let node2_pubkey = node_info(node2_addr).await.pubkey;
     let node3_pubkey = node_info(node3_addr).await.pubkey;
 
@@ -33,20 +33,10 @@ async fn swap_parallel() {
         node1_addr,
         &node2_pubkey,
         Some(NODE2_PEER_PORT),
-        None,
-        None,
+        Some(100000),
+        Some(50000000),
         Some(300),
         Some(&asset_id),
-    )
-    .await;
-    let channel_21 = open_channel(
-        node2_addr,
-        &node1_pubkey,
-        Some(NODE2_PEER_PORT),
-        Some(5000000),
-        Some(546000),
-        None,
-        None,
     )
     .await;
 
@@ -54,64 +44,12 @@ async fn swap_parallel() {
         node1_addr,
         &node3_pubkey,
         Some(NODE3_PEER_PORT),
-        None,
-        None,
+        Some(100000),
+        Some(50000000),
         Some(300),
         Some(&asset_id),
     )
     .await;
-    let channel_31 = open_channel(
-        node3_addr,
-        &node1_pubkey,
-        Some(NODE3_PEER_PORT),
-        Some(5000000),
-        Some(546000),
-        None,
-        None,
-    )
-    .await;
-
-    //let _channel_12 = open_channel(
-    //    node1_addr,
-    //    &node2_pubkey,
-    //    Some(NODE2_PEER_PORT),
-    //    None,
-    //    None,
-    //    Some(300),
-    //    Some(&asset_id),
-    //)
-    //.await;
-    //let _channel_21 = open_channel(
-    //    node2_addr,
-    //    &node1_pubkey,
-    //    Some(NODE2_PEER_PORT),
-    //    Some(5000000),
-    //    Some(546000),
-    //    None,
-    //    None,
-    //)
-    //.await;
-    //
-    //let _channel_13 = open_channel(
-    //    node1_addr,
-    //    &node3_pubkey,
-    //    Some(NODE3_PEER_PORT),
-    //    None,
-    //    None,
-    //    Some(300),
-    //    Some(&asset_id),
-    //)
-    //.await;
-    //let _channel_31 = open_channel(
-    //    node3_addr,
-    //    &node1_pubkey,
-    //    Some(NODE3_PEER_PORT),
-    //    Some(5000000),
-    //    Some(546000),
-    //    None,
-    //    None,
-    //)
-    //.await;
 
     let channels_1_before = list_channels(node1_addr).await;
     let channels_2_before = list_channels(node2_addr).await;
@@ -119,17 +57,9 @@ async fn swap_parallel() {
         .iter()
         .find(|c| c.channel_id == channel_12.channel_id)
         .unwrap();
-    let chan_1_21_before = channels_1_before
-        .iter()
-        .find(|c| c.channel_id == channel_21.channel_id)
-        .unwrap();
     let chan_2_12_before = channels_2_before
         .iter()
         .find(|c| c.channel_id == channel_12.channel_id)
-        .unwrap();
-    let chan_2_21_before = channels_2_before
-        .iter()
-        .find(|c| c.channel_id == channel_21.channel_id)
         .unwrap();
 
     let channels_3_before = list_channels(node3_addr).await;
@@ -137,24 +67,16 @@ async fn swap_parallel() {
         .iter()
         .find(|c| c.channel_id == channel_13.channel_id)
         .unwrap();
-    let chan_1_31_before = channels_1_before
-        .iter()
-        .find(|c| c.channel_id == channel_31.channel_id)
-        .unwrap();
     let chan_3_13_before = channels_3_before
         .iter()
         .find(|c| c.channel_id == channel_13.channel_id)
-        .unwrap();
-    let chan_3_31_before = channels_3_before
-        .iter()
-        .find(|c| c.channel_id == channel_31.channel_id)
         .unwrap();
 
     println!("\nsetup swap");
     let maker_addr = node1_addr;
     let taker_addr_1 = node2_addr;
     let taker_addr_2 = node3_addr;
-    let qty_from = 50000;
+    let qty_from = 25000;
     let qty_to = 10;
     let maker_init_response_1 =
         maker_init(maker_addr, qty_from, None, qty_to, Some(&asset_id), 3600).await;
@@ -221,24 +143,6 @@ async fn swap_parallel() {
     );
     assert_eq!(swap_taker_2.status, SwapStatus::Waiting);
 
-    //println!("\nexecute swap 1");
-    //maker_execute(
-    //    maker_addr,
-    //    maker_init_response_1.swapstring,
-    //    maker_init_response_1.payment_secret,
-    //    node2_pubkey.clone(),
-    //)
-    //.await;
-    //
-    //println!("\nexecute swap 2");
-    //maker_execute(
-    //    maker_addr,
-    //    maker_init_response_2.swapstring,
-    //    maker_init_response_2.payment_secret,
-    //    node3_pubkey.clone(),
-    //)
-    //.await;
-
     let start = Instant::now();
 
     println!("\nexecute swaps");
@@ -302,6 +206,8 @@ async fn swap_parallel() {
     )
     .await;
 
+    let total_duration_succeeded = start.elapsed();
+
     wait_for_ln_balance(maker_addr, &asset_id, 580).await;
     wait_for_ln_balance(taker_addr_1, &asset_id, 10).await;
     wait_for_ln_balance(taker_addr_2, &asset_id, 10).await;
@@ -314,9 +220,9 @@ async fn swap_parallel() {
     let maker_addr = node1_addr;
     let taker_addr_1 = node2_addr;
     let taker_addr_2 = node3_addr;
-    wait_for_usable_channels(node1_addr, 4).await;
-    wait_for_usable_channels(node2_addr, 2).await;
-    wait_for_usable_channels(node3_addr, 2).await;
+    wait_for_usable_channels(node1_addr, 2).await;
+    wait_for_usable_channels(node2_addr, 1).await;
+    wait_for_usable_channels(node3_addr, 1).await;
 
     println!("\ncheck off-chain balances and payments after nodes have restarted");
     let balance_1 = asset_balance(node1_addr, &asset_id).await;
@@ -366,91 +272,75 @@ async fn swap_parallel() {
         .iter()
         .find(|c| c.channel_id == channel_12.channel_id)
         .unwrap();
-    let chan_1_21 = channels_1
-        .iter()
-        .find(|c| c.channel_id == channel_21.channel_id)
-        .unwrap();
     let chan_2_12 = channels_2
         .iter()
         .find(|c| c.channel_id == channel_12.channel_id)
         .unwrap();
-    let chan_2_21 = channels_2
-        .iter()
-        .find(|c| c.channel_id == channel_21.channel_id)
-        .unwrap();
-    let chan_1_13 = channels_3
+    let chan_1_13 = channels_1
         .iter()
         .find(|c| c.channel_id == channel_13.channel_id)
-        .unwrap();
-    let chan_1_31 = channels_1
-        .iter()
-        .find(|c| c.channel_id == channel_21.channel_id)
         .unwrap();
     let chan_3_13 = channels_3
         .iter()
         .find(|c| c.channel_id == channel_13.channel_id)
         .unwrap();
-    let chan_3_31 = channels_3
-        .iter()
-        .find(|c| c.channel_id == channel_31.channel_id)
-        .unwrap();
-    let btc_leg_diff = HTLC_MIN_MSAT + qty_from;
     assert_eq!(
         chan_1_12.local_balance_msat,
-        chan_1_12_before.local_balance_msat - HTLC_MIN_MSAT
-    );
-    assert_eq!(
-        chan_1_21.local_balance_msat,
-        chan_1_21_before.local_balance_msat + btc_leg_diff
+        chan_1_12_before.local_balance_msat + qty_from
     );
     assert_eq!(
         chan_2_12.local_balance_msat,
-        chan_2_12_before.local_balance_msat + HTLC_MIN_MSAT
+        chan_2_12_before.local_balance_msat - qty_from
     );
-    assert_eq!(
-        chan_2_21.local_balance_msat,
-        chan_2_21_before.local_balance_msat - btc_leg_diff
-    );
+    // to check
     assert_eq!(
         chan_1_13.local_balance_msat,
-        chan_1_13_before.local_balance_msat - HTLC_MIN_MSAT
-    );
-    assert_eq!(
-        chan_1_31.local_balance_msat,
-        chan_1_31_before.local_balance_msat + btc_leg_diff
+        chan_1_13_before.local_balance_msat + qty_from
     );
     assert_eq!(
         chan_3_13.local_balance_msat,
-        chan_3_13_before.local_balance_msat + HTLC_MIN_MSAT
-    );
-    assert_eq!(
-        chan_3_31.local_balance_msat,
-        chan_3_31_before.local_balance_msat - btc_leg_diff
+        chan_3_13_before.local_balance_msat - qty_from
     );
 
-    //println!("\nclose channels");
-    //close_channel(node1_addr, &channel_12.channel_id, &node2_pubkey, false).await;
-    //wait_for_balance(node1_addr, &asset_id, 990).await;
-    //wait_for_balance(node2_addr, &asset_id, 10).await;
-    //
-    //close_channel(node2_addr, &channel_21.channel_id, &node1_pubkey, false).await;
-    //
-    //println!("\nspend assets");
-    //let recipient_id = rgb_invoice(node3_addr, None).await.recipient_id;
-    //send_asset(node1_addr, &asset_id, 200, recipient_id).await;
-    //mine(false);
-    //refresh_transfers(node3_addr).await;
-    //refresh_transfers(node3_addr).await;
-    //refresh_transfers(node1_addr).await;
-    //
-    //let recipient_id = rgb_invoice(node3_addr, None).await.recipient_id;
-    //send_asset(node2_addr, &asset_id, 5, recipient_id).await;
-    //mine(false);
-    //refresh_transfers(node3_addr).await;
-    //refresh_transfers(node3_addr).await;
-    //refresh_transfers(node2_addr).await;
-    //
-    //assert_eq!(asset_balance_spendable(node1_addr, &asset_id).await, 790);
-    //assert_eq!(asset_balance_spendable(node2_addr, &asset_id).await, 5);
-    //assert_eq!(asset_balance_spendable(node3_addr, &asset_id).await, 205);
+    println!("\nclose channels");
+    close_channel(node1_addr, &channel_12.channel_id, &node2_pubkey, false).await;
+    close_channel(node1_addr, &channel_13.channel_id, &node3_pubkey, false).await;
+    wait_for_balance(node1_addr, &asset_id, 980).await;
+    wait_for_balance(node2_addr, &asset_id, 10).await;
+    wait_for_balance(node3_addr, &asset_id, 10).await;
+
+    println!("\nspend assets");
+    let recipient_id = rgb_invoice(node4_addr, None).await.recipient_id;
+    send_asset(node1_addr, &asset_id, 200, recipient_id).await;
+    mine(false);
+    refresh_transfers(node4_addr).await;
+    refresh_transfers(node4_addr).await;
+    refresh_transfers(node1_addr).await;
+
+    let recipient_id = rgb_invoice(node4_addr, None).await.recipient_id;
+    send_asset(node2_addr, &asset_id, 5, recipient_id).await;
+    mine(false);
+    refresh_transfers(node4_addr).await;
+    refresh_transfers(node4_addr).await;
+    refresh_transfers(node2_addr).await;
+
+    let recipient_id = rgb_invoice(node4_addr, None).await.recipient_id;
+    send_asset(node3_addr, &asset_id, 5, recipient_id).await;
+    mine(false);
+    refresh_transfers(node4_addr).await;
+    refresh_transfers(node4_addr).await;
+    refresh_transfers(node3_addr).await;
+
+    assert_eq!(asset_balance_spendable(node1_addr, &asset_id).await, 780);
+    assert_eq!(asset_balance_spendable(node2_addr, &asset_id).await, 5);
+    assert_eq!(asset_balance_spendable(node3_addr, &asset_id).await, 5);
+    assert_eq!(asset_balance_spendable(node4_addr, &asset_id).await, 210);
+
+    println!("\n-------------------------------------------");
+    println!("total duration: {:?}", total_duration);
+    println!(
+        "total duration until succedeed: {:?}",
+        total_duration_succeeded
+    );
+    println!("-------------------------------------------\n");
 }
