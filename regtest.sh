@@ -35,9 +35,13 @@ _start_services() {
     $BITCOIN_CLI -rpcwallet=miner -generate $INITIAL_BLOCKS >/dev/null
     export HEIGHT=$INITIAL_BLOCKS
     # wait for electrs to have completed startup
-    until $COMPOSE logs electrs |grep 'finished full compaction' >/dev/null; do
-        sleep 1
-    done
+    # until $COMPOSE logs electrs |grep 'finished full compaction' >/dev/null; do
+    #     sleep 1
+    # done
+    $COMPOSE restart electrs
+    $BITCOIN_CLI createwallet miner >/dev/null
+    $BITCOIN_CLI -rpcwallet=miner -generate $INITIAL_BLOCKS >/dev/null
+    export HEIGHT=$INITIAL_BLOCKS
 }
 
 _stop_services() {
