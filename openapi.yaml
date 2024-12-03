@@ -1821,6 +1821,15 @@ components:
           example: true
         status:
           $ref: '#/components/schemas/HTLCStatus'
+        created_at:
+          type: integer
+          example: 1691160765
+        updated_at:
+          type: integer
+          example: 1691162674
+        payee_pubkey:
+          type: string
+          example: 03b79a4bc1ec365524b4fab9a39eb133753646babb5a1da5c4bc94c53110b7795d
     Peer:
       type: object
       properties:
@@ -1929,7 +1938,7 @@ components:
           type: array
           items:
             type: string
-            example: rpcs://proxy.iriswallet.com/0.2/json-rpc
+            example: rpc://127.0.0.1:3000/json-rpc
         skip_sync:
           type: boolean
           example: false
