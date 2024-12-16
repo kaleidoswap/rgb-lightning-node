@@ -812,6 +812,9 @@ pub(crate) struct Payment {
     pub(crate) payment_hash: String,
     pub(crate) inbound: bool,
     pub(crate) status: HTLCStatus,
+    pub(crate) created_at: u64,
+    pub(crate) updated_at: u64,
+    pub(crate) payee_pubkey: String,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -1790,6 +1793,7 @@ pub(crate) async fn keysend(
             amt_msat,
             rgb_payment,
         );
+        let created_at = get_current_timestamp();
         unlocked_state.add_outbound_payment(
             payment_id,
             PaymentInfo {
@@ -1797,6 +1801,9 @@ pub(crate) async fn keysend(
                 secret: None,
                 status: HTLCStatus::Pending,
                 amt_msat: Some(amt_msat),
+                created_at,
+                updated_at: created_at,
+                payee_pubkey: dest_pubkey,
             },
         );
         let status = match unlocked_state
@@ -2006,6 +2013,9 @@ pub(crate) async fn list_payments(
             payment_hash: hex_str(&payment_hash.0),
             inbound: true,
             status: payment_info.status,
+            created_at: payment_info.created_at,
+            updated_at: payment_info.updated_at,
+            payee_pubkey: payment_info.payee_pubkey.to_string(),
         });
     }
 
@@ -2029,6 +2039,9 @@ pub(crate) async fn list_payments(
             payment_hash: hex_str(&payment_hash.0),
             inbound: false,
             status: payment_info.status,
+            created_at: payment_info.created_at,
+            updated_at: payment_info.updated_at,
+            payee_pubkey: payment_info.payee_pubkey.to_string(),
         });
     }
 
@@ -2247,6 +2260,7 @@ pub(crate) async fn ln_invoice(
         };
 
         let payment_hash = PaymentHash((*invoice.payment_hash()).to_byte_array());
+        let created_at = get_current_timestamp();
         unlocked_state.add_inbound_payment(
             payment_hash,
             PaymentInfo {
@@ -2254,6 +2268,9 @@ pub(crate) async fn ln_invoice(
                 secret: Some(*invoice.payment_secret()),
                 status: HTLCStatus::Pending,
                 amt_msat: payload.amt_msat,
+                created_at,
+                updated_at: created_at,
+                payee_pubkey: unlocked_state.channel_manager.get_our_node_id(),
             },
         );
 
@@ -3099,6 +3116,7 @@ pub(crate) async fn send_payment(
         let unlocked_state = state.check_unlocked().await?.clone().unwrap();
 
         let mut status = HTLCStatus::Pending;
+        let created_at = get_current_timestamp();
 
         let (payment_id, payment_hash, payment_secret) = if let Ok(offer) = Offer::from_str(&payload.invoice) {
             let random_bytes = unlocked_state.keys_manager.get_secure_random_bytes();
@@ -3130,6 +3148,9 @@ pub(crate) async fn send_payment(
                     secret,
                     status,
                     amt_msat: Some(amt_msat),
+                    created_at,
+                    updated_at: created_at,
+                    payee_pubkey: offer.signing_pubkey().ok_or(APIError::InvalidInvoice(s!("missing signing pubkey")))?,
                 },
             );
 
@@ -3217,6 +3238,9 @@ pub(crate) async fn send_payment(
                     secret,
                     status,
                     amt_msat: invoice.amount_milli_satoshis(),
+                    created_at,
+                    updated_at: created_at,
+                    payee_pubkey: invoice.get_payee_pub_key(),
                 },
             );
 
