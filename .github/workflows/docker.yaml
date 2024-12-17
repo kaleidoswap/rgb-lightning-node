@@ -2,7 +2,7 @@ name: Build and Push Docker Image
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "docker" ]
 
 env:
   CARGO_TERM_COLOR: always
