@@ -37,7 +37,7 @@ use crate::routes::{
     SendBtcResponse, SendPaymentRequest, SendPaymentResponse, SwapStatus, TakerRequest,
     Transaction, Transfer, UnlockRequest, Unspent,
 };
-use crate::utils::{hex_str_to_vec, ELECTRUM_URL_REGTEST, PROXY_ENDPOINT_REGTEST};
+use crate::utils::{hex_str_to_vec, ELECTRUM_URL_REGTEST, PROXY_ENDPOINT_LOCAL};
 
 use super::*;
 
@@ -1000,6 +1000,7 @@ async fn open_channel(
         None,
         None,
         None,
+        true,
     )
     .await
 }
@@ -1016,6 +1017,7 @@ async fn open_channel_with_custom_data(
     fee_base_msat: Option<u32>,
     fee_proportional_millionths: Option<u32>,
     temporary_channel_id: Option<&str>,
+    with_anchors: bool,
 ) -> Channel {
     println!(
         "opening channel with {asset_amount:?} of asset {asset_id:?} from node {node_address} \
@@ -1034,7 +1036,7 @@ async fn open_channel_with_custom_data(
         asset_amount,
         asset_id: asset_id.map(|a| a.to_string()),
         public: true,
-        with_anchors: true,
+        with_anchors,
         fee_base_msat,
         fee_proportional_millionths,
         temporary_channel_id: temporary_channel_id.map(|t| t.to_string()),
@@ -1188,7 +1190,7 @@ async fn send_asset(node_address: SocketAddr, asset_id: &str, amount: u64, recip
         donation: true,
         fee_rate: FEE_RATE,
         min_confirmations: 1,
-        transport_endpoints: vec![PROXY_ENDPOINT_REGTEST.to_string()],
+        transport_endpoints: vec![PROXY_ENDPOINT_LOCAL.to_string()],
         skip_sync: false,
     };
     let res = reqwest::Client::new()
@@ -1345,7 +1347,7 @@ async fn unlock_res(node_address: SocketAddr, password: &str) -> Response {
         bitcoind_rpc_host: s!("localhost"),
         bitcoind_rpc_port: 18443,
         indexer_url: Some(ELECTRUM_URL_REGTEST.to_string()),
-        proxy_endpoint: Some(PROXY_ENDPOINT_REGTEST.to_string()),
+        proxy_endpoint: Some(PROXY_ENDPOINT_LOCAL.to_string()),
         announce_addresses: vec![],
         announce_alias: Some(s!("RLN_alias")),
     };
