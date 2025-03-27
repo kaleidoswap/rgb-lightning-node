@@ -1662,3 +1662,4 @@ mod swap_roundtrip_sell;
 mod swap_roundtrip_buy_sell_with_other_channels;
 mod upload_asset_media;
 mod vanilla_payment_on_rgb_channel;
+mod concurrent_swap;
