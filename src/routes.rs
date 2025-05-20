@@ -533,6 +533,27 @@ pub(crate) struct GetChannelIdResponse {
     pub(crate) channel_id: String,
 }
 
+#[derive(Deserialize, Serialize)]
+pub(crate) struct GetPaymentRequest {
+    pub(crate) payment_hash: String,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct GetPaymentResponse {
+    pub(crate) payment: Payment,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct GetSwapRequest {
+    pub(crate) payment_hash: String,
+    pub(crate) taker: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct GetSwapResponse {
+    pub(crate) swap: Swap,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
 pub(crate) enum HTLCStatus {
     Pending,
@@ -944,7 +965,7 @@ pub(crate) struct SignMessageResponse {
     pub(crate) signed_message: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct Swap {
     pub(crate) qty_from: u64,
     pub(crate) qty_to: u64,
@@ -958,7 +979,7 @@ pub(crate) struct Swap {
     pub(crate) completed_at: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) enum SwapStatus {
     Waiting,
     Pending,
@@ -1349,8 +1370,7 @@ pub(crate) async fn close_channel(
         if channel_id_vec.is_none() || channel_id_vec.as_ref().unwrap().len() != 32 {
             return Err(APIError::InvalidChannelID);
         }
-        let mut channel_id = [0; 32];
-        channel_id.copy_from_slice(&channel_id_vec.unwrap());
+        let requested_cid = ChannelId(channel_id_vec.unwrap().try_into().unwrap());
 
         let peer_pubkey_vec = match hex_str_to_vec(&payload.peer_pubkey) {
             Some(peer_pubkey_vec) => peer_pubkey_vec,
@@ -1365,7 +1385,7 @@ pub(crate) async fn close_channel(
             match unlocked_state
                 .channel_manager
                 .force_close_broadcasting_latest_txn(
-                    &ChannelId(channel_id),
+                    &requested_cid,
                     &peer_pubkey,
                     "Manually force-closed".to_string(),
                 ) {
@@ -1375,7 +1395,7 @@ pub(crate) async fn close_channel(
         } else {
             match unlocked_state
                 .channel_manager
-                .close_channel(&ChannelId(channel_id), &peer_pubkey)
+                .close_channel(&requested_cid, &peer_pubkey)
             {
                 Ok(()) => tracing::info!("EVENT: initiating channel close"),
                 Err(e) => return Err(APIError::FailedClosingChannel(format!("{:?}", e))),
@@ -2061,6 +2081,81 @@ pub(crate) async fn list_payments(
     Ok(Json(ListPaymentsResponse { payments }))
 }
 
+pub(crate) async fn get_payment(
+    State(state): State<Arc<AppState>>,
+    WithRejection(Json(payload), _): WithRejection<Json<GetPaymentRequest>, APIError>,
+) -> Result<Json<GetPaymentResponse>, APIError> {
+    let unlocked_state = state.check_unlocked().await?.clone().unwrap();
+
+    let payment_hash_vec = hex_str_to_vec(&payload.payment_hash);
+    if payment_hash_vec.is_none() || payment_hash_vec.as_ref().unwrap().len() != 32 {
+        return Err(APIError::InvalidPaymentHash(payload.payment_hash));
+    }
+    let requested_ph = PaymentHash(payment_hash_vec.unwrap().try_into().unwrap());
+
+    let inbound_payments = unlocked_state.inbound_payments();
+    let outbound_payments = unlocked_state.outbound_payments();
+
+    for (payment_hash, payment_info) in &inbound_payments {
+        if payment_hash == &requested_ph {
+            let rgb_payment_info_path_inbound =
+                get_rgb_payment_info_path(payment_hash, &state.static_state.ldk_data_dir, true);
+
+            let (asset_amount, asset_id) = if rgb_payment_info_path_inbound.exists() {
+                let info = parse_rgb_payment_info(&rgb_payment_info_path_inbound);
+                (Some(info.amount), Some(info.contract_id.to_string()))
+            } else {
+                (None, None)
+            };
+
+            return Ok(Json(GetPaymentResponse {
+                payment: Payment {
+                    amt_msat: payment_info.amt_msat,
+                    asset_amount,
+                    asset_id,
+                    payment_hash: hex_str(&payment_hash.0),
+                    inbound: true,
+                    status: payment_info.status,
+                    created_at: payment_info.created_at,
+                    updated_at: payment_info.updated_at,
+                    payee_pubkey: payment_info.payee_pubkey.to_string(),
+                },
+            }));
+        }
+    }
+
+    for (payment_id, payment_info) in &outbound_payments {
+        let payment_hash = &PaymentHash(payment_id.0);
+        if payment_hash == &requested_ph {
+            let rgb_payment_info_path_outbound =
+                get_rgb_payment_info_path(payment_hash, &state.static_state.ldk_data_dir, false);
+
+            let (asset_amount, asset_id) = if rgb_payment_info_path_outbound.exists() {
+                let info = parse_rgb_payment_info(&rgb_payment_info_path_outbound);
+                (Some(info.amount), Some(info.contract_id.to_string()))
+            } else {
+                (None, None)
+            };
+
+            return Ok(Json(GetPaymentResponse {
+                payment: Payment {
+                    amt_msat: payment_info.amt_msat,
+                    asset_amount,
+                    asset_id,
+                    payment_hash: hex_str(&payment_hash.0),
+                    inbound: false,
+                    status: payment_info.status,
+                    created_at: payment_info.created_at,
+                    updated_at: payment_info.updated_at,
+                    payee_pubkey: payment_info.payee_pubkey.to_string(),
+                },
+            }));
+        }
+    }
+
+    Err(APIError::PaymentNotFound(payload.payment_hash))
+}
+
 pub(crate) async fn list_peers(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ListPeersResponse>, APIError> {
@@ -2124,6 +2219,67 @@ pub(crate) async fn list_swaps(
             .map(|(ph, sd)| map_swap(ph, sd, false))
             .collect(),
     }))
+}
+
+pub(crate) async fn get_swap(
+    State(state): State<Arc<AppState>>,
+    WithRejection(Json(payload), _): WithRejection<Json<GetSwapRequest>, APIError>,
+) -> Result<Json<GetSwapResponse>, APIError> {
+    let unlocked_state = state.check_unlocked().await?.clone().unwrap();
+
+    let payment_hash_vec = hex_str_to_vec(&payload.payment_hash);
+    if payment_hash_vec.is_none() || payment_hash_vec.as_ref().unwrap().len() != 32 {
+        return Err(APIError::InvalidPaymentHash(payload.payment_hash));
+    }
+    let requested_ph = PaymentHash(payment_hash_vec.unwrap().try_into().unwrap());
+
+    let map_swap = |payment_hash: &PaymentHash, swap_data: &SwapData, taker: bool| {
+        let mut status = swap_data.status.clone();
+        if status == SwapStatus::Waiting && get_current_timestamp() > swap_data.swap_info.expiry {
+            status = SwapStatus::Expired;
+        } else if status == SwapStatus::Pending
+            && get_current_timestamp() > swap_data.initiated_at.unwrap() + 86400
+        {
+            status = SwapStatus::Failed;
+        }
+        if status != swap_data.status {
+            if taker {
+                unlocked_state.update_taker_swap_status(payment_hash, status.clone());
+            } else {
+                unlocked_state.update_maker_swap_status(payment_hash, status.clone());
+            }
+        }
+        Swap {
+            payment_hash: payment_hash.to_string(),
+            qty_from: swap_data.swap_info.qty_from,
+            qty_to: swap_data.swap_info.qty_to,
+            from_asset: swap_data.swap_info.from_asset.map(|c| c.to_string()),
+            to_asset: swap_data.swap_info.to_asset.map(|c| c.to_string()),
+            status,
+            requested_at: swap_data.requested_at,
+            initiated_at: swap_data.initiated_at,
+            expires_at: swap_data.swap_info.expiry,
+            completed_at: swap_data.completed_at,
+        }
+    };
+
+    if payload.taker {
+        let taker_swaps = unlocked_state.taker_swaps();
+        if let Some(sd) = taker_swaps.get(&requested_ph) {
+            return Ok(Json(GetSwapResponse {
+                swap: map_swap(&requested_ph, sd, true),
+            }));
+        }
+    } else {
+        let maker_swaps = unlocked_state.maker_swaps();
+        if let Some(sd) = maker_swaps.get(&requested_ph) {
+            return Ok(Json(GetSwapResponse {
+                swap: map_swap(&requested_ph, sd, false),
+            }));
+        }
+    }
+
+    Err(APIError::SwapNotFound(payload.payment_hash))
 }
 
 pub(crate) async fn list_transactions(
