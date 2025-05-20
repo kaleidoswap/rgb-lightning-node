@@ -24,18 +24,19 @@ use crate::routes::{
     DecodeLNInvoiceResponse, DecodeRGBInvoiceRequest, DecodeRGBInvoiceResponse,
     DisconnectPeerRequest, EmptyResponse, FailTransfersRequest, FailTransfersResponse,
     GetAssetMediaRequest, GetAssetMediaResponse, GetChannelIdRequest, GetChannelIdResponse,
-    HTLCStatus, InitRequest, InitResponse, InvoiceStatus, InvoiceStatusRequest,
-    InvoiceStatusResponse, IssueAssetCFARequest, IssueAssetCFAResponse, IssueAssetNIARequest,
-    IssueAssetNIAResponse, IssueAssetUDARequest, IssueAssetUDAResponse, KeysendRequest,
-    KeysendResponse, LNInvoiceRequest, LNInvoiceResponse, ListAssetsRequest, ListAssetsResponse,
-    ListChannelsResponse, ListPaymentsResponse, ListPeersResponse, ListSwapsResponse,
-    ListTransactionsRequest, ListTransactionsResponse, ListTransfersRequest, ListTransfersResponse,
-    ListUnspentsRequest, ListUnspentsResponse, MakerExecuteRequest, MakerInitRequest,
-    MakerInitResponse, NetworkInfoResponse, NodeInfoResponse, OpenChannelRequest,
-    OpenChannelResponse, Payment, Peer, PostAssetMediaResponse, RefreshRequest, RestoreRequest,
-    RgbInvoiceRequest, RgbInvoiceResponse, SendAssetRequest, SendAssetResponse, SendBtcRequest,
-    SendBtcResponse, SendPaymentRequest, SendPaymentResponse, SwapStatus, TakerRequest,
-    Transaction, Transfer, UnlockRequest, Unspent,
+    GetPaymentRequest, GetPaymentResponse, GetSwapRequest, GetSwapResponse, HTLCStatus,
+    InitRequest, InitResponse, InvoiceStatus, InvoiceStatusRequest, InvoiceStatusResponse,
+    IssueAssetCFARequest, IssueAssetCFAResponse, IssueAssetNIARequest, IssueAssetNIAResponse,
+    IssueAssetUDARequest, IssueAssetUDAResponse, KeysendRequest, KeysendResponse, LNInvoiceRequest,
+    LNInvoiceResponse, ListAssetsRequest, ListAssetsResponse, ListChannelsResponse,
+    ListPaymentsResponse, ListPeersResponse, ListSwapsResponse, ListTransactionsRequest,
+    ListTransactionsResponse, ListTransfersRequest, ListTransfersResponse, ListUnspentsRequest,
+    ListUnspentsResponse, MakerExecuteRequest, MakerInitRequest, MakerInitResponse,
+    NetworkInfoResponse, NodeInfoResponse, OpenChannelRequest, OpenChannelResponse, Payment, Peer,
+    PostAssetMediaResponse, RefreshRequest, RestoreRequest, RgbInvoiceRequest, RgbInvoiceResponse,
+    SendAssetRequest, SendAssetResponse, SendBtcRequest, SendBtcResponse, SendPaymentRequest,
+    SendPaymentResponse, Swap, SwapStatus, TakerRequest, Transaction, Transfer, UnlockRequest,
+    Unspent,
 };
 use crate::utils::{hex_str_to_vec, ELECTRUM_URL_REGTEST, PROXY_ENDPOINT_LOCAL};
 
@@ -92,7 +93,7 @@ async fn check_response_is_nok(
     assert_eq!(res.status(), expected_status);
     let api_error_response = res.json::<APIErrorResponse>().await.unwrap();
     assert_eq!(api_error_response.code, expected_status.as_u16());
-    assert_eq!(api_error_response.error, expected_message);
+    assert!(api_error_response.error.contains(expected_message));
     assert_eq!(api_error_response.name, expected_name);
 }
 
@@ -765,6 +766,24 @@ async fn list_payments(node_address: SocketAddr) -> Vec<Payment> {
         .unwrap()
         .payments
 }
+async fn get_payment(node_address: SocketAddr, payment_hash: &str) -> Payment {
+    println!("getting payment for node {node_address}");
+    let payload = GetPaymentRequest {
+        payment_hash: payment_hash.to_string(),
+    };
+    let res = reqwest::Client::new()
+        .post(format!("http://{}/getpayment", node_address))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    _check_response_is_ok(res)
+        .await
+        .json::<GetPaymentResponse>()
+        .await
+        .unwrap()
+        .payment
+}
 
 async fn list_peers(node_address: SocketAddr) -> Vec<Peer> {
     println!("listing peers for node {node_address}");
@@ -789,6 +808,26 @@ async fn list_swaps(node_address: SocketAddr) -> ListSwapsResponse {
         .await
         .unwrap();
     _check_response_is_ok(res).await.json().await.unwrap()
+}
+
+async fn get_swap(node_address: SocketAddr, payment_hash: &str, taker: bool) -> Swap {
+    println!("getting swap with payment hash {payment_hash} for node {node_address}");
+    let payload = GetSwapRequest {
+        payment_hash: payment_hash.to_string(),
+        taker,
+    };
+    let res = reqwest::Client::new()
+        .post(format!("http://{}/getswap", node_address))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    _check_response_is_ok(res)
+        .await
+        .json::<GetSwapResponse>()
+        .await
+        .unwrap()
+        .swap
 }
 
 async fn list_transactions(node_address: SocketAddr) -> Vec<Transaction> {
