@@ -43,11 +43,8 @@ jobs:
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=sha,prefix={{branch}}-
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=latest-amd,enable={{is_default_branch}}
+            type=raw,value=latest
+            type=raw,value=latest-amd64
             type=sha,prefix=rgb-node-,format=short
 
       - name: Build and push multi-architecture image
