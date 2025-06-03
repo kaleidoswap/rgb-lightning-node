@@ -47,6 +47,8 @@ jobs:
             type=ref,event=pr
             type=sha,prefix={{branch}}-
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest-amd,enable={{is_default_branch}}
+            type=sha,prefix=rgb-node-,format=short
 
       - name: Build and push multi-architecture image
         uses: docker/build-push-action@v5
