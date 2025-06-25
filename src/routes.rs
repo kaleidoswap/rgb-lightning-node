@@ -2999,8 +2999,8 @@ pub(crate) async fn open_channel(
                 consignment_endpoint,
             )
             .map_err(|e| {
-                *unlocked_state.rgb_send_lock.lock().unwrap() = false;
-                tracing::debug!("RGB send lock set to false (open channel failure: {e:?})");
+                unlocked_state.release_rgb_send_lock("open channel failure");
+                tracing::debug!("RGB send lock released due to open channel failure: {e:?}");
                 match e {
                     LDKAPIError::APIMisuseError { err }
                         if err.contains("fee for initial commitment transaction") =>

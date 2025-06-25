@@ -284,6 +284,10 @@ impl UnlockedAppState {
     pub(crate) fn rgb_sync(&self) -> Result<(), RgbLibError> {
         self.rgb_wallet_wrapper.sync()
     }
+
+    pub(crate) fn rgb_send_end_robust(&self, signed_psbt: String) -> Result<SendResult, RgbLibError> {
+        self.rgb_wallet_wrapper.send_end_robust(signed_psbt)
+    }
 }
 
 pub(crate) struct RgbLibWalletWrapper {
@@ -621,6 +625,65 @@ impl RgbLibWalletWrapper {
     ) -> Result<ReceiveData, RgbLibError> {
         self.get_rgb_wallet()
             .witness_receive(None, None, None, transport_endpoints, 0)
+    }
+
+    /// Robust wrapper for rgb_send_end that handles errors gracefully and attempts recovery
+    pub(crate) fn send_end_robust(
+        &self,
+        signed_psbt: String,
+    ) -> Result<rgb_lib::wallet::SendResult, RgbLibError> {
+        tracing::debug!("Attempting rgb_send_end with robust error handling");
+        
+        match self.send_end(signed_psbt.clone()) {
+            Ok(result) => {
+                tracing::info!("RGB send_end completed successfully: txid={}", result.txid);
+                Ok(result)
+            }
+            Err(e) => {
+                tracing::error!("RGB send_end failed: {}", e);
+                
+                // Attempt to extract transaction from PSBT to check if it was actually broadcast
+                if let Ok(psbt) = rgb_lib::bitcoin::psbt::Psbt::from_str(&signed_psbt) {
+                    if let Ok(tx) = psbt.extract_tx() {
+                        let txid = tx.compute_txid();
+                        tracing::info!("Extracted txid from failed send_end: {}", txid);
+                        
+                        // Attempt to verify if the transaction was actually broadcast
+                        // by checking the wallet's transaction history
+                        match self.get_tx_height(txid.to_string()) {
+                            Ok(Some(_height)) => {
+                                tracing::warn!("Transaction {} was actually broadcast despite send_end error", txid);
+                                // Force a wallet refresh to sync state
+                                if let Err(refresh_err) = self.refresh(false) {
+                                    tracing::error!("Failed to refresh wallet after detecting broadcast tx: {}", refresh_err);
+                                }
+                                
+                                // Return a synthetic successful result with a special batch_transfer_idx
+                                // to indicate this is a recovery case
+                                return Ok(rgb_lib::wallet::SendResult {
+                                    txid: txid.to_string(),
+                                    batch_transfer_idx: -1, // Special value to indicate recovery case
+                                });
+                            }
+                            Ok(None) => {
+                                tracing::debug!("Transaction {} not found in blockchain, genuine failure", txid);
+                            }
+                            Err(height_err) => {
+                                tracing::error!("Failed to check transaction height: {}", height_err);
+                            }
+                        }
+                    }
+                }
+                
+                // Attempt wallet refresh to recover state consistency
+                if let Err(refresh_err) = self.refresh(false) {
+                    tracing::error!("Failed to refresh wallet after send_end error: {}", refresh_err);
+                }
+                
+                // Return the original error
+                Err(e)
+            }
+        }
     }
 }
 
