@@ -9,9 +9,9 @@ use lightning::chain::{chainmonitor, ChannelMonitorUpdateStatus};
 use lightning::chain::{BestBlock, Filter, Watch};
 use lightning::events::bump_transaction::{BumpTransactionEventHandler, Wallet};
 use lightning::events::{Event, PaymentFailureReason, PaymentPurpose};
-use lightning::ln::channelmanager::{self, PaymentId, RecentPaymentDetails};
+use lightning::ln::channelmanager::{self, ChannelManagerReadArgs, SimpleArcChannelManager, PaymentId, RecentPaymentDetails};
 use lightning::ln::channelmanager::{
-    ChainParameters, ChannelManagerReadArgs, SimpleArcChannelManager,
+    ChainParameters,
 };
 use lightning::ln::msgs::SocketAddress;
 use lightning::ln::peer_handler::{IgnoringMessageHandler, MessageHandler, SimpleArcPeerManager};
@@ -155,11 +155,81 @@ pub(crate) struct ChannelIdsMap {
     pub(crate) channel_ids: HashMap<ChannelId, ChannelId>,
 }
 
+/// RAII guard for RGB send lock that ensures it's always released
+pub(crate) struct RgbSendLockGuard {
+    lock: Arc<Mutex<bool>>,
+    released: bool,
+}
+
+impl RgbSendLockGuard {
+    /// Manually release the lock before the guard is dropped
+    pub(crate) fn release(&mut self, context: &str) {
+        if !self.released {
+            match self.lock.lock() {
+                Ok(mut lock) => {
+                    *lock = false;
+                    self.released = true;
+                    tracing::debug!("RGB send lock manually released: {}", context);
+                }
+                Err(poisoned) => {
+                    tracing::error!("RGB send lock is poisoned during manual release: {} - {:?}", context, poisoned);
+                    *poisoned.into_inner() = false;
+                    self.released = true;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for RgbSendLockGuard {
+    fn drop(&mut self) {
+        if !self.released {
+            match self.lock.lock() {
+                Ok(mut lock) => {
+                    *lock = false;
+                    tracing::debug!("RGB send lock released in drop guard");
+                }
+                Err(poisoned) => {
+                    tracing::error!("RGB send lock is poisoned in drop, forcing release: {:?}", poisoned);
+                    *poisoned.into_inner() = false;
+                }
+            }
+        }
+    }
+}
+
 impl_writeable_tlv_based!(ChannelIdsMap, {
     (0, channel_ids, required),
 });
 
 impl UnlockedAppState {
+    /// Safely releases the RGB send lock with proper error handling and logging
+    pub(crate) fn release_rgb_send_lock(&self, context: &str) {
+        match self.rgb_send_lock.lock() {
+            Ok(mut lock) => {
+                if *lock {
+                    *lock = false;
+                    tracing::debug!("RGB send lock released: {}", context);
+                } else {
+                    tracing::debug!("RGB send lock was already released: {}", context);
+                }
+            }
+            Err(poisoned) => {
+                tracing::error!("RGB send lock is poisoned, forcing release: {} - {:?}", context, poisoned);
+                // Force clear the poisoned lock
+                *poisoned.into_inner() = false;
+            }
+        }
+    }
+
+    /// Creates a RAII guard that automatically releases the RGB send lock when dropped
+    pub(crate) fn create_rgb_send_lock_guard(&self) -> RgbSendLockGuard {
+        RgbSendLockGuard {
+            lock: self.rgb_send_lock.clone(),
+            released: false,
+        }
+    }
+
     pub(crate) fn add_maker_swap(&self, payment_hash: PaymentHash, swap: SwapData) {
         let mut maker_swaps = self.get_maker_swaps();
         maker_swaps.swaps.insert(payment_hash, swap);
@@ -606,7 +676,7 @@ async fn handle_ldk_events(
             {
                 tracing::error!(
                         "ERROR: Channel went away before we could fund it. The peer disconnected or refused the channel.");
-                *unlocked_state.rgb_send_lock.lock().unwrap() = false;
+                unlocked_state.release_rgb_send_lock("channel funding failed");
             }
         }
         Event::FundingTxBroadcastSafe { .. } => {
@@ -951,17 +1021,68 @@ async fn handle_ldk_events(
 
                 let state_copy = unlocked_state.clone();
                 let psbt_str_copy = psbt_str.clone();
-                let _txid = tokio::task::spawn_blocking(move || {
+                
+                // Create a RAII guard to ensure the lock is always released
+                let mut _guard = unlocked_state.create_rgb_send_lock_guard();
+
+                let result = tokio::task::spawn_blocking(move || {
                     if is_channel_rgb(&channel_id, &PathBuf::from(&static_state.ldk_data_dir)) {
-                        state_copy.rgb_send_end(psbt_str_copy).unwrap().txid
+                        // Use the robust send_end method that includes error recovery
+                        match state_copy.rgb_send_end_robust(psbt_str_copy) {
+                            Ok(send_result) => Ok(send_result.txid),
+                            Err(e) => {
+                                tracing::error!("Error in rgb_send_end_robust: {}", e);
+                                Err(e)
+                            }
+                        }
                     } else {
-                        state_copy.rgb_send_btc_end(psbt_str_copy).unwrap()
+                        match state_copy.rgb_send_btc_end(psbt_str_copy) {
+                            Ok(txid) => Ok(txid),
+                            Err(e) => {
+                                tracing::error!("Error in rgb_send_btc_end: {}", e);
+                                Err(e)
+                            }
+                        }
                     }
                 })
-                .await
-                .unwrap();
+                .await;
 
-                *unlocked_state.rgb_send_lock.lock().unwrap() = false;
+                match result {
+                    Ok(Ok(txid)) => {
+                        tracing::info!("Successfully completed send operation with txid: {}", txid);
+                        _guard.release("successful channel pending send");
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!("Send operation failed: {}", e);
+                        // Here we could potentially implement recovery logic:
+                        // 1. Check if the transaction was actually broadcast despite the error
+                        // 2. Update the wallet database accordingly
+                        // 3. Attempt to refresh the wallet state
+                        
+                        // For now, we'll attempt a wallet refresh to sync state
+                        let refresh_state = unlocked_state.clone();
+                        tokio::spawn(async move {
+                            tokio::task::spawn_blocking(move || {
+                                if let Err(refresh_err) = refresh_state.rgb_refresh(false) {
+                                    tracing::error!("Failed to refresh wallet after send error: {}", refresh_err);
+                                }
+                            })
+                            .await
+                            .unwrap_or_else(|e| {
+                                tracing::error!("Panic during wallet refresh: {:?}", e);
+                            });
+                        });
+                        
+                        _guard.release("failed channel pending send");
+                    }
+                    Err(panic_err) => {
+                        tracing::error!("Panic occurred during send operation: {:?}", panic_err);
+                        // Handle panic case - the lock guard will still ensure cleanup
+                        _guard.release("panic in channel pending send");
+                    }
+                }
+                
+                // The lock guard will automatically release the lock when it goes out of scope if not manually released
             } else {
                 // acceptor
                 let consignment_path = static_state
@@ -1027,7 +1148,8 @@ async fn handle_ldk_events(
                 channel_id
             );
 
-            *unlocked_state.rgb_send_lock.lock().unwrap() = false;
+            // Safely release the RGB send lock using the centralized method
+            unlocked_state.release_rgb_send_lock("funding discarded");
 
             unlocked_state.delete_channel_id(channel_id);
         }
