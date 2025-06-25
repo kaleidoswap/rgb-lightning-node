@@ -658,9 +658,11 @@ impl RgbLibWalletWrapper {
                                     tracing::error!("Failed to refresh wallet after detecting broadcast tx: {}", refresh_err);
                                 }
                                 
-                                // Return a synthetic successful result
+                                // Return a synthetic successful result with a special batch_transfer_idx
+                                // to indicate this is a recovery case
                                 return Ok(rgb_lib::wallet::SendResult {
                                     txid: txid.to_string(),
+                                    batch_transfer_idx: -1, // Special value to indicate recovery case
                                 });
                             }
                             Ok(None) => {
