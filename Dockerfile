@@ -7,7 +7,7 @@ RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
 
-COPY --from=builder ./target/debug/rgb-lightning-node /usr/bin/rgb-lightning-node
+COPY --from=builder ./target/release/rgb-lightning-node /usr/bin/rgb-lightning-node
 
 RUN apt-get update && apt install -y --no-install-recommends \
     ca-certificates openssl \
