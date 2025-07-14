@@ -2,7 +2,7 @@ FROM rust:1.87.0-bookworm AS builder
 
 COPY . .
 
-RUN cargo build
+RUN cargo build --release --locked
 
 
 FROM debian:bookworm-slim
