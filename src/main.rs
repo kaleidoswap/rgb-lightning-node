@@ -54,7 +54,7 @@ use crate::routes::{
 };
 use crate::utils::{start_daemon, AppState, LOGS_DIR};
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() -> Result<()> {
     let args = args::parse_startup_args()?;
 
