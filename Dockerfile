@@ -1,12 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM lukemathwalker/cargo-chef:latest-rust-1.87.0-bookworm AS chef
-WORKDIR /app
-
-FROM chef AS planner
-COPY . .
-RUN cargo chef prepare --recipe-path recipe.json
-
-FROM chef AS builder
+FROM rust:1.87.0-bookworm AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -18,42 +11,57 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
 
-# Optimize for specific architectures
-RUN if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
-        export RUSTFLAGS="-C target-cpu=cortex-a72 -C opt-level=2"; \
-    elif [ "$TARGETPLATFORM" = "linux/amd64" ]; then \
-        export RUSTFLAGS="-C target-cpu=x86-64 -C opt-level=3"; \
-    else \
-        export RUSTFLAGS="-C opt-level=2"; \
-    fi
+WORKDIR /app
 
-# Set optimal build jobs based on platform
-ENV CARGO_BUILD_JOBS="4"
+# Copy the Git submodule first (required for dependency resolution)
+COPY rust-lightning rust-lightning/
+
+# Copy manifests for dependency caching
+COPY ./Cargo.lock ./Cargo.lock
+COPY ./Cargo.toml ./Cargo.toml
+
+# Set optimal build jobs and environment based on platform
 ENV CARGO_NET_RETRY="10"
 ENV CARGO_NET_TIMEOUT="60"
 
-# Copy the recipe from planner stage
-COPY --from=planner /app/recipe.json recipe.json
+# Create a dummy main.rs to cache dependencies
+RUN mkdir -p src && echo "fn main() {}" > src/main.rs
 
-# Build only dependencies (this will be cached)
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/target \
-    cargo chef cook --release --recipe-path recipe.json
-
-# Copy source code
-COPY . .
-
-# Build application with optimizations
+# Cache dependencies with optimized settings
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
     if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
-        RUSTFLAGS="-C target-cpu=cortex-a72 -C opt-level=2 -C codegen-units=1"; \
+        export RUSTFLAGS="-C target-cpu=cortex-a72 -C opt-level=2" && \
+        export CARGO_BUILD_JOBS="4"; \
     elif [ "$TARGETPLATFORM" = "linux/amd64" ]; then \
-        RUSTFLAGS="-C target-cpu=x86-64 -C opt-level=3"; \
+        export RUSTFLAGS="-C target-cpu=x86-64 -C opt-level=3" && \
+        export CARGO_BUILD_JOBS="6"; \
     else \
-        RUSTFLAGS="-C opt-level=2"; \
+        export RUSTFLAGS="-C opt-level=2" && \
+        export CARGO_BUILD_JOBS="4"; \
+    fi && \
+    cargo build --release --locked
+
+# Remove the dummy source
+RUN rm -rf src/
+
+# Copy source code
+COPY ./src ./src
+
+# Build application with platform-specific optimizations
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+        export RUSTFLAGS="-C target-cpu=cortex-a72 -C opt-level=2 -C codegen-units=1" && \
+        export CARGO_BUILD_JOBS="4"; \
+    elif [ "$TARGETPLATFORM" = "linux/amd64" ]; then \
+        export RUSTFLAGS="-C target-cpu=x86-64 -C opt-level=3" && \
+        export CARGO_BUILD_JOBS="6"; \
+    else \
+        export RUSTFLAGS="-C opt-level=2" && \
+        export CARGO_BUILD_JOBS="4"; \
     fi && \
     cargo build --release --locked && \
     cp target/release/rgb-lightning-node /usr/local/bin/rgb-lightning-node
