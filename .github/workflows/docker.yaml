@@ -17,7 +17,8 @@ jobs:
   prepare:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      version: ${{ steps.meta.outputs.version }}
+      tags: ${{ steps.meta.outputs.tags }}
     steps:
       - name: Extract Docker metadata
         id: meta
@@ -32,11 +33,6 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=sha
-
-      - name: Set build matrix
-        id: set-matrix
-        run: |
-          echo "matrix=$(echo '${{ steps.meta.outputs.json }}' | jq -c .)" >> $GITHUB_OUTPUT
 
   build-amd64:
     needs: prepare
@@ -63,6 +59,8 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE_NAME }}
+          flavor: |
+            suffix=-amd64
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=ref,event=branch
@@ -113,6 +111,8 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE_NAME }}
+          flavor: |
+            suffix=-arm64
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=ref,event=branch
@@ -131,4 +131,34 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=arm64
-          cache-to: type=gha,mode=max,scope=arm64 
+          cache-to: type=gha,mode=max,scope=arm64
+
+  create-manifest:
+    needs: [prepare, build-amd64, build-arm64]
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create and push manifest
+        run: |
+          # For each tag, create a multi-arch manifest
+          echo "${{ needs.prepare.outputs.tags }}" | while read -r tag; do
+            if [ ! -z "$tag" ]; then
+              # Create manifest
+              docker manifest create "$tag" \
+                "$tag-amd64" \
+                "$tag-arm64"
+              
+              # Add architecture-specific annotations
+              docker manifest annotate "$tag" "$tag-amd64" --os linux --arch amd64
+              docker manifest annotate "$tag" "$tag-arm64" --os linux --arch arm64
+              
+              # Push manifest
+              docker manifest push "$tag"
+            fi
+          done
