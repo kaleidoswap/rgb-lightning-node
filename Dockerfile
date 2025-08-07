@@ -1,17 +1,9 @@
 FROM rust:1.89-slim-bookworm AS builder
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake \
-    git \
-    && rm -rf /var/lib/apt/lists/*
+COPY . .
 
-# Create a new empty shell project
-RUN USER=root cargo new --bin app
-WORKDIR /app
+RUN cargo build
 
-# Copy the Git submodule first
-COPY rust-lightning rust-lightning/
 
 # Copy manifests
 COPY ./Cargo.lock ./Cargo.lock
