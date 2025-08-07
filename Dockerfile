@@ -13,33 +13,27 @@ WORKDIR /app
 # Copy the Git submodule first
 COPY rust-lightning rust-lightning/
 
-# Copy manifests
+# Copy manifests first for better caching
 COPY ./Cargo.lock ./Cargo.lock
 COPY ./Cargo.toml ./Cargo.toml
 
-# Cache dependencies
-RUN cargo fetch
-
-# Build only dependencies to cache them
-RUN cargo build --release --locked
-RUN rm src/*.rs
+# Build only dependencies (this layer will be cached if dependencies don't change)
+RUN cargo build --release --locked && rm src/*.rs target/release/deps/app*
 
 # Copy source code
 COPY ./src ./src
 
 # Set environment variables for optimal compilation
-ENV RUSTFLAGS="-C target-cpu=native"
-ENV CARGO_BUILD_JOBS="8"
+ENV RUSTFLAGS="-C target-cpu=generic -C opt-level=3 -C codegen-units=1 -C lto=thin"
+ENV CARGO_BUILD_JOBS="$(nproc)"
 
-# Build application
+# Build application (only app code will rebuild if dependencies haven't changed)
 RUN cargo build --release --locked
 
-FROM debian:bookworm-slim
+# Use distroless for smaller final image and better security
+FROM gcr.io/distroless/cc-debian12:nonroot
 
+# Copy the binary
 COPY --from=builder /app/target/release/rgb-lightning-node /usr/bin/rgb-lightning-node
-
-RUN apt-get update && apt install -y --no-install-recommends \
-    ca-certificates openssl \
-    && apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 ENTRYPOINT ["/usr/bin/rgb-lightning-node"]
