@@ -2,14 +2,15 @@ FROM rust:1.89-slim-bookworm AS builder
 
 COPY . .
 
-RUN cargo build
-
-
 RUN cargo build --release
 
+# Start a new stage for the final image
+FROM debian:bookworm-slim
+
+# Copy the binary from the builder stage
 COPY --from=builder ./target/release/rgb-lightning-node /usr/bin/rgb-lightning-node
 
-RUN apt-get update && apt install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates openssl \
     && apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
