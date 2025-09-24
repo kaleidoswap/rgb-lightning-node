@@ -2,11 +2,9 @@ name: Build and Push Docker Image
 
 on:
   push:
-    branches: [ "docker", "main" ]
+    branches: [ "main" ]
     tags:
       - 'v*.*.*'
-  pull_request:
-    branches: [ "docker", "main" ]
   workflow_dispatch:
 
 env:
@@ -32,7 +30,6 @@ jobs:
         uses: docker/setup-buildx-action@v3
             
       - name: Login to Docker Hub
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -45,89 +42,15 @@ jobs:
           images: ${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
-            type=ref,event=branch,enable={{is_default_branch}}
-            type=ref,event=pr
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=sha,prefix={{branch}}-
 
       - name: Build and push multi-arch image
         uses: docker/build-push-action@v5
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          build-args: |
-            BUILDKIT_INLINE_CACHE=1
-          # ARM64 optimizations
-          provenance: false
-          sbom: false
-
-  # Optional: Create separate architecture-specific tags for debugging
-  build-arch-specific:
-    runs-on: ubuntu-latest
-    timeout-minutes: 180
-    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
-    strategy:
-      matrix:
-        platform: [linux/amd64, linux/arm64]
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Set up QEMU
-        if: matrix.platform == 'linux/arm64'
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Extract platform suffix
-        id: platform
-        run: |
-          platform_pair=${{ matrix.platform }}
-          platform_suffix=${platform_pair#*/}
-          echo "suffix=$platform_suffix" >> $GITHUB_OUTPUT
-
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          flavor: |
-            suffix=-${{ steps.platform.outputs.suffix }}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-
-      - name: Build and push platform-specific image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          platforms: ${{ matrix.platform }}
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ steps.platform.outputs.suffix }}
-          cache-to: type=gha,mode=max,scope=${{ steps.platform.outputs.suffix }}
-          build-args: |
-            BUILDKIT_INLINE_CACHE=1
-          provenance: false
-          sbom: false
