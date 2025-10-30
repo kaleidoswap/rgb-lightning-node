@@ -36,6 +36,9 @@ pub enum APIError {
     #[error("Batch transfer not found")]
     BatchTransferNotFound,
 
+    #[error("Cannot close channel")]
+    CannotCloseChannel(String),
+
     #[error("Cannot estimate fees")]
     CannotEstimateFees,
 
@@ -180,6 +183,9 @@ pub enum APIError {
     #[error("Invalid pubkey")]
     InvalidPubkey,
 
+    #[error("The provided recipient data is invalid: {0}")]
+    InvalidRecipientData(String),
+
     #[error("The provided recipient ID is neither a blinded UTXO or a script")]
     InvalidRecipientID,
 
@@ -267,6 +273,9 @@ pub enum APIError {
     #[error("Unexpected error: {0}")]
     Unexpected(String),
 
+    #[error("Unknown channel ID")]
+    UnknownChannelId,
+
     #[error("Unknown RGB contract ID")]
     UnknownContractId,
 
@@ -347,6 +356,9 @@ impl From<RgbLibError> for APIError {
             RgbLibError::InvalidPrecision { details } => APIError::InvalidPrecision(details),
             RgbLibError::InvalidProxyProtocol { version } => {
                 APIError::InvalidProxyProtocol(version)
+            }
+            RgbLibError::InvalidRecipientData { details } => {
+                APIError::InvalidRecipientData(details)
             }
             RgbLibError::InvalidRecipientID => APIError::InvalidRecipientID,
             RgbLibError::InvalidRecipientNetwork => APIError::InvalidRecipientNetwork,
@@ -429,6 +441,7 @@ impl IntoResponse for APIError {
             | APIError::InvalidPeerInfo(_)
             | APIError::InvalidPrecision(_)
             | APIError::InvalidPubkey
+            | APIError::InvalidRecipientData(_)
             | APIError::InvalidRecipientID
             | APIError::InvalidRecipientNetwork
             | APIError::InvalidSwap(_)
@@ -450,6 +463,7 @@ impl IntoResponse for APIError {
             | APIError::AlreadyUnlocked
             | APIError::AuthenticationDisabled
             | APIError::BatchTransferNotFound
+            | APIError::CannotCloseChannel(_)
             | APIError::CannotEstimateFees
             | APIError::CannotFailBatchTransfer
             | APIError::ChangingState
@@ -476,6 +490,7 @@ impl IntoResponse for APIError {
             | APIError::RecipientIDAlreadyUsed
             | APIError::SwapNotFound(_)
             | APIError::TemporaryChannelIdAlreadyUsed
+            | APIError::UnknownChannelId
             | APIError::UnknownContractId
             | APIError::UnknownLNInvoice
             | APIError::UnknownTemporaryChannelId
