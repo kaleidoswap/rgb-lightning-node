@@ -244,10 +244,10 @@ The node currently exposes the following APIs:
 - `/restore` (POST)
 - `/revoketoken` (POST)
 - `/rgbinvoice` (POST)
-- `/sendasset` (POST)
 - `/sendbtc` (POST)
 - `/sendonionmessage` (POST)
 - `/sendpayment` (POST)
+- `/sendrgb` (POST)
 - `/shutdown` (POST)
 - `/signmessage` (POST)
 - `/sync` (POST)
@@ -289,7 +289,7 @@ biscuit keypair
 # alternatively, you can export just the private key
 biscuit keypair --only-private-key > private-key-file
 # and later derive the public key from it
-biscuit keypair --from-private-key-file private-key-file --only-public-key
+biscuit keypair --from-file private-key-file --only-public-key
 ```
 
 Save the private key in a secure way (e.g. in a secret manager).
