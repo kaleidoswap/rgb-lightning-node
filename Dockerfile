@@ -18,6 +18,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 
 COPY --from=planner /app/recipe.json recipe.json
+COPY rust-lightning/ rust-lightning/
 RUN cargo chef cook --release --recipe-path recipe.json
 
 COPY . .
