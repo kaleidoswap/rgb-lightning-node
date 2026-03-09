@@ -8,10 +8,11 @@ use biscuit_auth::Biscuit;
 use bitcoin::hashes::sha256::{self, Hash as Sha256};
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::PublicKey;
+use bitcoin::constants::ChainHash;
 use bitcoin::{Network, ScriptBuf};
 use hex::DisplayHex;
 use lightning::ln::{channelmanager::OptionalOfferPaymentParams, types::ChannelId};
-use lightning::offers::offer::{self, Offer};
+use lightning::offers::offer::{self, Offer, Quantity};
 use lightning::onion_message::messenger::Destination;
 use lightning::rgb_utils::{
     get_rgb_channel_info_path, get_rgb_payment_info_path, parse_rgb_channel_info,
@@ -69,6 +70,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use std::num::NonZeroU64;
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
@@ -389,6 +391,40 @@ impl From<RgbLibNetwork> for BitcoinNetwork {
     }
 }
 
+fn chain_hash_to_bitcoin_network(chain_hash: ChainHash) -> Option<BitcoinNetwork> {
+    if chain_hash == ChainHash::using_genesis_block(Network::Bitcoin) {
+        Some(BitcoinNetwork::Mainnet)
+    } else if chain_hash == ChainHash::using_genesis_block(Network::Testnet) {
+        Some(BitcoinNetwork::Testnet)
+    } else if chain_hash == ChainHash::using_genesis_block(Network::Testnet4) {
+        Some(BitcoinNetwork::Testnet4)
+    } else if chain_hash == ChainHash::using_genesis_block(Network::Signet) {
+        Some(BitcoinNetwork::Signet)
+    } else if chain_hash == ChainHash::using_genesis_block(Network::Regtest) {
+        Some(BitcoinNetwork::Regtest)
+    } else {
+        None
+    }
+}
+
+fn quantity_to_supported_quantity_max(quantity: Quantity) -> Option<u64> {
+    match quantity {
+        Quantity::One => None,
+        Quantity::Unbounded => Some(0),
+        Quantity::Bounded(n) => Some(n.get()),
+    }
+}
+
+fn supported_quantity_max_to_quantity(quantity_max: Option<u64>) -> Result<Quantity, APIError> {
+    match quantity_max {
+        None => Ok(Quantity::One),
+        Some(0) => Ok(Quantity::Unbounded),
+        Some(value) => NonZeroU64::new(value)
+            .map(Quantity::Bounded)
+            .ok_or_else(|| APIError::InvalidAmount(s!("supported quantity cannot be zero"))),
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct BlockTime {
     pub(crate) height: u32,
@@ -491,6 +527,11 @@ pub(crate) struct DecodeLNInvoiceRequest {
 }
 
 #[derive(Deserialize, Serialize)]
+pub(crate) struct DecodeOfferRequest {
+    pub(crate) offer: String,
+}
+
+#[derive(Deserialize, Serialize)]
 pub(crate) struct DecodeLNInvoiceResponse {
     pub(crate) amt_msat: Option<u64>,
     pub(crate) expiry_sec: u64,
@@ -501,6 +542,20 @@ pub(crate) struct DecodeLNInvoiceResponse {
     pub(crate) payment_secret: String,
     pub(crate) payee_pubkey: Option<String>,
     pub(crate) network: BitcoinNetwork,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct DecodeOfferResponse {
+    pub(crate) amt_msat: Option<u64>,
+    pub(crate) description: Option<String>,
+    pub(crate) issuer: Option<String>,
+    pub(crate) expiry_sec: Option<u64>,
+    pub(crate) is_expired: bool,
+    pub(crate) chains: Vec<BitcoinNetwork>,
+    pub(crate) supported_quantity_max: Option<u64>,
+    pub(crate) issuer_signing_pubkey: Option<String>,
+    pub(crate) path_count: usize,
+    pub(crate) offer_id: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -824,6 +879,22 @@ pub(crate) struct LNInvoiceRequest {
 #[derive(Deserialize, Serialize)]
 pub(crate) struct LNInvoiceResponse {
     pub(crate) invoice: String,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct LNOfferRequest {
+    pub(crate) amt_msat: Option<u64>,
+    pub(crate) description: Option<String>,
+    pub(crate) issuer: Option<String>,
+    pub(crate) expiry_sec: Option<u32>,
+    pub(crate) supported_quantity_max: Option<u64>,
+    pub(crate) asset_id: Option<String>,
+    pub(crate) asset_amount: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct LNOfferResponse {
+    pub(crate) offer: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1657,6 +1728,38 @@ pub(crate) async fn decode_ln_invoice(
         payment_secret: hex_str(&invoice.payment_secret().0),
         payee_pubkey: invoice.payee_pub_key().map(|p| p.to_string()),
         network: invoice.network().into(),
+    }))
+}
+
+pub(crate) async fn decode_offer(
+    State(state): State<Arc<AppState>>,
+    WithRejection(Json(payload), _): WithRejection<Json<DecodeOfferRequest>, APIError>,
+) -> Result<Json<DecodeOfferResponse>, APIError> {
+    let _guard = state.get_unlocked_app_state();
+
+    let offer = Offer::from_str(&payload.offer)
+        .map_err(|e| APIError::InvalidInvoice(format!("{e:?}")))?;
+
+    let amt_msat = match offer.amount() {
+        Some(offer::Amount::Bitcoin { amount_msats }) => Some(amount_msats),
+        _ => None,
+    };
+
+    Ok(Json(DecodeOfferResponse {
+        amt_msat,
+        description: offer.description().map(|d| d.to_string()),
+        issuer: offer.issuer().map(|i| i.to_string()),
+        expiry_sec: offer.absolute_expiry().map(|d| d.as_secs()),
+        is_expired: offer.is_expired(),
+        chains: offer
+            .chains()
+            .into_iter()
+            .filter_map(chain_hash_to_bitcoin_network)
+            .collect(),
+        supported_quantity_max: quantity_to_supported_quantity_max(offer.supported_quantity()),
+        issuer_signing_pubkey: offer.issuer_signing_pubkey().map(|p| p.to_string()),
+        path_count: offer.paths().len(),
+        offer_id: hex_str(&offer.id().0),
     }))
 }
 
@@ -2725,6 +2828,53 @@ pub(crate) async fn ln_invoice(
 
         Ok(Json(LNInvoiceResponse {
             invoice: invoice.to_string(),
+        }))
+    })
+    .await
+}
+
+pub(crate) async fn ln_offer(
+    State(state): State<Arc<AppState>>,
+    WithRejection(Json(payload), _): WithRejection<Json<LNOfferRequest>, APIError>,
+) -> Result<Json<LNOfferResponse>, APIError> {
+    no_cancel(async move {
+        let guard = state.check_unlocked().await?;
+        let unlocked_state = guard.as_ref().unwrap();
+
+        if payload.asset_id.is_some() || payload.asset_amount.is_some() {
+            return Err(APIError::InvalidRequest(s!(
+                "RGB assets are not yet supported in BOLT12 offers"
+            )));
+        }
+
+        let supported_quantity =
+            supported_quantity_max_to_quantity(payload.supported_quantity_max)?;
+
+        let mut offer_builder = unlocked_state
+            .channel_manager
+            .create_offer_builder()
+            .map_err(|e| APIError::FailedOfferCreation(format!("{e:?}")))?
+            .description(payload.description.unwrap_or_default())
+            .supported_quantity(supported_quantity);
+
+        if let Some(amt_msat) = payload.amt_msat {
+            offer_builder = offer_builder.amount_msats(amt_msat);
+        }
+        if let Some(issuer) = payload.issuer {
+            offer_builder = offer_builder.issuer(issuer);
+        }
+        if let Some(expiry_sec) = payload.expiry_sec {
+            offer_builder = offer_builder.absolute_expiry(Duration::from_secs(
+                get_current_timestamp() + expiry_sec as u64,
+            ));
+        }
+
+        let offer = offer_builder
+            .build()
+            .map_err(|e| APIError::FailedOfferCreation(format!("{e:?}")))?;
+
+        Ok(Json(LNOfferResponse {
+            offer: offer.to_string(),
         }))
     })
     .await
