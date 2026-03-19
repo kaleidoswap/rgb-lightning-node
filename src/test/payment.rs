@@ -1,9 +1,20 @@
+use bitcoin::hashes::sha256::Hash as Sha256;
+use bitcoin::hashes::Hash;
+
 use crate::routes::{BitcoinNetwork, TransactionType, TransferKind, TransferStatus};
+use crate::utils::hex_str;
 
 use super::*;
 
 const TEST_DIR_BASE: &str = "tmp/payment/";
 const SHORT_EXPIRY_SEC: u32 = 1;
+
+fn assert_payment_preimage_matches_hash(payment: &Payment, expected_payment_hash: &str) {
+    let payment_preimage = payment.preimage.as_ref().unwrap();
+    let payment_preimage_hash =
+        hex_str(&Sha256::hash(&hex_str_to_vec(payment_preimage).unwrap()).to_byte_array());
+    assert_eq!(payment_preimage_hash, expected_payment_hash);
+}
 
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -64,10 +75,24 @@ async fn success() {
     assert_eq!(payment.asset_id, Some(asset_id.clone()));
     assert_eq!(payment.asset_amount, asset_amount);
     assert_eq!(payment.status, HTLCStatus::Succeeded);
+    assert_payment_preimage_matches_hash(&payment, &decoded.payment_hash);
     let payment = get_payment(node2_addr, &decoded.payment_hash).await;
     assert_eq!(payment.asset_id, Some(asset_id.clone()));
     assert_eq!(payment.asset_amount, asset_amount);
     assert_eq!(payment.status, HTLCStatus::Succeeded);
+    assert_payment_preimage_matches_hash(&payment, &decoded.payment_hash);
+    let payment = list_payments(node1_addr)
+        .await
+        .into_iter()
+        .find(|payment| payment.payment_hash == decoded.payment_hash)
+        .unwrap();
+    assert_payment_preimage_matches_hash(&payment, &decoded.payment_hash);
+    let payment = list_payments(node2_addr)
+        .await
+        .into_iter()
+        .find(|payment| payment.payment_hash == decoded.payment_hash)
+        .unwrap();
+    assert_payment_preimage_matches_hash(&payment, &decoded.payment_hash);
 
     let asset_amount = Some(50);
     let LNInvoiceResponse { invoice } =
@@ -86,10 +111,12 @@ async fn success() {
     assert_eq!(payment.asset_id, Some(asset_id.clone()));
     assert_eq!(payment.asset_amount, asset_amount);
     assert_eq!(payment.status, HTLCStatus::Succeeded);
+    assert_payment_preimage_matches_hash(&payment, &decoded.payment_hash);
     let payment = get_payment(node2_addr, &decoded.payment_hash).await;
     assert_eq!(payment.asset_id, Some(asset_id.clone()));
     assert_eq!(payment.asset_amount, asset_amount);
     assert_eq!(payment.status, HTLCStatus::Succeeded);
+    assert_payment_preimage_matches_hash(&payment, &decoded.payment_hash);
 
     let LNInvoiceResponse { invoice } =
         ln_invoice(node2_addr, None, Some(&asset_id), asset_amount, 900).await;
@@ -100,10 +127,12 @@ async fn success() {
     assert_eq!(payment.asset_id, Some(asset_id.clone()));
     assert_eq!(payment.asset_amount, asset_amount);
     assert_eq!(payment.status, HTLCStatus::Succeeded);
+    assert_payment_preimage_matches_hash(&payment, &decoded.payment_hash);
     let payment = get_payment(node2_addr, &decoded.payment_hash).await;
     assert_eq!(payment.asset_id, Some(asset_id.clone()));
     assert_eq!(payment.asset_amount, asset_amount);
     assert_eq!(payment.status, HTLCStatus::Succeeded);
+    assert_payment_preimage_matches_hash(&payment, &decoded.payment_hash);
 
     let LNInvoiceResponse { invoice } =
         ln_invoice(node1_addr, None, Some(&asset_id), asset_amount, 900).await;
@@ -114,10 +143,12 @@ async fn success() {
     assert_eq!(payment.asset_id, Some(asset_id.clone()));
     assert_eq!(payment.asset_amount, asset_amount);
     assert_eq!(payment.status, HTLCStatus::Succeeded);
+    assert_payment_preimage_matches_hash(&payment, &decoded.payment_hash);
     let payment = get_payment(node2_addr, &decoded.payment_hash).await;
     assert_eq!(payment.asset_id, Some(asset_id.clone()));
     assert_eq!(payment.asset_amount, asset_amount);
     assert_eq!(payment.status, HTLCStatus::Succeeded);
+    assert_payment_preimage_matches_hash(&payment, &decoded.payment_hash);
 
     let channels_1 = list_channels(node1_addr).await;
     let channels_2 = list_channels(node2_addr).await;
