@@ -44,7 +44,7 @@ use crate::routes::{
     SendPaymentResponse, SendRgbRequest, SendRgbResponse, Swap, SwapStatus, TakerRequest,
     Transaction, Transfer, UnlockRequest, Unspent, WitnessData,
 };
-use crate::utils::{hex_str, hex_str_to_vec, ELECTRUM_URL_REGTEST, PROXY_ENDPOINT_LOCAL};
+use crate::utils::{hex_str, hex_str_to_vec, AppState, ELECTRUM_URL_REGTEST, PROXY_ENDPOINT_LOCAL};
 
 use super::*;
 
@@ -148,12 +148,12 @@ fn _get_txout(txid: &str) -> String {
     .unwrap()
 }
 
-async fn start_daemon(
+pub(crate) async fn start_daemon_with_state(
     node_test_dir: &str,
     node_peer_port: u16,
     root_public_key: Option<biscuit_auth::PublicKey>,
     keep_node_dir: bool,
-) -> SocketAddr {
+) -> (SocketAddr, Arc<AppState>) {
     if !keep_node_dir && Path::new(&node_test_dir).is_dir() {
         std::fs::remove_dir_all(node_test_dir).unwrap();
     }
@@ -166,14 +166,26 @@ async fn start_daemon(
         root_public_key,
         ..Default::default()
     };
+    let (router, app_state) = app(args).await.unwrap();
+    let app_state_for_server = app_state.clone();
     tokio::spawn(async move {
-        let (router, app_state) = app(args).await.unwrap();
         axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown_signal(app_state))
+            .with_graceful_shutdown(shutdown_signal(app_state_for_server))
             .await
             .unwrap();
     });
-    node_address
+    (node_address, app_state)
+}
+
+async fn start_daemon(
+    node_test_dir: &str,
+    node_peer_port: u16,
+    root_public_key: Option<biscuit_auth::PublicKey>,
+    keep_node_dir: bool,
+) -> SocketAddr {
+    start_daemon_with_state(node_test_dir, node_peer_port, root_public_key, keep_node_dir)
+        .await
+        .0
 }
 
 async fn init(node_address: SocketAddr, password: &str, mnemonic: Option<String>) -> InitResponse {
@@ -240,6 +252,27 @@ async fn start_node(
 
     println!("node on peer port {node_peer_port} started with address {node_address:?}");
     (node_address, password)
+}
+
+pub(crate) async fn start_node_with_state(
+    node_test_dir: &str,
+    node_peer_port: u16,
+    keep_node_dir: bool,
+) -> (SocketAddr, String, Arc<AppState>) {
+    println!("starting node with peer port {node_peer_port}");
+    let (node_address, app_state) =
+        start_daemon_with_state(node_test_dir, node_peer_port, None, keep_node_dir).await;
+
+    let password = format!("{node_test_dir}.{node_peer_port}");
+
+    if !keep_node_dir {
+        init(node_address, &password, None).await;
+    }
+
+    unlock(node_address, &password).await;
+
+    println!("node on peer port {node_peer_port} started with address {node_address:?}");
+    (node_address, password, app_state)
 }
 
 async fn address(node_address: SocketAddr) -> String {

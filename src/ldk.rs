@@ -2360,3 +2360,68 @@ pub(crate) async fn stop_ldk(app_state: Arc<AppState>) {
 
     tracing::info!("Stopped LDK");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test::{initialize, start_node_with_state};
+    use tracing_test::traced_test;
+
+    const TEST_DIR_BASE: &str = "tmp/channel_pending_panic_releases_openchannel_lock/";
+
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[traced_test]
+    async fn channel_pending_panic_releases_openchannel_lock() {
+        initialize();
+
+        let test_dir_node1 = format!("{TEST_DIR_BASE}node1");
+        let (_, _, app_state) = start_node_with_state(&test_dir_node1, 9811, false).await;
+
+        let unlocked_state = {
+            let guard = app_state.get_unlocked_app_state().await;
+            guard.as_ref().unwrap().clone()
+        };
+
+        *unlocked_state.rgb_send_lock.lock().unwrap() = true;
+
+        let wallet = unlocked_state.rgb_wallet_wrapper.wallet.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = wallet.lock().unwrap();
+            panic!("poison wallet mutex");
+        })
+        .join();
+        assert!(unlocked_state.rgb_wallet_wrapper.wallet.lock().is_err());
+
+        let funding_txo = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_str(
+                "0101010101010101010101010101010101010101010101010101010101010101",
+            )
+            .unwrap(),
+            vout: 0,
+        };
+        let psbt_path = app_state
+            .static_state
+            .ldk_data_dir
+            .join(format!("psbt_{}", funding_txo.txid));
+        fs::write(psbt_path, "dummy psbt").unwrap();
+
+        let event = Event::ChannelPending {
+            channel_id: ChannelId::from_bytes([1; 32]),
+            user_channel_id: 42,
+            former_temporary_channel_id: Some(ChannelId::from_bytes([2; 32])),
+            counterparty_node_id: PublicKey::from_str(
+                "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+            )
+            .unwrap(),
+            funding_txo,
+            channel_type: None,
+            funding_redeem_script: None,
+        };
+
+        let res = handle_ldk_events(event, unlocked_state.clone(), app_state.static_state.clone()).await;
+
+        assert!(res.is_err());
+        assert!(!*unlocked_state.rgb_send_lock.lock().unwrap());
+    }
+}
