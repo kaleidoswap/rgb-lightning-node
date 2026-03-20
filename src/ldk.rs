@@ -1074,21 +1074,28 @@ async fn handle_ldk_events(
                     is_channel_rgb(&channel_id, &PathBuf::from(&static_state.ldk_data_dir));
                 tracing::info!("Initiator of the channel (colored: {})", is_chan_colored);
 
-                let _txid = tokio::task::spawn_blocking(move || {
+                let txid_result = tokio::task::spawn_blocking(move || {
                     if is_chan_colored {
                         state_copy.rgb_send_end(psbt_str_copy).map(|r| r.txid)
                     } else {
                         state_copy.rgb_send_btc_end(psbt_str_copy)
                     }
                 })
-                .await
-                .unwrap()
-                .map_err(|e| {
-                    tracing::error!("Error completing channel opening: {e:?}");
-                    ReplayEvent()
-                })?;
+                .await;
 
                 *unlocked_state.rgb_send_lock.lock().unwrap() = false;
+
+                match txid_result {
+                    Ok(Ok(_txid)) => {}
+                    Ok(Err(e)) => {
+                        tracing::error!("Error completing channel opening: {e:?}");
+                        return Err(ReplayEvent());
+                    }
+                    Err(e) => {
+                        tracing::error!("Channel opening task panicked: {e:?}");
+                        return Err(ReplayEvent());
+                    }
+                }
             } else {
                 // acceptor
                 let consignment_path = static_state
@@ -1121,12 +1128,17 @@ async fn handle_ldk_events(
                 hex_str(&counterparty_node_id.serialize()),
             );
 
-            tokio::task::spawn_blocking(move || {
+            match tokio::task::spawn_blocking(move || {
                 unlocked_state.rgb_refresh(false).unwrap();
                 unlocked_state.rgb_refresh(true).unwrap()
             })
             .await
-            .unwrap();
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!("RGB refresh task panicked on channel ready: {e:?}");
+                }
+            }
         }
         Event::ChannelClosed {
             channel_id,
@@ -2419,7 +2431,12 @@ mod tests {
             funding_redeem_script: None,
         };
 
-        let res = handle_ldk_events(event, unlocked_state.clone(), app_state.static_state.clone()).await;
+        let res = handle_ldk_events(
+            event,
+            unlocked_state.clone(),
+            app_state.static_state.clone(),
+        )
+        .await;
 
         assert!(res.is_err());
         assert!(!*unlocked_state.rgb_send_lock.lock().unwrap());
