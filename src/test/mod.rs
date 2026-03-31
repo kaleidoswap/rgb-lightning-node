@@ -23,15 +23,16 @@ use tracing_test::traced_test;
 use crate::error::APIErrorResponse;
 use crate::ldk::FEE_RATE;
 use crate::routes::{
-    AddressResponse, AssetBalanceRequest, AssetBalanceResponse, AssetCFA, AssetNIA, AssetUDA,
-    Assignment, BackupRequest, BtcBalanceRequest, BtcBalanceResponse, ChangePasswordRequest,
-    Channel, CloseChannelRequest, ConnectPeerRequest, CreateUtxosRequest, DecodeLNInvoiceRequest,
-    DecodeLNInvoiceResponse, DecodeRGBInvoiceRequest, DecodeRGBInvoiceResponse,
-    DisconnectPeerRequest, EmptyResponse, FailTransfersRequest, FailTransfersResponse,
-    GetAssetMediaRequest, GetAssetMediaResponse, GetChannelIdRequest, GetChannelIdResponse,
-    GetPaymentRequest, GetPaymentResponse, GetSwapRequest, GetSwapResponse, HTLCStatus,
-    InitRequest, InitResponse, InvoiceStatus, InvoiceStatusRequest, InvoiceStatusResponse,
-    IssueAssetCFARequest, IssueAssetCFAResponse, IssueAssetNIARequest, IssueAssetNIAResponse,
+    AddressResponse, AssetBalanceRequest, AssetBalanceResponse, AssetCFA, AssetIFA, AssetNIA,
+    AssetUDA, Assignment, BackupRequest, BtcBalanceRequest, BtcBalanceResponse,
+    ChangePasswordRequest, Channel, CloseChannelRequest, ConnectPeerRequest, CreateUtxosRequest,
+    DecodeLNInvoiceRequest, DecodeLNInvoiceResponse, DecodeRGBInvoiceRequest,
+    DecodeRGBInvoiceResponse, DisconnectPeerRequest, EmptyResponse, FailTransfersRequest,
+    FailTransfersResponse, GetAssetMediaRequest, GetAssetMediaResponse, GetChannelIdRequest,
+    GetChannelIdResponse, GetPaymentRequest, GetPaymentResponse, GetSwapRequest, GetSwapResponse,
+    HTLCStatus, InflateRequest, InflateResponse, InitRequest, InitResponse, InvoiceStatus,
+    InvoiceStatusRequest, InvoiceStatusResponse, IssueAssetCFARequest, IssueAssetCFAResponse,
+    IssueAssetIFARequest, IssueAssetIFAResponse, IssueAssetNIARequest, IssueAssetNIAResponse,
     IssueAssetUDARequest, IssueAssetUDAResponse, KeysendRequest, KeysendResponse, LNInvoiceRequest,
     LNInvoiceResponse, ListAssetsRequest, ListAssetsResponse, ListChannelsResponse,
     ListPaymentsResponse, ListPeersResponse, ListSwapsResponse, ListTransactionsRequest,
@@ -54,6 +55,8 @@ const NODE3_PEER_PORT: u16 = 9803;
 const NODE4_PEER_PORT: u16 = 9804;
 const NODE5_PEER_PORT: u16 = 9805;
 const NODE6_PEER_PORT: u16 = 9806;
+
+const DURATION_SECONDS: u64 = 999;
 
 static INIT: Once = Once::new();
 
@@ -574,6 +577,27 @@ async fn get_channel_id(node_address: SocketAddr, temp_chan_id: &str) -> String 
         .channel_id
 }
 
+async fn inflate(node_address: SocketAddr, asset_id: &str, inflation_amount: u64) {
+    println!("inflating asset {asset_id} by {inflation_amount}");
+    let payload = InflateRequest {
+        asset_id: asset_id.to_string(),
+        inflation_amounts: vec![inflation_amount],
+        fee_rate: FEE_RATE,
+        min_confirmations: 1,
+    };
+    let res = reqwest::Client::new()
+        .post(format!("http://{node_address}/inflate"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    _check_response_is_ok(res)
+        .await
+        .json::<InflateResponse>()
+        .await
+        .unwrap();
+}
+
 async fn invoice_status(node_address: SocketAddr, invoice: &str) -> InvoiceStatus {
     println!("getting status of invoice {invoice} for node {node_address}");
     let payload = InvoiceStatusRequest {
@@ -615,6 +639,30 @@ async fn issue_asset_cfa(node_address: SocketAddr, file_path: Option<&str>) -> A
     _check_response_is_ok(res)
         .await
         .json::<IssueAssetCFAResponse>()
+        .await
+        .unwrap()
+        .asset
+}
+
+async fn issue_asset_ifa(node_address: SocketAddr) -> AssetIFA {
+    println!("issuing IFA asset on node {node_address}");
+    let payload = IssueAssetIFARequest {
+        amounts: vec![1000],
+        inflation_amounts: vec![2000],
+        ticker: s!("USDT"),
+        name: s!("Tether"),
+        precision: 0,
+        reject_list_url: None,
+    };
+    let res = reqwest::Client::new()
+        .post(format!("http://{node_address}/issueassetifa"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    _check_response_is_ok(res)
+        .await
+        .json::<IssueAssetIFAResponse>()
         .await
         .unwrap()
         .asset
@@ -1380,7 +1428,9 @@ async fn rgb_invoice_with_assignment(
         min_confirmations: 1,
         asset_id,
         assignment,
-        duration_seconds: None,
+        expiration_timestamp: Some(
+            OffsetDateTime::now_utc().unix_timestamp() as u64 + DURATION_SECONDS,
+        ),
         witness,
     };
     let res = reqwest::Client::new()
@@ -1431,6 +1481,9 @@ async fn send_assets(
         donation,
         fee_rate: FEE_RATE,
         min_confirmations: 1,
+        expiration_timestamp: Some(
+            OffsetDateTime::now_utc().unix_timestamp() as u64 + DURATION_SECONDS,
+        ),
         recipient_map,
         skip_sync: false,
     };
@@ -1885,6 +1938,7 @@ mod concurrent_openchannel;
 mod fail_transfers;
 mod getchannelid;
 mod htlc_amount_checks;
+mod inflate;
 mod init;
 mod invoice;
 mod issue;

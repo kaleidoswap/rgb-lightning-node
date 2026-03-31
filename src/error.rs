@@ -137,6 +137,9 @@ pub enum APIError {
     #[error("Trying to request fee estimation for an invalid block number")]
     InvalidEstimationBlocks,
 
+    #[error("Invalid expiration")]
+    InvalidExpiration,
+
     #[error("Invalid fee rate: {0}")]
     InvalidFeeRate(String),
 
@@ -190,6 +193,9 @@ pub enum APIError {
 
     #[error("The provided recipient ID is neither a blinded UTXO or a script")]
     InvalidRecipientID,
+
+    #[error("The provided recipient map is invalid")]
+    InvalidRecipientMap,
 
     #[error("The provided recipient ID is for a different network than the wallet's one")]
     InvalidRecipientNetwork,
@@ -293,6 +299,9 @@ pub enum APIError {
     #[error("The provided backup has an unsupported version: {version}")]
     UnsupportedBackupVersion { version: String },
 
+    #[error("Inflation is not supported by schema {0}")]
+    UnsupportedInflation(String),
+
     #[error("Layer 1 {0} is not supported")]
     UnsupportedLayer1(String),
 
@@ -356,12 +365,12 @@ impl From<RgbLibError> for APIError {
             }
             RgbLibError::InvalidAddress { details } => APIError::InvalidAddress(details),
             RgbLibError::InvalidAmountZero => APIError::InvalidAmount(s!("0")),
-            RgbLibError::InvalidAssetID { asset_id } => APIError::InvalidAssetID(asset_id),
             RgbLibError::InvalidAssignment => APIError::InvalidAssignment,
             RgbLibError::InvalidAttachments { details } => APIError::InvalidAttachments(details),
             RgbLibError::InvalidDetails { details } => APIError::InvalidDetails(details),
             RgbLibError::InvalidElectrum { details } => APIError::InvalidIndexer(details),
             RgbLibError::InvalidEstimationBlocks => APIError::InvalidEstimationBlocks,
+            RgbLibError::InvalidExpiration => APIError::InvalidExpiration,
             RgbLibError::InvalidFeeRate { details } => APIError::InvalidFeeRate(details),
             RgbLibError::InvalidFilePath { .. } => APIError::MediaFileNotProvided,
             RgbLibError::InvalidIndexer { details } => APIError::InvalidIndexer(details),
@@ -375,6 +384,7 @@ impl From<RgbLibError> for APIError {
                 APIError::InvalidRecipientData(details)
             }
             RgbLibError::InvalidRecipientID => APIError::InvalidRecipientID,
+            RgbLibError::InvalidRecipientMap => APIError::InvalidRecipientMap,
             RgbLibError::InvalidRecipientNetwork => APIError::InvalidRecipientNetwork,
             RgbLibError::InvalidTicker { details } => APIError::InvalidTicker(details),
             RgbLibError::InvalidTransportEndpoint { details } => {
@@ -386,6 +396,9 @@ impl From<RgbLibError> for APIError {
             RgbLibError::MaxFeeExceeded { txid } => APIError::MaxFeeExceeded(txid),
             RgbLibError::MinFeeNotMet { txid } => APIError::MinFeeNotMet(txid),
             RgbLibError::Network { details } => APIError::Network(details),
+            RgbLibError::NoInflationAmounts => {
+                APIError::InvalidAmount(s!("inflation request with no amounts or zero amounts"))
+            }
             RgbLibError::NoIssuanceAmounts => {
                 APIError::InvalidAmount(s!("issuance request with no provided amounts"))
             }
@@ -393,8 +406,14 @@ impl From<RgbLibError> for APIError {
             RgbLibError::OutputBelowDustLimit => APIError::OutputBelowDustLimit,
             RgbLibError::Proxy { details } => APIError::Network(format!("proxy err: {details}")),
             RgbLibError::RecipientIDAlreadyUsed => APIError::RecipientIDAlreadyUsed,
+            RgbLibError::TooHighInflationAmounts => {
+                APIError::InvalidAmount(s!("inflation amount exceeds the max possible supply"))
+            }
             RgbLibError::TooHighIssuanceAmounts => {
                 APIError::InvalidAmount(s!("trying to issue too many assets"))
+            }
+            RgbLibError::UnsupportedInflation { asset_schema } => {
+                APIError::UnsupportedInflation(format!("{asset_schema}"))
             }
             RgbLibError::UnsupportedLayer1 { layer_1 } => APIError::UnsupportedLayer1(layer_1),
             RgbLibError::UnsupportedTransportType => APIError::UnsupportedTransportType,
@@ -438,6 +457,7 @@ impl IntoResponse for APIError {
             | APIError::InvalidChannelID
             | APIError::InvalidDetails(_)
             | APIError::InvalidEstimationBlocks
+            | APIError::InvalidExpiration
             | APIError::InvalidFeeRate(_)
             | APIError::InvalidInvoice(_)
             | APIError::InvalidMediaDigest
@@ -453,6 +473,7 @@ impl IntoResponse for APIError {
             | APIError::InvalidPubkey
             | APIError::InvalidRecipientData(_)
             | APIError::InvalidRecipientID
+            | APIError::InvalidRecipientMap
             | APIError::InvalidRecipientNetwork
             | APIError::InvalidRequest(_)
             | APIError::InvalidSwap(_)
@@ -506,6 +527,7 @@ impl IntoResponse for APIError {
             | APIError::UnknownLNInvoice
             | APIError::UnknownTemporaryChannelId
             | APIError::UnlockedNode
+            | APIError::UnsupportedInflation(_)
             | APIError::UnsupportedLayer1(_)
             | APIError::UnsupportedTransportType => {
                 (StatusCode::FORBIDDEN, self.to_string(), self.name())

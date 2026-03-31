@@ -44,16 +44,16 @@ use lightning_invoice::{Bolt11Invoice, PaymentSecret};
 use regex::Regex;
 use rgb_lib::{
     bdk_wallet::keys::bip39::Mnemonic,
-    generate_keys,
+    keys::generate_keys,
     utils::recipient_id_from_script_buf,
     wallet::{
         rust_only::{
             check_indexer_url as rgb_lib_check_indexer_url,
             IndexerProtocol as RgbLibIndexerProtocol,
         },
-        AssetCFA as RgbLibAssetCFA, AssetNIA as RgbLibAssetNIA, AssetUDA as RgbLibAssetUDA,
-        Balance as RgbLibBalance, EmbeddedMedia as RgbLibEmbeddedMedia, Invoice as RgbLibInvoice,
-        Media as RgbLibMedia, ProofOfReserves as RgbLibProofOfReserves,
+        AssetCFA as RgbLibAssetCFA, AssetIFA as RgbLibAssetIFA, AssetNIA as RgbLibAssetNIA,
+        AssetUDA as RgbLibAssetUDA, Balance as RgbLibBalance, EmbeddedMedia as RgbLibEmbeddedMedia,
+        Invoice as RgbLibInvoice, Media as RgbLibMedia, ProofOfReserves as RgbLibProofOfReserves,
         Recipient as RgbLibRecipient, RecipientInfo, RecipientType as RgbLibRecipientType,
         Token as RgbLibToken, TokenLight as RgbLibTokenLight, WitnessData as RgbLibWitnessData,
     },
@@ -172,6 +172,43 @@ impl From<RgbLibAssetCFA> for AssetCFA {
 }
 
 #[derive(Deserialize, Serialize)]
+pub(crate) struct AssetIFA {
+    pub(crate) asset_id: String,
+    pub(crate) ticker: String,
+    pub(crate) name: String,
+    pub(crate) details: Option<String>,
+    pub(crate) precision: u8,
+    pub(crate) initial_supply: u64,
+    pub(crate) max_supply: u64,
+    pub(crate) known_circulating_supply: u64,
+    pub(crate) timestamp: i64,
+    pub(crate) added_at: i64,
+    pub(crate) balance: AssetBalanceResponse,
+    pub(crate) media: Option<Media>,
+    pub(crate) reject_list_url: Option<String>,
+}
+
+impl From<RgbLibAssetIFA> for AssetIFA {
+    fn from(value: RgbLibAssetIFA) -> Self {
+        Self {
+            asset_id: value.asset_id,
+            ticker: value.ticker,
+            name: value.name,
+            details: value.details,
+            precision: value.precision,
+            initial_supply: value.initial_supply,
+            max_supply: value.max_supply,
+            known_circulating_supply: value.known_circulating_supply,
+            timestamp: value.timestamp,
+            added_at: value.added_at,
+            balance: value.balance.into(),
+            media: value.media.map(|m| m.into()),
+            reject_list_url: value.reject_list_url,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
 pub(crate) struct AssetMetadataRequest {
     pub(crate) asset_id: String,
 }
@@ -226,6 +263,7 @@ pub(crate) enum AssetSchema {
     Nia,
     Uda,
     Cfa,
+    Ifa,
 }
 
 impl From<AssetSchema> for RgbLibAssetSchema {
@@ -234,6 +272,7 @@ impl From<AssetSchema> for RgbLibAssetSchema {
             AssetSchema::Nia => Self::Nia,
             AssetSchema::Uda => Self::Uda,
             AssetSchema::Cfa => Self::Cfa,
+            AssetSchema::Ifa => Self::Ifa,
         }
     }
 }
@@ -244,7 +283,7 @@ impl From<RgbLibAssetSchema> for AssetSchema {
             RgbLibAssetSchema::Nia => Self::Nia,
             RgbLibAssetSchema::Uda => Self::Uda,
             RgbLibAssetSchema::Cfa => Self::Cfa,
-            RgbLibAssetSchema::Ifa => todo!(),
+            RgbLibAssetSchema::Ifa => Self::Ifa,
         }
     }
 }
@@ -284,7 +323,6 @@ pub(crate) enum Assignment {
     Fungible(u64),
     NonFungible,
     InflationRight(u64),
-    ReplaceRight,
     Any,
 }
 
@@ -294,7 +332,6 @@ impl From<RgbLibAssignment> for Assignment {
             RgbLibAssignment::Fungible(amt) => Self::Fungible(amt),
             RgbLibAssignment::NonFungible => Self::NonFungible,
             RgbLibAssignment::InflationRight(amt) => Self::InflationRight(amt),
-            RgbLibAssignment::ReplaceRight => Self::ReplaceRight,
             RgbLibAssignment::Any => Self::Any,
         }
     }
@@ -306,7 +343,6 @@ impl From<Assignment> for RgbLibAssignment {
             Assignment::Fungible(amt) => Self::Fungible(amt),
             Assignment::NonFungible => Self::NonFungible,
             Assignment::InflationRight(amt) => Self::InflationRight(amt),
-            Assignment::ReplaceRight => Self::ReplaceRight,
             Assignment::Any => Self::Any,
         }
     }
@@ -335,7 +371,6 @@ impl From<Network> for BitcoinNetwork {
             Network::Testnet4 => Self::Testnet4,
             Network::Regtest => Self::Regtest,
             Network::Signet => Self::Signet,
-            _ => unimplemented!("unsupported network"),
         }
     }
 }
@@ -348,6 +383,7 @@ impl From<RgbLibNetwork> for BitcoinNetwork {
             RgbLibNetwork::Testnet4 => Self::Testnet4,
             RgbLibNetwork::Regtest => Self::Regtest,
             RgbLibNetwork::Signet => Self::Signet,
+            RgbLibNetwork::SignetCustom => todo!("fix when adding support to custom signet"),
         }
     }
 }
@@ -479,7 +515,7 @@ pub(crate) struct DecodeRGBInvoiceResponse {
     pub(crate) asset_id: Option<String>,
     pub(crate) assignment: Assignment,
     pub(crate) network: BitcoinNetwork,
-    pub(crate) expiration_timestamp: Option<i64>,
+    pub(crate) expiration_timestamp: Option<u64>,
     pub(crate) transport_endpoints: Vec<String>,
 }
 
@@ -599,6 +635,19 @@ impl From<RgbLibIndexerProtocol> for IndexerProtocol {
 }
 
 #[derive(Deserialize, Serialize)]
+pub(crate) struct InflateRequest {
+    pub(crate) asset_id: String,
+    pub(crate) inflation_amounts: Vec<u64>,
+    pub(crate) fee_rate: u64,
+    pub(crate) min_confirmations: u8,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct InflateResponse {
+    pub(crate) txid: String,
+}
+
+#[derive(Deserialize, Serialize)]
 pub(crate) struct InitRequest {
     pub(crate) password: String,
     pub(crate) mnemonic: Option<String>,
@@ -639,6 +688,21 @@ pub(crate) struct IssueAssetCFARequest {
 #[derive(Deserialize, Serialize)]
 pub(crate) struct IssueAssetCFAResponse {
     pub(crate) asset: AssetCFA,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct IssueAssetIFARequest {
+    pub(crate) amounts: Vec<u64>,
+    pub(crate) inflation_amounts: Vec<u64>,
+    pub(crate) ticker: String,
+    pub(crate) name: String,
+    pub(crate) precision: u8,
+    pub(crate) reject_list_url: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct IssueAssetIFAResponse {
+    pub(crate) asset: AssetIFA,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -694,6 +758,7 @@ pub(crate) struct ListAssetsResponse {
     pub(crate) nia: Option<Vec<AssetNIA>>,
     pub(crate) uda: Option<Vec<AssetUDA>>,
     pub(crate) cfa: Option<Vec<AssetCFA>>,
+    pub(crate) ifa: Option<Vec<AssetIFA>>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -952,7 +1017,7 @@ pub(crate) struct RgbAllocation {
 pub(crate) struct RgbInvoiceRequest {
     pub(crate) asset_id: Option<String>,
     pub(crate) assignment: Option<Assignment>,
-    pub(crate) duration_seconds: Option<u32>,
+    pub(crate) expiration_timestamp: Option<u64>,
     pub(crate) min_confirmations: u8,
     pub(crate) witness: bool,
 }
@@ -961,7 +1026,7 @@ pub(crate) struct RgbInvoiceRequest {
 pub(crate) struct RgbInvoiceResponse {
     pub(crate) recipient_id: String,
     pub(crate) invoice: String,
-    pub(crate) expiration_timestamp: Option<i64>,
+    pub(crate) expiration_timestamp: Option<u64>,
     pub(crate) batch_transfer_idx: i32,
 }
 
@@ -1006,6 +1071,7 @@ pub(crate) struct SendRgbRequest {
     pub(crate) donation: bool,
     pub(crate) fee_rate: u64,
     pub(crate) min_confirmations: u8,
+    pub(crate) expiration_timestamp: Option<u64>,
     pub(crate) recipient_map: HashMap<String, Vec<Recipient>>,
     pub(crate) skip_sync: bool,
 }
@@ -1154,7 +1220,7 @@ pub(crate) struct Transfer {
     pub(crate) recipient_id: Option<String>,
     pub(crate) receive_utxo: Option<String>,
     pub(crate) change_utxo: Option<String>,
-    pub(crate) expiration: Option<i64>,
+    pub(crate) expiration_timestamp: Option<u64>,
     pub(crate) transport_endpoints: Vec<TransferTransportEndpoint>,
 }
 
@@ -1169,6 +1235,7 @@ pub(crate) enum TransferKind {
 
 #[derive(Debug, PartialEq, Deserialize, Serialize)]
 pub(crate) enum TransferStatus {
+    Initiated,
     WaitingCounterparty,
     WaitingConfirmations,
     Settled,
@@ -1876,6 +1943,37 @@ pub(crate) async fn get_swap(
     Err(APIError::SwapNotFound(payload.payment_hash))
 }
 
+pub(crate) async fn inflate(
+    State(state): State<Arc<AppState>>,
+    WithRejection(Json(payload), _): WithRejection<Json<InflateRequest>, APIError>,
+) -> Result<Json<InflateResponse>, APIError> {
+    no_cancel(async move {
+        let guard = state.check_unlocked().await?;
+        let unlocked_state = guard.as_ref().unwrap();
+
+        if *unlocked_state.rgb_send_lock.lock().unwrap() {
+            return Err(APIError::OpenChannelInProgress);
+        }
+
+        let unlocked_state_copy = unlocked_state.clone();
+        let inflate_result = tokio::task::spawn_blocking(move || {
+            unlocked_state_copy.rgb_inflate(
+                payload.asset_id,
+                payload.inflation_amounts,
+                payload.fee_rate,
+                payload.min_confirmations,
+            )
+        })
+        .await
+        .unwrap()?;
+
+        Ok(Json(InflateResponse {
+            txid: inflate_result.txid,
+        }))
+    })
+    .await
+}
+
 pub(crate) async fn init(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<InitRequest>, APIError>,
@@ -1957,6 +2055,34 @@ pub(crate) async fn issue_asset_cfa(
         )?;
 
         Ok(Json(IssueAssetCFAResponse {
+            asset: asset.into(),
+        }))
+    })
+    .await
+}
+
+pub(crate) async fn issue_asset_ifa(
+    State(state): State<Arc<AppState>>,
+    WithRejection(Json(payload), _): WithRejection<Json<IssueAssetIFARequest>, APIError>,
+) -> Result<Json<IssueAssetIFAResponse>, APIError> {
+    no_cancel(async move {
+        let guard = state.check_unlocked().await?;
+        let unlocked_state = guard.as_ref().unwrap();
+
+        if *unlocked_state.rgb_send_lock.lock().unwrap() {
+            return Err(APIError::OpenChannelInProgress);
+        }
+
+        let asset = unlocked_state.rgb_issue_asset_ifa(
+            payload.ticker,
+            payload.name,
+            payload.precision,
+            payload.amounts,
+            payload.inflation_amounts,
+            payload.reject_list_url,
+        )?;
+
+        Ok(Json(IssueAssetIFAResponse {
             asset: asset.into(),
         }))
     })
@@ -2204,8 +2330,21 @@ pub(crate) async fn list_assets(
             })
             .collect()
     });
+    let ifa = rgb_assets.ifa.map(|assets| {
+        assets
+            .into_iter()
+            .map(|a| {
+                let mut asset: AssetIFA = a.into();
+                (
+                    asset.balance.offchain_outbound,
+                    asset.balance.offchain_inbound,
+                ) = *offchain_balances.get(&asset.asset_id).unwrap_or(&(0, 0));
+                asset
+            })
+            .collect()
+    });
 
-    Ok(Json(ListAssetsResponse { nia, uda, cfa }))
+    Ok(Json(ListAssetsResponse { nia, uda, cfa, ifa }))
 }
 
 pub(crate) async fn list_channels(
@@ -2431,10 +2570,10 @@ pub(crate) async fn list_transactions(
     for tx in unlocked_state.rgb_list_transactions(payload.skip_sync)? {
         transactions.push(Transaction {
             transaction_type: match tx.transaction_type {
-                rgb_lib::TransactionType::RgbSend => TransactionType::RgbSend,
-                rgb_lib::TransactionType::Drain => TransactionType::Drain,
-                rgb_lib::TransactionType::CreateUtxos => TransactionType::CreateUtxos,
-                rgb_lib::TransactionType::User => TransactionType::User,
+                rgb_lib::wallet::TransactionType::RgbSend => TransactionType::RgbSend,
+                rgb_lib::wallet::TransactionType::Drain => TransactionType::Drain,
+                rgb_lib::wallet::TransactionType::CreateUtxos => TransactionType::CreateUtxos,
+                rgb_lib::wallet::TransactionType::User => TransactionType::User,
             },
             txid: tx.txid,
             received: tx.received,
@@ -2464,6 +2603,7 @@ pub(crate) async fn list_transfers(
             created_at: transfer.created_at,
             updated_at: transfer.updated_at,
             status: match transfer.status {
+                rgb_lib::TransferStatus::Initiated => TransferStatus::Initiated,
                 rgb_lib::TransferStatus::WaitingCounterparty => TransferStatus::WaitingCounterparty,
                 rgb_lib::TransferStatus::WaitingConfirmations => {
                     TransferStatus::WaitingConfirmations
@@ -2474,17 +2614,17 @@ pub(crate) async fn list_transfers(
             requested_assignment: transfer.requested_assignment.map(|a| a.into()),
             assignments: transfer.assignments.into_iter().map(|a| a.into()).collect(),
             kind: match transfer.kind {
-                rgb_lib::TransferKind::Issuance => TransferKind::Issuance,
-                rgb_lib::TransferKind::ReceiveBlind => TransferKind::ReceiveBlind,
-                rgb_lib::TransferKind::ReceiveWitness => TransferKind::ReceiveWitness,
-                rgb_lib::TransferKind::Send => TransferKind::Send,
-                rgb_lib::TransferKind::Inflation => TransferKind::Inflation,
+                rgb_lib::wallet::TransferKind::Issuance => TransferKind::Issuance,
+                rgb_lib::wallet::TransferKind::ReceiveBlind => TransferKind::ReceiveBlind,
+                rgb_lib::wallet::TransferKind::ReceiveWitness => TransferKind::ReceiveWitness,
+                rgb_lib::wallet::TransferKind::Send => TransferKind::Send,
+                rgb_lib::wallet::TransferKind::Inflation => TransferKind::Inflation,
             },
             txid: transfer.txid,
             recipient_id: transfer.recipient_id,
             receive_utxo: transfer.receive_utxo.map(|u| u.to_string()),
             change_utxo: transfer.change_utxo.map(|u| u.to_string()),
-            expiration: transfer.expiration,
+            expiration_timestamp: transfer.expiration_timestamp,
             transport_endpoints: transfer
                 .transport_endpoints
                 .iter()
@@ -2976,8 +3116,8 @@ pub(crate) async fn node_info(
         eventual_close_fees_sat,
         pending_outbound_payments_sat,
         num_peers: unlocked_state.peer_manager.list_peers().len(),
-        account_xpub_vanilla: unlocked_state.rgb_get_wallet_data().account_xpub_vanilla,
-        account_xpub_colored: unlocked_state.rgb_get_wallet_data().account_xpub_colored,
+        account_xpub_vanilla: unlocked_state.rgb_get_keys().account_xpub_vanilla,
+        account_xpub_colored: unlocked_state.rgb_get_keys().account_xpub_colored,
         max_media_upload_size_mb: state.static_state.max_media_upload_size_mb,
         rgb_htlc_min_msat: HTLC_MIN_MSAT,
         rgb_channel_capacity_min_sat: OPENRGBCHANNEL_MIN_SAT,
@@ -3149,11 +3289,10 @@ pub(crate) async fn open_channel(
                 .rgb_get_asset_metadata(*contract_id)?
                 .asset_schema;
             let assignment = match schema {
-                RgbLibAssetSchema::Nia | RgbLibAssetSchema::Cfa => {
+                RgbLibAssetSchema::Nia | RgbLibAssetSchema::Cfa | RgbLibAssetSchema::Ifa => {
                     Assignment::Fungible(*asset_amount)
                 }
                 RgbLibAssetSchema::Uda => Assignment::NonFungible,
-                RgbLibAssetSchema::Ifa => todo!(),
             };
 
             let recipient_map = map! {
@@ -3174,6 +3313,8 @@ pub(crate) async fn open_channel(
                     true,
                     FEE_RATE,
                     MIN_CHANNEL_CONFIRMATIONS,
+                    None,
+                    true,
                 )
             })
             .await
@@ -3380,7 +3521,7 @@ pub(crate) async fn rgb_invoice(
             unlocked_state.rgb_witness_receive(
                 payload.asset_id,
                 assignment,
-                payload.duration_seconds,
+                payload.expiration_timestamp,
                 vec![unlocked_state.proxy_endpoint.clone()],
                 payload.min_confirmations,
             )?
@@ -3388,7 +3529,7 @@ pub(crate) async fn rgb_invoice(
             unlocked_state.rgb_blind_receive(
                 payload.asset_id,
                 assignment,
-                payload.duration_seconds,
+                payload.expiration_timestamp,
                 vec![unlocked_state.proxy_endpoint.clone()],
                 payload.min_confirmations,
             )?
@@ -3702,6 +3843,7 @@ pub(crate) async fn send_rgb(
                 payload.donation,
                 payload.fee_rate,
                 payload.min_confirmations,
+                payload.expiration_timestamp,
                 payload.skip_sync,
             )
         })
