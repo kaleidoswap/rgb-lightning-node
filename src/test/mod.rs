@@ -41,10 +41,10 @@ use crate::routes::{
     NetworkInfoResponse, NodeInfoResponse, OpenChannelRequest, OpenChannelResponse, Payment, Peer,
     PostAssetMediaResponse, Recipient, RefreshRequest, RestoreRequest, RevokeTokenRequest,
     RgbInvoiceRequest, RgbInvoiceResponse, SendBtcRequest, SendBtcResponse, SendPaymentRequest,
-    SendPaymentResponse, SendRgbRequest, SendRgbResponse, Swap, SwapStatus, TakerRequest,
-    Transaction, Transfer, UnlockRequest, Unspent, WitnessData,
+    SendPaymentResponse, SendRgbRequest, SendRgbResponse, Swap, SwapHopHint, SwapStatus,
+    TakerRequest, TakerResponse, Transaction, Transfer, UnlockRequest, Unspent, WitnessData,
 };
-use crate::utils::{hex_str, hex_str_to_vec, ELECTRUM_URL_REGTEST, PROXY_ENDPOINT_LOCAL};
+use crate::utils::{hex_str, hex_str_to_vec, PROXY_ENDPOINT_LOCAL};
 
 use super::*;
 
@@ -61,6 +61,8 @@ const DURATION_SECONDS: u64 = 999;
 static INIT: Once = Once::new();
 
 static MINER: Lazy<RwLock<Miner>> = Lazy::new(|| RwLock::new(Miner { no_mine_count: 0 }));
+static TAKER_HOPS_BY_SWAPSTRING: Lazy<Mutex<HashMap<String, Vec<SwapHopHint>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(test)]
 impl Default for UserArgs {
@@ -1048,10 +1050,15 @@ async fn maker_execute_raw(
     taker_pubkey: String,
 ) -> Response {
     println!("executing swap {swapstring} from node {node_address}");
+    let taker_hops = TAKER_HOPS_BY_SWAPSTRING
+        .lock()
+        .unwrap()
+        .remove(&swapstring);
     let payload = MakerExecuteRequest {
         swapstring,
         payment_secret,
         taker_pubkey,
+        taker_hops,
     };
     reqwest::Client::new()
         .post(format!("http://{node_address}/makerexecute"))
@@ -1618,7 +1625,7 @@ async fn shutdown(node_sockets: &[SocketAddr]) {
     }
 }
 
-async fn taker(node_address: SocketAddr, swapstring: String) -> EmptyResponse {
+async fn taker(node_address: SocketAddr, swapstring: String) -> TakerResponse {
     println!("taking swap {swapstring} on node {node_address}");
     let payload = TakerRequest { swapstring };
     let res = reqwest::Client::new()
@@ -1627,21 +1634,22 @@ async fn taker(node_address: SocketAddr, swapstring: String) -> EmptyResponse {
         .send()
         .await
         .unwrap();
-    _check_response_is_ok(res)
+    let response = _check_response_is_ok(res)
         .await
-        .json::<EmptyResponse>()
+        .json::<TakerResponse>()
         .await
-        .unwrap()
+        .unwrap();
+    TAKER_HOPS_BY_SWAPSTRING.lock().unwrap().insert(
+        payload.swapstring,
+        response.taker_hops.clone(),
+    );
+    response
 }
 
 fn unlock_req(password: &str) -> UnlockRequest {
     UnlockRequest {
         password: password.to_string(),
-        bitcoind_rpc_username: s!("user"),
-        bitcoind_rpc_password: s!("password"),
-        bitcoind_rpc_host: s!("localhost"),
-        bitcoind_rpc_port: 18443,
-        indexer_url: Some(ELECTRUM_URL_REGTEST.to_string()),
+        indexer_url: Some(ELECTRUM_URL.to_string()),
         proxy_endpoint: Some(PROXY_ENDPOINT_LOCAL.to_string()),
         announce_addresses: vec![],
         announce_alias: Some(s!("RLN_alias")),

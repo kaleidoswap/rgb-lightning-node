@@ -10,7 +10,10 @@ use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Network, ScriptBuf};
 use hex::DisplayHex;
-use lightning::ln::{channelmanager::OptionalOfferPaymentParams, types::ChannelId};
+use lightning::ln::{
+    channelmanager::OptionalOfferPaymentParams,
+    types::ChannelId,
+};
 use lightning::offers::offer::{self, Offer};
 use lightning::onion_message::messenger::Destination;
 use lightning::rgb_utils::{
@@ -18,7 +21,7 @@ use lightning::rgb_utils::{
     parse_rgb_payment_info, STATIC_BLINDING,
 };
 use lightning::routing::gossip::RoutingFees;
-use lightning::routing::router::{Path as LnPath, Route, RouteHint, RouteHintHop};
+use lightning::routing::router::{Path as LnPath, Route, RouteHint, RouteHintHop, RouteHop};
 use lightning::sign::EntropySource;
 use lightning::util::config::ChannelConfig;
 use lightning::{chain::channelmonitor::Balance, impl_writeable_tlv_based_enum};
@@ -37,6 +40,7 @@ use lightning::{
         gossip::NodeId,
         router::{PaymentParameters, RouteParameters},
     },
+    types::features::{ChannelFeatures, NodeFeatures},
     util::config::{ChannelHandshakeConfig, ChannelHandshakeLimits, UserConfig},
     util::{errors::APIError as LDKAPIError, IS_SWAP_SCID},
 };
@@ -831,6 +835,7 @@ pub(crate) struct MakerExecuteRequest {
     pub(crate) swapstring: String,
     pub(crate) payment_secret: String,
     pub(crate) taker_pubkey: String,
+    pub(crate) taker_hops: Option<Vec<SwapHopHint>>,
 }
 
 // "from" and "to" are seen from the taker's perspective, so:
@@ -1128,6 +1133,21 @@ pub(crate) struct TakerRequest {
     pub(crate) swapstring: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct SwapHopHint {
+    pub(crate) counterparty_pubkey: String,
+    pub(crate) short_channel_id: u64,
+    pub(crate) fee_base_msat: u32,
+    pub(crate) fee_proportional_millionths: u32,
+    pub(crate) cltv_expiry_delta: u16,
+    pub(crate) maybe_announced_channel: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct TakerResponse {
+    pub(crate) taker_hops: Vec<SwapHopHint>,
+}
+
 #[derive(Deserialize, Serialize)]
 pub(crate) struct Token {
     pub(crate) index: u32,
@@ -1258,10 +1278,6 @@ pub(crate) enum TransportType {
 #[derive(Deserialize, Serialize)]
 pub(crate) struct UnlockRequest {
     pub(crate) password: String,
-    pub(crate) bitcoind_rpc_username: String,
-    pub(crate) bitcoind_rpc_password: String,
-    pub(crate) bitcoind_rpc_host: String,
-    pub(crate) bitcoind_rpc_port: u16,
     pub(crate) indexer_url: Option<String>,
     pub(crate) proxy_endpoint: Option<String>,
     pub(crate) announce_addresses: Vec<String>,
@@ -2791,7 +2807,7 @@ pub(crate) async fn maker_execute(
 
         let swap_info = swapstring.swap_info;
 
-        let receive_hints = unlocked_state
+        let receive_hints: Vec<RouteHint> = unlocked_state
             .channel_manager
             .list_usable_channels()
             .iter()
@@ -2842,28 +2858,38 @@ pub(crate) async fn maker_execute(
             vec![],
         );
 
-        let rgb_payment = swap_info
+        let second_leg_rgb_payment = swap_info
             .from_asset
             .map(|from_asset| (from_asset, swap_info.qty_from));
+        let second_leg_amount = if swap_info.is_to_btc() || swap_info.is_asset_asset() {
+            Some(HTLC_MIN_MSAT)
+        } else {
+            Some(swap_info.qty_from + HTLC_MIN_MSAT)
+        };
         let second_leg = get_route(
             &unlocked_state.channel_manager,
             &unlocked_state.router,
             taker_pk,
             unlocked_state.channel_manager.get_our_node_id(),
-            if swap_info.is_to_btc() || swap_info.is_asset_asset() {
-                Some(HTLC_MIN_MSAT)
-            } else {
-                Some(swap_info.qty_from + HTLC_MIN_MSAT)
-            },
-            rgb_payment,
-            receive_hints,
-        );
+            second_leg_amount,
+            second_leg_rgb_payment,
+            receive_hints.clone(),
+        )
+        .or_else(|| {
+            build_second_leg_from_taker_hops(
+                &unlocked_state.channel_manager,
+                &unlocked_state.router,
+                payload.taker_hops.as_deref().unwrap_or(&[]),
+                unlocked_state.channel_manager.get_our_node_id(),
+                second_leg_amount,
+                second_leg_rgb_payment,
+                &receive_hints,
+            )
+        });
 
         let (mut first_leg, mut second_leg) = match (first_leg, second_leg) {
             (Some(f), Some(s)) => (f, s),
-            _ => {
-                return Err(APIError::NoRoute);
-            }
+            _ => return Err(APIError::NoRoute),
         };
 
         // Set swap flag
@@ -2973,6 +2999,59 @@ pub(crate) async fn maker_execute(
         }
     })
     .await
+}
+
+fn build_second_leg_from_taker_hops(
+    channel_manager: &crate::ldk::ChannelManager,
+    router: &crate::ldk::Router,
+    taker_hops: &[SwapHopHint],
+    dest: PublicKey,
+    final_value_msat: Option<u64>,
+    rgb_payment: Option<(ContractId, u64)>,
+    receive_hints: &[RouteHint],
+) -> Option<Route> {
+    taker_hops.iter().find_map(|taker_hop| {
+        let next_hop_pubkey = PublicKey::from_str(&taker_hop.counterparty_pubkey).ok()?;
+        let mut route = get_route(
+            channel_manager,
+            router,
+            next_hop_pubkey,
+            dest,
+            final_value_msat,
+            rgb_payment,
+            receive_hints.to_vec(),
+        )?;
+        let downstream_hop = route.paths.first()?.hops.first()?;
+        let routed_amount_msat = downstream_hop.fee_msat;
+        let downstream_cltv_expiry_delta = downstream_hop.cltv_expiry_delta;
+        let forwarding_fee_msat = compute_routing_fee_msat(
+            routed_amount_msat,
+            taker_hop.fee_base_msat,
+            taker_hop.fee_proportional_millionths,
+        )?;
+        route.paths[0].hops.insert(
+            0,
+            RouteHop {
+                pubkey: next_hop_pubkey,
+                node_features: NodeFeatures::empty(),
+                short_channel_id: taker_hop.short_channel_id,
+                channel_features: ChannelFeatures::empty(),
+                fee_msat: routed_amount_msat + forwarding_fee_msat,
+                cltv_expiry_delta: downstream_cltv_expiry_delta + taker_hop.cltv_expiry_delta as u32,
+                maybe_announced_channel: taker_hop.maybe_announced_channel,
+                payment_amount: final_value_msat.unwrap_or(HTLC_MIN_MSAT),
+                rgb_payment: None,
+            },
+        );
+        Some(route)
+    })
+}
+
+fn compute_routing_fee_msat(amount_msat: u64, fee_base_msat: u32, fee_proportional_millionths: u32) -> Option<u64> {
+    amount_msat
+        .checked_mul(fee_proportional_millionths as u64)?
+        .checked_div(1_000_000)?
+        .checked_add(fee_base_msat as u64)
 }
 
 pub(crate) async fn maker_init(
@@ -3904,7 +3983,7 @@ pub(crate) async fn sync(
 pub(crate) async fn taker(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<TakerRequest>, APIError>,
-) -> Result<Json<EmptyResponse>, APIError> {
+) -> Result<Json<TakerResponse>, APIError> {
     no_cancel(async move {
         let guard = state.check_unlocked().await?;
         let unlocked_state = guard.as_ref().unwrap();
@@ -3930,7 +4009,38 @@ pub(crate) async fn taker(
         let swap_data = SwapData::create_from_swap_info(&swapstring.swap_info);
         unlocked_state.add_taker_swap(swapstring.payment_hash, swap_data);
 
-        Ok(Json(EmptyResponse {}))
+        let taker_hops = unlocked_state
+            .channel_manager
+            .list_usable_channels()
+            .iter()
+            .filter(|details| match get_rgb_channel_info_optional(
+                &details.channel_id,
+                &state.static_state.ldk_data_dir,
+                false,
+            ) {
+                _ if swapstring.swap_info.from_asset.is_none() => true,
+                Some((rgb_info, _))
+                    if Some(rgb_info.contract_id) == swapstring.swap_info.from_asset =>
+                {
+                    true
+                }
+                _ => false,
+            })
+            .filter_map(|details| {
+                let config = details.counterparty.forwarding_info.as_ref()?;
+                let short_channel_id = details.get_outbound_payment_scid()?;
+                Some(SwapHopHint {
+                    counterparty_pubkey: details.counterparty.node_id.to_string(),
+                    short_channel_id,
+                    fee_base_msat: config.fee_base_msat,
+                    fee_proportional_millionths: config.fee_proportional_millionths,
+                    cltv_expiry_delta: config.cltv_expiry_delta,
+                    maybe_announced_channel: details.is_announced,
+                })
+            })
+            .collect();
+
+        Ok(Json(TakerResponse { taker_hops }))
     })
     .await
 }
