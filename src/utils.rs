@@ -449,11 +449,16 @@ pub(crate) fn get_route(
 }
 
 fn route_first_hops<'a>(
-    _start: &PublicKey,
-    _our_node_id: PublicKey,
-    _usable_channels: impl Iterator<Item = &'a ChannelDetails>,
+    start: &PublicKey,
+    our_node_id: PublicKey,
+    usable_channels: impl Iterator<Item = &'a ChannelDetails>,
 ) -> Option<Vec<&'a ChannelDetails>> {
-    None
+    if *start != our_node_id {
+        return None;
+    }
+
+    let first_hops = usable_channels.collect::<Vec<_>>();
+    (!first_hops.is_empty()).then_some(first_hops)
 }
 
 #[cfg(test)]
