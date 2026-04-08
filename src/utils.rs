@@ -416,6 +416,8 @@ pub(crate) fn get_route(
     hints: Vec<RouteHint>,
 ) -> Option<Route> {
     let inflight_htlcs = channel_manager.compute_inflight_htlcs();
+    let usable_channels = channel_manager.list_usable_channels();
+    let first_hops = route_first_hops(&start, channel_manager.get_our_node_id(), usable_channels.iter());
     let payment_params = PaymentParameters {
         payee: Payee::Clear {
             node_id: dest,
@@ -439,9 +441,86 @@ pub(crate) fn get_route(
             max_total_routing_fee_msat: None,
             rgb_payment,
         },
-        None,
+        first_hops.as_deref(),
         inflight_htlcs,
     );
 
     route.ok()
+}
+
+fn route_first_hops<'a>(
+    _start: &PublicKey,
+    _our_node_id: PublicKey,
+    _usable_channels: impl Iterator<Item = &'a ChannelDetails>,
+) -> Option<Vec<&'a ChannelDetails>> {
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{route_first_hops, PublicKey};
+    use lightning::ln::channel_state::{
+        ChannelCounterparty, ChannelDetails, ChannelShutdownState, InboundHTLCDetails,
+        OutboundHTLCDetails,
+    };
+    use lightning::ln::types::ChannelId;
+    use lightning::types::features::InitFeatures;
+    use std::str::FromStr;
+
+    fn test_channel_details(node_id: PublicKey) -> ChannelDetails {
+        ChannelDetails {
+            channel_id: ChannelId::new_zero(),
+            counterparty: ChannelCounterparty {
+                features: InitFeatures::from_le_bytes(vec![0b11]),
+                node_id,
+                unspendable_punishment_reserve: 0,
+                forwarding_info: None,
+                outbound_htlc_minimum_msat: None,
+                outbound_htlc_maximum_msat: None,
+            },
+            funding_txo: None,
+            channel_type: None,
+            short_channel_id: Some(42),
+            outbound_scid_alias: None,
+            inbound_scid_alias: None,
+            channel_value_satoshis: 100_000,
+            unspendable_punishment_reserve: None,
+            user_channel_id: 0,
+            feerate_sat_per_1000_weight: None,
+            outbound_capacity_msat: 50_000,
+            next_outbound_htlc_limit_msat: 50_000,
+            next_outbound_htlc_minimum_msat: 0,
+            inbound_capacity_msat: 42,
+            confirmations_required: None,
+            confirmations: None,
+            force_close_spend_delay: None,
+            is_outbound: true,
+            is_channel_ready: true,
+            channel_shutdown_state: Some(ChannelShutdownState::NotShuttingDown),
+            is_usable: true,
+            is_announced: false,
+            inbound_htlc_minimum_msat: None,
+            inbound_htlc_maximum_msat: None,
+            config: None,
+            pending_inbound_htlcs: Vec::<InboundHTLCDetails>::new(),
+            pending_outbound_htlcs: Vec::<OutboundHTLCDetails>::new(),
+            funding_redeem_script: None,
+            next_outbound_htlc_limit_rgb: 0,
+            inbound_htlc_maximum_rgb: 0,
+        }
+    }
+
+    #[test]
+    fn route_first_hops_uses_local_usable_channels() {
+        let our_node_id = PublicKey::from_str(
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        )
+        .unwrap();
+        let channels = vec![test_channel_details(our_node_id)];
+
+        let first_hops = route_first_hops(&our_node_id, our_node_id, channels.iter());
+
+        assert!(first_hops.is_some());
+        assert_eq!(first_hops.unwrap().len(), 1);
+    }
 }
