@@ -5,10 +5,10 @@ use axum::{
 };
 use axum_extra::extract::WithRejection;
 use biscuit_auth::Biscuit;
+use bitcoin::constants::ChainHash;
 use bitcoin::hashes::sha256::{self, Hash as Sha256};
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::PublicKey;
-use bitcoin::constants::ChainHash;
 use bitcoin::{Network, ScriptBuf};
 use hex::DisplayHex;
 use lightning::ln::{channelmanager::OptionalOfferPaymentParams, types::ChannelId};
@@ -62,6 +62,7 @@ use rgb_lib::{
     BitcoinNetwork as RgbLibNetwork, ContractId, RgbTransport,
 };
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroU64;
 use std::{
     collections::HashMap,
     net::ToSocketAddrs,
@@ -70,7 +71,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use std::num::NonZeroU64;
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
@@ -1737,8 +1737,8 @@ pub(crate) async fn decode_offer(
 ) -> Result<Json<DecodeOfferResponse>, APIError> {
     let _guard = state.get_unlocked_app_state();
 
-    let offer = Offer::from_str(&payload.offer)
-        .map_err(|e| APIError::InvalidInvoice(format!("{e:?}")))?;
+    let offer =
+        Offer::from_str(&payload.offer).map_err(|e| APIError::InvalidInvoice(format!("{e:?}")))?;
 
     let amt_msat = match offer.amount() {
         Some(offer::Amount::Bitcoin { amount_msats }) => Some(amount_msats),
@@ -1953,10 +1953,16 @@ pub(crate) async fn get_payment(
     }
 
     for (payment_id, payment_info) in &outbound_payments {
-        let payment_hash = &PaymentHash(payment_id.0);
-        if payment_hash == &requested_ph {
+        let derived_payment_hash = PaymentHash(payment_id.0);
+        if derived_payment_hash == requested_ph
+            || payment_info.payment_hash.as_ref() == Some(&requested_ph)
+        {
+            let payment_hash = payment_info
+                .payment_hash
+                .clone()
+                .unwrap_or(derived_payment_hash);
             let rgb_payment_info_path_outbound =
-                get_rgb_payment_info_path(payment_hash, &state.static_state.ldk_data_dir, false);
+                get_rgb_payment_info_path(&payment_hash, &state.static_state.ldk_data_dir, false);
 
             let (asset_amount, asset_id) = if rgb_payment_info_path_outbound.exists() {
                 let info = parse_rgb_payment_info(&rgb_payment_info_path_outbound);
@@ -2312,6 +2318,7 @@ pub(crate) async fn keysend(
                 secret: None,
                 status: HTLCStatus::Pending,
                 amt_msat: Some(amt_msat),
+                payment_hash: Some(payment_hash),
                 created_at,
                 updated_at: created_at,
                 payee_pubkey: dest_pubkey,
@@ -2346,7 +2353,11 @@ pub(crate) async fn keysend(
             }
             Err(e) => {
                 tracing::error!("ERROR: failed to send payment: {:?}", e);
-                unlocked_state.update_outbound_payment_status(payment_id, HTLCStatus::Failed);
+                unlocked_state.update_outbound_payment_status(
+                    payment_id,
+                    HTLCStatus::Failed,
+                    Some(payment_hash),
+                );
                 HTLCStatus::Failed
             }
         };
@@ -2567,10 +2578,13 @@ pub(crate) async fn list_payments(
     }
 
     for (payment_id, payment_info) in &outbound_payments {
-        let payment_hash = &PaymentHash(payment_id.0);
+        let payment_hash = payment_info
+            .payment_hash
+            .clone()
+            .unwrap_or(PaymentHash(payment_id.0));
 
         let rgb_payment_info_path_outbound =
-            get_rgb_payment_info_path(payment_hash, &state.static_state.ldk_data_dir, false);
+            get_rgb_payment_info_path(&payment_hash, &state.static_state.ldk_data_dir, false);
 
         let (asset_amount, asset_id) = if rgb_payment_info_path_outbound.exists() {
             let info = parse_rgb_payment_info(&rgb_payment_info_path_outbound);
@@ -2819,6 +2833,7 @@ pub(crate) async fn ln_invoice(
                 secret: Some(*invoice.payment_secret()),
                 status: HTLCStatus::Pending,
                 amt_msat: payload.amt_msat,
+                payment_hash: Some(payment_hash),
                 created_at,
                 updated_at: created_at,
                 payee_pubkey: unlocked_state.channel_manager.get_our_node_id(),
@@ -3822,6 +3837,7 @@ pub(crate) async fn send_payment(
                     secret,
                     status,
                     amt_msat: Some(amt_msat),
+                    payment_hash: None,
                     created_at,
                     updated_at: created_at,
                     payee_pubkey: offer.issuer_signing_pubkey().ok_or(APIError::InvalidInvoice(s!("missing signing pubkey")))?,
@@ -3837,9 +3853,13 @@ pub(crate) async fn send_payment(
                 .pay_for_offer(&offer, Some(amt_msat), payment_id, params);
             if pay.is_err() {
                 tracing::error!("ERROR: failed to pay: {:?}", pay);
-                unlocked_state.update_outbound_payment_status(payment_id, HTLCStatus::Failed);
+                unlocked_state.update_outbound_payment_status(
+                    payment_id,
+                    HTLCStatus::Failed,
+                    None,
+                );
                 status = HTLCStatus::Failed;
-                unlocked_state.update_outbound_payment_status(payment_id, status);
+                unlocked_state.update_outbound_payment_status(payment_id, status, None);
             }
             (payment_id, None, secret)
         } else {
@@ -3906,6 +3926,7 @@ pub(crate) async fn send_payment(
                 }
             };
 
+            let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
             let secret = payment_secret;
             unlocked_state.add_outbound_payment(
                 payment_id,
@@ -3914,13 +3935,13 @@ pub(crate) async fn send_payment(
                     secret,
                     status,
                     amt_msat: Some(amt_msat),
+                    payment_hash: Some(payment_hash),
                     created_at,
                     updated_at: created_at,
                     payee_pubkey: invoice.get_payee_pub_key(),
                     expires_at: None,
                 },
             )?;
-            let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
             if let Some((contract_id, rgb_amount)) = rgb_payment {
                 write_rgb_payment_info_file(
                     &PathBuf::from(&state.static_state.ldk_data_dir),
@@ -3950,7 +3971,11 @@ pub(crate) async fn send_payment(
                 Err(e) => {
                     tracing::error!("ERROR: failed to send payment: {:?}", e);
                     status = HTLCStatus::Failed;
-                    unlocked_state.update_outbound_payment_status(payment_id, status);
+                    unlocked_state.update_outbound_payment_status(
+                        payment_id,
+                        status,
+                        Some(payment_hash),
+                    );
                 },
             };
 
