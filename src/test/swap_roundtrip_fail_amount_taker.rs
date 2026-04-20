@@ -19,7 +19,8 @@ async fn swap_fail_amount_taker() {
 
     let asset_id = issue_asset_nia(node2_addr).await.asset_id;
 
+    let node2_pubkey = node_info(node2_addr).await.pubkey;
     let maker_init_response =
-        maker_init(node1_addr, 1000, Some(&asset_id), 360000, None, 5000).await;
+        maker_init(node1_addr, 1000, Some(&asset_id), 360000, None, 5000, &node2_pubkey).await;
     taker(node2_addr, maker_init_response.swapstring.clone()).await;
 }

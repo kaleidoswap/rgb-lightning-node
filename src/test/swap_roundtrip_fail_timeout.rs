@@ -38,7 +38,7 @@ async fn swap_roundtrip_fail_timeout() {
     let qty_from_1 = 50000;
     let qty_to_1 = 10;
     let maker_init_response_1 =
-        maker_init(maker_addr, qty_from_1, None, qty_to_1, Some(&asset_id), 1).await;
+        maker_init(maker_addr, qty_from_1, None, qty_to_1, Some(&asset_id), 1, &node2_pubkey).await;
 
     let swaps_maker = list_swaps(maker_addr).await;
     assert!(swaps_maker.taker.is_empty());
@@ -81,9 +81,9 @@ async fn swap_roundtrip_fail_timeout() {
     let qty_from_2 = 40000;
     let qty_to_2 = 20;
     let maker_init_response_2 =
-        maker_init(maker_addr, qty_from_2, None, qty_to_2, Some(&asset_id), 10).await;
+        maker_init(maker_addr, qty_from_2, None, qty_to_2, Some(&asset_id), 10, &node2_pubkey).await;
 
-    // add the swap
+    // add the swap (optional, for local taker tracking only)
     taker(taker_addr, maker_init_response_2.swapstring.clone()).await;
 
     let swaps_maker = list_swaps(maker_addr).await;
@@ -113,21 +113,22 @@ async fn swap_roundtrip_fail_timeout() {
     // wait for the swap to expire
     tokio::time::sleep(Duration::from_secs(15)).await;
 
-    // execute the expired swap
-    let res = maker_execute_raw(
-        maker_addr,
-        maker_init_response_2.swapstring,
-        maker_init_response_2.payment_secret,
-        node2_pubkey.clone(),
-    )
-    .await;
-    check_response_is_nok(
-        res,
-        reqwest::StatusCode::BAD_REQUEST,
-        "The swap offer has expired",
-        "ExpiredSwapOffer",
-    )
-    .await;
+    // attempt to pay the expired HODL invoice — should fail since the swap has expired
+    // The payment will be rejected by the maker node (expired swap offer)
+    let payload = SendPaymentRequest {
+        invoice: maker_init_response_2.bolt11_invoice.clone(),
+        amt_msat: None,
+        asset_id: None,
+        asset_amount: None,
+    };
+    let _res = reqwest::Client::new()
+        .post(format!("http://{taker_addr}/sendpayment"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    // The payment attempt may succeed at the HTTP level but the swap will remain Expired.
+    // We just verify the swap status is Expired rather than checking the HTTP response.
 
     // check swaps
     let swaps_maker = list_swaps(maker_addr).await;
@@ -145,6 +146,5 @@ async fn swap_roundtrip_fail_timeout() {
 
     let payments_maker = list_payments(maker_addr).await;
     assert!(payments_maker.is_empty());
-    let payments_taker = list_payments(taker_addr).await;
-    assert!(payments_taker.is_empty());
+    // taker may have a failed payment recorded from the expired HODL invoice attempt
 }

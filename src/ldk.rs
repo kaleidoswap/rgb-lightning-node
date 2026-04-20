@@ -9,7 +9,9 @@ use lightning::chain::{chainmonitor, ChannelMonitorUpdateStatus};
 use lightning::chain::{BestBlock, Filter};
 use lightning::events::bump_transaction::{BumpTransactionEventHandler, Wallet};
 use lightning::events::{Event, PaymentFailureReason, PaymentPurpose, ReplayEvent};
-use lightning::ln::channelmanager::{self, PaymentId, RecentPaymentDetails};
+use lightning::ln::channelmanager::{
+    self, PaymentId, RecipientOnionFields, RecentPaymentDetails, Retry,
+};
 use lightning::ln::channelmanager::{
     ChainParameters, ChannelManagerReadArgs, SimpleArcChannelManager,
 };
@@ -23,14 +25,14 @@ use lightning::onion_message::messenger::{
 };
 use lightning::rgb_utils::{
     get_rgb_channel_info_pending, is_channel_rgb, parse_rgb_payment_info, read_rgb_transfer_info,
-    update_rgb_channel_amount, BITCOIN_NETWORK_FNAME, INDEXER_URL_FNAME, STATIC_BLINDING,
-    WALLET_ACCOUNT_XPUB_COLORED_FNAME, WALLET_ACCOUNT_XPUB_VANILLA_FNAME, WALLET_FINGERPRINT_FNAME,
-    WALLET_MASTER_FINGERPRINT_FNAME,
+    update_rgb_channel_amount, write_rgb_payment_info_file, BITCOIN_NETWORK_FNAME,
+    INDEXER_URL_FNAME, STATIC_BLINDING, WALLET_ACCOUNT_XPUB_COLORED_FNAME,
+    WALLET_ACCOUNT_XPUB_VANILLA_FNAME, WALLET_FINGERPRINT_FNAME, WALLET_MASTER_FINGERPRINT_FNAME,
 };
 use lightning::routing::gossip;
 use lightning::routing::gossip::{NodeId, P2PGossipSync};
-use lightning::routing::router::DefaultRouter;
-use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringFeeParameters};
+use lightning::routing::router::{DefaultRouter, PaymentParameters, RouteParameters};
+use lightning::routing::scoring::ProbabilisticScoringFeeParameters;
 use lightning::sign::{
     EntropySource, InMemorySigner, KeysManager, NodeSigner, OutputSpender,
     SpendableOutputDescriptor,
@@ -97,9 +99,9 @@ use crate::disk::{
     MAKER_SWAPS_FNAME, OUTBOUND_PAYMENTS_FNAME, OUTPUT_SPENDER_TXES, TAKER_SWAPS_FNAME,
 };
 use crate::error::APIError;
-use crate::rgb::{check_rgb_proxy_endpoint, get_rgb_channel_info_optional, RgbLibWalletWrapper};
-use crate::routes::{HTLCStatus, SwapStatus, UnlockRequest, DUST_LIMIT_MSAT};
-use crate::swap::SwapData;
+use crate::rgb::{check_rgb_proxy_endpoint, RgbLibWalletWrapper};
+use crate::routes::{HTLCStatus, SwapStatus, UnlockRequest, DUST_LIMIT_MSAT, HTLC_MIN_MSAT};
+use crate::swap::{SwapData, SwapInfo};
 use crate::utils::{
     check_port_is_available, connect_peer_if_necessary, do_connect_peer, get_current_timestamp,
     hex_str, AppState, StaticState, UnlockedAppState, ELECTRUM_URL_MAINNET, ELECTRUM_URL_REGTEST,
@@ -552,17 +554,6 @@ pub(crate) type PeerManager = LdkPeerManager<
     Arc<ChainMonitor>,
 >;
 
-pub(crate) type Scorer = ProbabilisticScorer<Arc<NetworkGraph>, Arc<FilesystemLogger>>;
-
-pub(crate) type Router = DefaultRouter<
-    Arc<NetworkGraph>,
-    Arc<FilesystemLogger>,
-    Arc<KeysManager>,
-    Arc<RwLock<Scorer>>,
-    ProbabilisticScoringFeeParameters,
-    Scorer,
->;
-
 pub(crate) type ChannelManager =
     SimpleArcChannelManager<ChainMonitor, BitcoindClient, BitcoindClient, FilesystemLogger>;
 
@@ -889,16 +880,133 @@ async fn handle_ldk_events(
                         .claim_funds(payment_preimage.unwrap());
                 }
                 InvoiceType::Hodl => {
-                    unlocked_state.upsert_inbound_payment(
-                        payment_hash,
-                        HTLCStatus::Claimable,
-                        payment_preimage,
-                        payment_secret,
-                        Some(amount_msat),
-                        unlocked_state.channel_manager.get_our_node_id(),
-                        claim_deadline,
-                        None,
-                    );
+                    // Check whether this HODL is for a maker swap
+                    let maybe_swap = unlocked_state
+                        .maker_swaps
+                        .lock()
+                        .unwrap()
+                        .swaps
+                        .get(&payment_hash)
+                        .cloned();
+
+                    if let Some(swap_data) = maybe_swap {
+                        let swap_info: SwapInfo = swap_data.into();
+
+                        // Validate received BTC amount (RGB asset amount is encoded in the BOLT11
+                        // and enforced by the invoice layer; we validate BTC msats here)
+                        let valid = if swap_info.is_from_btc() {
+                            amount_msat >= swap_info.qty_from
+                        } else {
+                            // For RGB-from swaps, invoice amount check is sufficient
+                            true
+                        };
+
+                        if !valid {
+                            tracing::error!(
+                                "Swap payment amount mismatch (got {} msat, want {}), refunding taker",
+                                amount_msat,
+                                swap_info.qty_from
+                            );
+                            unlocked_state.fail_htlc_backwards_and_update_inbound_payment(
+                                payment_hash,
+                                HTLCStatus::Failed,
+                            );
+                            unlocked_state.update_maker_swap_status(
+                                &payment_hash,
+                                SwapStatus::Failed,
+                            );
+                            return Ok(());
+                        }
+
+                        // Build RouteParameters for the forward keysend leg:
+                        // maker → taker_pubkey.  Using send_spontaneous_payment (not
+                        // send_spontaneous_payment_with_route) so the channel manager
+                        // supplies first_hops from list_channels() internally — this is
+                        // critical for the single-channel case where the only route is a
+                        // direct private channel that may not be in the network graph.
+                        let rgb_payment =
+                            swap_info.to_asset.map(|a| (a, swap_info.qty_to));
+                        // BTC forward: send exactly qty_to msat.
+                        // RGB forward: send HTLC_MIN_MSAT as the msat carrier
+                        // for the RGB asset.
+                        let fwd_amt_msat = if swap_info.is_to_btc() {
+                            swap_info.qty_to
+                        } else {
+                            HTLC_MIN_MSAT
+                        };
+                        let route_params = RouteParameters::from_payment_params_and_value(
+                            PaymentParameters::for_keysend(swap_info.taker_pubkey, 40, false),
+                            fwd_amt_msat,
+                            rgb_payment,
+                        );
+
+                        // Fresh keysend preimage/hash for the forward leg.
+                        // Generated here so the RGB info file uses fwd_hash (not HODL hash).
+                        let fwd_preimage = PaymentPreimage(
+                            unlocked_state.keys_manager.get_secure_random_bytes(),
+                        );
+                        let fwd_hash: PaymentHash = fwd_preimage.into();
+
+                        // Write RGB payment info file if sending an RGB asset forward.
+                        // swap_payment must be false so that send_payment_along_path
+                        // sets hop.rgb_payment, which color_commitment requires to
+                        // create the {channel_id}{fwd_hash}.outbound file that
+                        // _update_rgb_channel_amount later reads.
+                        if swap_info.is_to_asset() {
+                            write_rgb_payment_info_file(
+                                &static_state.ldk_data_dir,
+                                &fwd_hash,
+                                swap_info.to_asset.unwrap(),
+                                swap_info.qty_to,
+                                false,
+                                false,
+                            );
+                        }
+
+                        // Mark swap Pending; PaymentId encodes HODL hash so
+                        // PaymentSent/Failed can identify which HODL to settle.
+                        unlocked_state.update_maker_swap_status(
+                            &payment_hash,
+                            SwapStatus::Pending,
+                        );
+
+                        let send_result = unlocked_state
+                            .channel_manager
+                            .send_spontaneous_payment(
+                                Some(fwd_preimage),
+                                RecipientOnionFields::spontaneous_empty(),
+                                PaymentId(payment_hash.0),
+                                route_params,
+                                Retry::Attempts(0),
+                            );
+
+                        if send_result.is_err() {
+                            tracing::error!(
+                                "Forward leg send failed immediately for swap {}, refunding taker",
+                                payment_hash
+                            );
+                            unlocked_state.fail_htlc_backwards_and_update_inbound_payment(
+                                payment_hash,
+                                HTLCStatus::Failed,
+                            );
+                            unlocked_state.update_maker_swap_status(
+                                &payment_hash,
+                                SwapStatus::Failed,
+                            );
+                        }
+                    } else {
+                        // Normal HODL invoice (not a swap) — existing behaviour
+                        unlocked_state.upsert_inbound_payment(
+                            payment_hash,
+                            HTLCStatus::Claimable,
+                            payment_preimage,
+                            payment_secret,
+                            Some(amount_msat),
+                            unlocked_state.channel_manager.get_our_node_id(),
+                            claim_deadline,
+                            None,
+                        );
+                    }
                 }
             }
         }
@@ -981,13 +1089,36 @@ async fn handle_ldk_events(
         } => {
             _update_rgb_channel_amount(&static_state.ldk_data_dir, &payment_hash, false);
 
-            if unlocked_state.is_maker_swap(&payment_hash) {
+            // Check if this PaymentSent is the forward leg of a HODL swap.
+            // PaymentId encodes the HODL payment_hash so we can identify which swap to settle.
+            let swap_hodl_hash = payment_id.and_then(|pid| {
+                let candidate = PaymentHash(pid.0);
+                if unlocked_state.is_maker_swap(&candidate) {
+                    Some(candidate)
+                } else {
+                    None
+                }
+            });
+
+            if let Some(hodl_hash) = swap_hodl_hash {
                 tracing::info!(
-                    "EVENT: successfully swapped payment with hash {} and preimage {}",
-                    payment_hash,
-                    payment_preimage
+                    "EVENT: swap forward leg succeeded for hodl {} — claiming HODL",
+                    hodl_hash
                 );
-                unlocked_state.update_maker_swap_status(&payment_hash, SwapStatus::Succeeded);
+                // Retrieve the preimage we stored at maker_init time
+                let hodl_preimage = unlocked_state
+                    .get_inbound_payments()
+                    .payments
+                    .get(&hodl_hash)
+                    .and_then(|p| p.preimage)
+                    .expect("preimage stored at maker_init");
+                // Call claim_funds; PaymentClaimed event will fire next and is
+                // responsible for updating the RGB channel balance on the
+                // receive side and marking the swap Succeeded. Marking it
+                // Succeeded here too would short-circuit the "already claimed"
+                // check in PaymentClaimed and skip the RGB balance update for
+                // sell/asset-asset swaps where the HODL carries RGB.
+                unlocked_state.channel_manager.claim_funds(hodl_preimage);
             } else {
                 let payment = unlocked_state.update_outbound_payment(
                     payment_id.unwrap(),
@@ -1006,6 +1137,11 @@ async fn handle_ldk_events(
                     payment_hash,
                     payment_preimage
                 );
+                // Update taker swap status if this was an outbound payment for a registered swap
+                if unlocked_state.is_taker_swap(&payment_hash) {
+                    unlocked_state
+                        .update_taker_swap_status(&payment_hash, SwapStatus::Succeeded);
+                }
             }
         }
         Event::OpenChannelRequest {
@@ -1049,6 +1185,23 @@ async fn handle_ldk_events(
             payment_id,
             ..
         } => {
+            // Check if this failure is the forward leg of a HODL swap.
+            // PaymentId encodes the HODL hash; if so we must refund the taker.
+            let hodl_hash = PaymentHash(payment_id.0);
+            if unlocked_state.is_maker_swap(&hodl_hash) {
+                tracing::error!(
+                    "EVENT: swap forward leg failed for hodl {} — refunding taker: {:?}",
+                    hodl_hash,
+                    reason.unwrap_or(PaymentFailureReason::RetriesExhausted)
+                );
+                unlocked_state.fail_htlc_backwards_and_update_inbound_payment(
+                    hodl_hash,
+                    HTLCStatus::Failed,
+                );
+                unlocked_state.update_maker_swap_status(&hodl_hash, SwapStatus::Failed);
+                return Ok(());
+            }
+
             if let Some(hash) = payment_hash {
                 tracing::error!(
                     "EVENT: Failed to send payment to payment ID {}, payment hash {}: {:?}",
@@ -1060,10 +1213,10 @@ async fn handle_ldk_events(
                         PaymentFailureReason::RetriesExhausted
                     }
                 );
-                if unlocked_state.is_maker_swap(&hash) {
-                    unlocked_state.update_maker_swap_status(&hash, SwapStatus::Failed);
-                } else {
-                    unlocked_state.update_outbound_payment_status(payment_id, HTLCStatus::Failed);
+                unlocked_state.update_outbound_payment_status(payment_id, HTLCStatus::Failed);
+                // Update taker swap status if this was an outbound payment for a registered swap
+                if unlocked_state.is_taker_swap(&hash) {
+                    unlocked_state.update_taker_swap_status(&hash, SwapStatus::Failed);
                 }
             } else {
                 tracing::error!(
@@ -1317,132 +1470,14 @@ async fn handle_ldk_events(
 
             unlocked_state.delete_channel_id(channel_id);
         }
-        Event::HTLCIntercepted {
-            is_swap,
-            payment_hash,
-            intercept_id,
-            inbound_amount_msat,
-            expected_outbound_amount_msat,
-            inbound_rgb_amount,
-            expected_outbound_rgb_payment,
-            requested_next_hop_scid,
-            prev_outbound_scid_alias,
-        } => {
-            if !is_swap {
-                tracing::warn!("Intercepted an HTLC that's not related to a swap");
-                unlocked_state
-                    .channel_manager
-                    .fail_intercepted_htlc(intercept_id)
-                    .unwrap();
-                return Ok(());
-            }
-
-            let get_rgb_info = |channel_id| {
-                get_rgb_channel_info_optional(
-                    channel_id,
-                    &PathBuf::from(&static_state.ldk_data_dir),
-                    true,
-                )
-                .map(|(rgb_info, _)| {
-                    (
-                        rgb_info.contract_id,
-                        rgb_info.local_rgb_amount,
-                        rgb_info.remote_rgb_amount,
-                    )
-                })
-            };
-
-            let inbound_channel = unlocked_state
-                .channel_manager
-                .list_channels()
-                .into_iter()
-                .find(|details| details.outbound_scid_alias == Some(prev_outbound_scid_alias))
-                .expect("Should always be a valid channel");
-            let outbound_channel = unlocked_state
-                .channel_manager
-                .list_channels()
-                .into_iter()
-                .find(|details| details.short_channel_id == Some(requested_next_hop_scid))
-                .expect("Should always be a valid channel");
-
-            let inbound_rgb_info = get_rgb_info(&inbound_channel.channel_id);
-            let outbound_rgb_info = get_rgb_info(&outbound_channel.channel_id);
-
-            tracing::debug!("EVENT: Requested swap with params inbound_msat={} outbound_msat={} inbound_rgb={:?} outbound_rgb={:?} inbound_contract_id={:?}, outbound_contract_id={:?}", inbound_amount_msat, expected_outbound_amount_msat, inbound_rgb_amount, expected_outbound_rgb_payment.map(|(_, a)| a), inbound_rgb_info.map(|i| i.0), expected_outbound_rgb_payment.map(|(c, _)| c));
-
-            let swaps_lock = unlocked_state.taker_swaps.lock().unwrap();
-            let whitelist_swap = match swaps_lock.swaps.get(&payment_hash) {
-                None => {
-                    tracing::error!("ERROR: rejecting non-whitelisted swap");
-                    unlocked_state
-                        .channel_manager
-                        .fail_intercepted_htlc(intercept_id)
-                        .unwrap();
-                    return Ok(());
-                }
-                Some(x) => x,
-            };
-
-            let mut fail = false;
-            if whitelist_swap.swap_info.is_from_btc() {
-                let net_msat_diff = expected_outbound_amount_msat.checked_sub(inbound_amount_msat);
-
-                if inbound_rgb_amount != Some(whitelist_swap.swap_info.qty_to)
-                    || inbound_rgb_info.map(|x| x.0) != whitelist_swap.swap_info.to_asset
-                    || net_msat_diff != Some(whitelist_swap.swap_info.qty_from)
-                {
-                    fail = true;
-                }
-            } else if whitelist_swap.swap_info.is_to_btc() {
-                let net_msat_diff =
-                    inbound_amount_msat.saturating_sub(expected_outbound_amount_msat);
-
-                if expected_outbound_rgb_payment.map(|(_, a)| a)
-                    != Some(whitelist_swap.swap_info.qty_from)
-                    || outbound_rgb_info.map(|x| x.0) != whitelist_swap.swap_info.from_asset
-                    || net_msat_diff != whitelist_swap.swap_info.qty_to
-                {
-                    fail = true;
-                }
-            } else {
-                let net_msat_diff = inbound_amount_msat.checked_sub(expected_outbound_amount_msat);
-
-                if net_msat_diff != Some(0)
-                    || expected_outbound_rgb_payment.map(|(_, a)| a)
-                        != Some(whitelist_swap.swap_info.qty_from)
-                    || outbound_rgb_info.map(|x| x.0) != whitelist_swap.swap_info.from_asset
-                    || inbound_rgb_amount != Some(whitelist_swap.swap_info.qty_to)
-                    || inbound_rgb_info.map(|x| x.0) != whitelist_swap.swap_info.to_asset
-                {
-                    fail = true;
-                }
-            }
-
-            drop(swaps_lock);
-
-            if fail {
-                tracing::error!("ERROR: swap doesn't match the whitelisted info, rejecting it");
-                unlocked_state.update_taker_swap_status(&payment_hash, SwapStatus::Failed);
-                unlocked_state
-                    .channel_manager
-                    .fail_intercepted_htlc(intercept_id)
-                    .unwrap();
-                return Ok(());
-            }
-
-            tracing::debug!("Swap is whitelisted, forwarding the htlc...");
-            unlocked_state.update_taker_swap_status(&payment_hash, SwapStatus::Pending);
-
+        Event::HTLCIntercepted { intercept_id, .. } => {
+            // Swap intercepts are no longer used — the HODL-invoice flow handles swaps directly
+            // in PaymentClaimable. Any intercepted HTLC is unexpected; reject it.
+            tracing::warn!("EVENT: Unexpected HTLCIntercepted — rejecting");
             unlocked_state
                 .channel_manager
-                .forward_intercepted_htlc(
-                    intercept_id,
-                    channelmanager::NextHopForward::ShortChannelId(requested_next_hop_scid),
-                    outbound_channel.counterparty.node_id,
-                    expected_outbound_amount_msat,
-                    expected_outbound_rgb_payment,
-                )
-                .expect("Forward should be valid");
+                .fail_intercepted_htlc(intercept_id)
+                .unwrap();
         }
         Event::OnionMessageIntercepted { .. } => {
             // We don't use the onion message interception feature, so this event should never be
@@ -2295,7 +2330,6 @@ pub(crate) async fn start_ldk(
         rgb_wallet_wrapper,
         maker_swaps,
         taker_swaps,
-        router: Arc::clone(&router),
         output_sweeper: Arc::clone(&output_sweeper),
         rgb_send_lock: Arc::new(Mutex::new(false)),
         channel_ids_map,

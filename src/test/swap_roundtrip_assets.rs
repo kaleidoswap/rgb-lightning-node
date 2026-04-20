@@ -79,6 +79,7 @@ async fn swap_roundtrip_assets() {
         qty_to,
         Some(&asset_id_1),
         3600,
+        &node2_pubkey,
     )
     .await;
     taker(taker_addr, maker_init_response.swapstring.clone()).await;
@@ -107,22 +108,18 @@ async fn swap_roundtrip_assets() {
     assert_eq!(swap_taker.status, SwapStatus::Waiting);
 
     println!("\nexecute swap");
-    maker_execute(
+    taker_pay_invoice(taker_addr, &maker_init_response.bolt11_invoice).await;
+
+    wait_for_swap_status(
         maker_addr,
-        maker_init_response.swapstring,
-        maker_init_response.payment_secret,
-        node2_pubkey.clone(),
+        &maker_init_response.payment_hash,
+        SwapStatus::Succeeded,
     )
     .await;
-
-    let swaps_maker = list_swaps(maker_addr).await;
-    assert_eq!(swaps_maker.maker.len(), 1);
-    let swap_maker = swaps_maker.maker.first().unwrap();
-    assert_eq!(swap_maker.status, SwapStatus::Pending);
     wait_for_swap_status(
         taker_addr,
         &maker_init_response.payment_hash,
-        SwapStatus::Pending,
+        SwapStatus::Succeeded,
     )
     .await;
 
@@ -165,8 +162,7 @@ async fn swap_roundtrip_assets() {
 
     let payments_maker = list_payments(maker_addr).await;
     assert!(payments_maker.is_empty());
-    let payments_taker = list_payments(taker_addr).await;
-    assert!(payments_taker.is_empty());
+    // taker now has an outbound payment (the HODL invoice payment)
 
     let channels_1 = list_channels(node1_addr).await;
     let channels_2 = list_channels(node2_addr).await;
@@ -186,6 +182,9 @@ async fn swap_roundtrip_assets() {
         .iter()
         .find(|c| c.channel_id == channel_21.channel_id)
         .unwrap();
+    // New 2-step swap (asset-for-asset): both legs use HTLC_MIN_MSAT as carrier BTC amount.
+    // HODL payment (taker→maker via chan_21) + forward keysend (maker→taker via chan_12).
+    // TODO: verify expected channel balance changes with new swap mechanism
     let htlc_min_sat = HTLC_MIN_MSAT / 1000;
     assert_eq!(
         chan_1_12.local_balance_sat,

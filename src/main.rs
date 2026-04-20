@@ -48,7 +48,7 @@ use crate::routes::{
     estimate_fee, fail_transfers, get_asset_media, get_channel_id, get_payment, get_swap, inflate,
     init, invoice_status, issue_asset_cfa, issue_asset_ifa, issue_asset_nia, issue_asset_uda,
     keysend, list_assets, list_channels, list_payments, list_peers, list_swaps, list_transactions,
-    list_transfers, list_unspents, ln_invoice, lock, maker_execute, maker_init, network_info,
+    list_transfers, list_unspents, ln_invoice, lock, maker_init, network_info,
     node_info, open_channel, post_asset_media, refresh_transfers, restore, revoke_token,
     rgb_invoice, send_btc, send_onion_message, send_payment, send_rgb, shutdown, sign_message,
     sync, taker, unlock,
@@ -145,7 +145,6 @@ pub(crate) async fn app(args: UserArgs) -> Result<(Router, Arc<AppState>), AppEr
         .route("/listunspents", post(list_unspents))
         .route("/lninvoice", post(ln_invoice))
         .route("/lock", post(lock))
-        .route("/makerexecute", post(maker_execute))
         .route("/makerinit", post(maker_init))
         .route("/networkinfo", get(network_info))
         .route("/nodeinfo", get(node_info))

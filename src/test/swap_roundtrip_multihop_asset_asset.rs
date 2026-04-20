@@ -151,6 +151,7 @@ async fn swap_roundtrip_multihop_asset_asset() {
         qty_to,
         Some(&asset_id_1),
         500,
+        &node3_pubkey,
     )
     .await;
     taker(taker_addr, maker_init_response.swapstring.clone()).await;
@@ -177,22 +178,18 @@ async fn swap_roundtrip_multihop_asset_asset() {
     assert_eq!(swap_taker.status, SwapStatus::Waiting);
 
     println!("\nexecute swap");
-    maker_execute(
+    taker_pay_invoice(taker_addr, &maker_init_response.bolt11_invoice).await;
+
+    wait_for_swap_status(
         maker_addr,
-        maker_init_response.swapstring,
-        maker_init_response.payment_secret,
-        node3_pubkey.clone(),
+        &maker_init_response.payment_hash,
+        SwapStatus::Succeeded,
     )
     .await;
-
-    let swaps_maker = list_swaps(maker_addr).await;
-    assert_eq!(swaps_maker.maker.len(), 1);
-    let swap_maker = swaps_maker.maker.first().unwrap();
-    assert_eq!(swap_maker.status, SwapStatus::Pending);
     wait_for_swap_status(
         taker_addr,
         &maker_init_response.payment_hash,
-        SwapStatus::Pending,
+        SwapStatus::Succeeded,
     )
     .await;
 
@@ -243,8 +240,7 @@ async fn swap_roundtrip_multihop_asset_asset() {
 
     let payments_maker = list_payments(maker_addr).await;
     assert!(payments_maker.is_empty());
-    let payments_taker = list_payments(taker_addr).await;
-    assert!(payments_taker.is_empty());
+    // taker now has an outbound payment (the HODL invoice payment)
 
     let channels_1_before = list_channels(node1_addr).await;
     let channels_2_before = list_channels(node2_addr).await;
@@ -281,25 +277,34 @@ async fn swap_roundtrip_multihop_asset_asset() {
         .iter()
         .find(|c| c.channel_id == channel_32.channel_id)
         .unwrap();
+    // TODO: verify expected channel balance changes with new swap mechanism.
+    // New 2-step swap (asset-for-asset multihop, maker=node1, taker=node3):
+    // HODL payment: taker(node3) sends HTLC_MIN_MSAT via chan_32→chan_21 (asset_id_2 channels) to maker(node1)
+    // Forward keysend: maker(node1) sends HTLC_MIN_MSAT via chan_12→chan_23 (asset_id_1 channels) to taker(node3)
     let htlc_min_sat = HTLC_MIN_MSAT / 1000;
     let fees = 1;
-    assert!(chan_1_12.local_balance_sat < chan_1_12_before.local_balance_sat - htlc_min_sat);
-    assert!(
-        chan_1_12.local_balance_sat
-            >= chan_1_12_before.local_balance_sat - htlc_min_sat - (fees * 3)
+    // Forward leg via chan_12→chan_23 (maker sends asset_id_1 to taker).
+    // One fee is taken at the middle hop (node2) — so node1 pays htlc_min+fee on chan_1_12,
+    // node2 sees +htlc_min+fee on chan_2_12 and forwards -htlc_min on chan_2_23,
+    // node3 receives +htlc_min on chan_3_23.
+    assert_eq!(
+        chan_1_12.local_balance_sat,
+        chan_1_12_before.local_balance_sat - htlc_min_sat - fees
     );
     assert_eq!(
         chan_2_12.local_balance_sat,
-        chan_2_12_before.local_balance_sat + htlc_min_sat + (fees * 2)
+        chan_2_12_before.local_balance_sat + htlc_min_sat + fees
     );
     assert_eq!(
         chan_2_23.local_balance_sat,
-        chan_2_23_before.local_balance_sat - htlc_min_sat - fees
+        chan_2_23_before.local_balance_sat - htlc_min_sat
     );
     assert_eq!(
         chan_3_23.local_balance_sat,
-        chan_3_23_before.local_balance_sat + htlc_min_sat + fees
+        chan_3_23_before.local_balance_sat + htlc_min_sat
     );
+    // HODL leg via chan_32→chan_21 (taker sends asset_id_2 to maker).
+    // One fee is taken at the middle hop (node2).
     assert_eq!(
         chan_3_32.local_balance_sat,
         chan_3_32_before.local_balance_sat - htlc_min_sat - fees

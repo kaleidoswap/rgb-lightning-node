@@ -52,10 +52,13 @@ async fn swap_assets_liquidity_both_ways() {
     // part 1: swap, using part of the RGB balance on each side
 
     println!("\nsetup swap buy some asset 1");
-    let qty_from = 25000;
+    // qty_from must be >= HTLC_MIN_MSAT because the taker pays the HODL BTC
+    // invoice through the RGB channel (channel_mt_asset_1) which was opened
+    // by the maker with our_htlc_minimum_msat = HTLC_MIN_MSAT.
+    let qty_from = 5000000;
     let qty_to = 10;
     let maker_init_response =
-        maker_init(maker_addr, qty_from, None, qty_to, Some(&asset_id_1), 3600).await;
+        maker_init(maker_addr, qty_from, None, qty_to, Some(&asset_id_1), 3600, &taker_pubkey).await;
     taker(taker_addr, maker_init_response.swapstring.clone()).await;
 
     let swap_maker = get_swap(maker_addr, &maker_init_response.payment_hash, false).await;
@@ -75,20 +78,18 @@ async fn swap_assets_liquidity_both_ways() {
     assert_eq!(swap_taker.status, SwapStatus::Waiting);
 
     println!("\nexecute swap buy some asset 1");
-    maker_execute(
+    taker_pay_invoice(taker_addr, &maker_init_response.bolt11_invoice).await;
+
+    wait_for_swap_status(
         maker_addr,
-        maker_init_response.swapstring,
-        maker_init_response.payment_secret,
-        taker_pubkey.clone(),
+        &maker_init_response.payment_hash,
+        SwapStatus::Succeeded,
     )
     .await;
-
-    let swap_maker = get_swap(maker_addr, &maker_init_response.payment_hash, false).await;
-    assert_eq!(swap_maker.status, SwapStatus::Pending);
     wait_for_swap_status(
         taker_addr,
         &maker_init_response.payment_hash,
-        SwapStatus::Pending,
+        SwapStatus::Succeeded,
     )
     .await;
 
@@ -101,10 +102,10 @@ async fn swap_assets_liquidity_both_ways() {
     assert_eq!(swap_taker.status, SwapStatus::Succeeded);
 
     println!("\nsetup swap buy some asset 2");
-    let qty_from = 25000;
+    let qty_from = 5000000;
     let qty_to = 20;
     let maker_init_response =
-        maker_init(maker_addr, qty_from, None, qty_to, Some(&asset_id_2), 3600).await;
+        maker_init(maker_addr, qty_from, None, qty_to, Some(&asset_id_2), 3600, &taker_pubkey).await;
     taker(taker_addr, maker_init_response.swapstring.clone()).await;
 
     let swap_maker = get_swap(maker_addr, &maker_init_response.payment_hash, false).await;
@@ -124,20 +125,18 @@ async fn swap_assets_liquidity_both_ways() {
     assert_eq!(swap_taker.status, SwapStatus::Waiting);
 
     println!("\nexecute swap buy some asset 2");
-    maker_execute(
+    taker_pay_invoice(taker_addr, &maker_init_response.bolt11_invoice).await;
+
+    wait_for_swap_status(
         maker_addr,
-        maker_init_response.swapstring,
-        maker_init_response.payment_secret,
-        taker_pubkey.clone(),
+        &maker_init_response.payment_hash,
+        SwapStatus::Succeeded,
     )
     .await;
-
-    let swap_maker = get_swap(maker_addr, &maker_init_response.payment_hash, false).await;
-    assert_eq!(swap_maker.status, SwapStatus::Pending);
     wait_for_swap_status(
         taker_addr,
         &maker_init_response.payment_hash,
-        SwapStatus::Pending,
+        SwapStatus::Succeeded,
     )
     .await;
 
@@ -159,6 +158,7 @@ async fn swap_assets_liquidity_both_ways() {
         qty_to,
         Some(&asset_id_2),
         3600,
+        &taker_pubkey,
     )
     .await;
     taker(taker_addr, maker_init_response.swapstring.clone()).await;
@@ -180,20 +180,18 @@ async fn swap_assets_liquidity_both_ways() {
     assert_eq!(swap_taker.status, SwapStatus::Waiting);
 
     println!("\nexecute swap some asset 1 for some asset 2");
-    maker_execute(
+    taker_pay_invoice(taker_addr, &maker_init_response.bolt11_invoice).await;
+
+    wait_for_swap_status(
         maker_addr,
-        maker_init_response.swapstring,
-        maker_init_response.payment_secret,
-        taker_pubkey.clone(),
+        &maker_init_response.payment_hash,
+        SwapStatus::Succeeded,
     )
     .await;
-
-    let swap_maker = get_swap(maker_addr, &maker_init_response.payment_hash, false).await;
-    assert_eq!(swap_maker.status, SwapStatus::Pending);
     wait_for_swap_status(
         taker_addr,
         &maker_init_response.payment_hash,
-        SwapStatus::Pending,
+        SwapStatus::Succeeded,
     )
     .await;
 
@@ -227,6 +225,7 @@ async fn swap_assets_liquidity_both_ways() {
         qty_to,
         Some(&asset_id_1),
         3600,
+        &taker_pubkey,
     )
     .await;
     taker(taker_addr, maker_init_response.swapstring.clone()).await;
@@ -248,11 +247,18 @@ async fn swap_assets_liquidity_both_ways() {
     assert_eq!(swap_taker.status, SwapStatus::Waiting);
 
     println!("\nexecute swap all asset 2 for all asset 1");
-    maker_execute(
+    taker_pay_invoice(taker_addr, &maker_init_response.bolt11_invoice).await;
+
+    wait_for_swap_status(
         maker_addr,
-        maker_init_response.swapstring,
-        maker_init_response.payment_secret,
-        taker_pubkey.clone(),
+        &maker_init_response.payment_hash,
+        SwapStatus::Succeeded,
+    )
+    .await;
+    wait_for_swap_status(
+        taker_addr,
+        &maker_init_response.payment_hash,
+        SwapStatus::Succeeded,
     )
     .await;
 

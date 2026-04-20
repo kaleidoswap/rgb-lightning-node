@@ -16,5 +16,5 @@ async fn swap_fail_amount_maker() {
 
     let asset_id = issue_asset_nia(node1_addr).await.asset_id;
 
-    maker_init(node1_addr, 3600000, None, 1000, Some(&asset_id), 5000).await;
+    maker_init(node1_addr, 3600000, None, 1000, Some(&asset_id), 5000, "02a1633cafcc01ebfb6d78e39f687a1f0995c62fc95f51ead10a02ee0be551b5dc").await;
 }

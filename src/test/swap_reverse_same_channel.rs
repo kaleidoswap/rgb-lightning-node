@@ -46,10 +46,13 @@ async fn swap_reverse_same_channel() {
     println!("\nsetup swap");
     let maker_addr = node1_addr;
     let taker_addr = node2_addr;
-    let qty_from = 25000;
+    // qty_from must be >= HTLC_MIN_MSAT because the single RGB channel was opened
+    // by node1 with our_htlc_minimum_msat = HTLC_MIN_MSAT, and the taker pays
+    // the HODL BTC invoice through this same channel (node2→node1 direction).
+    let qty_from = 5000000;
     let qty_to = 10;
     let maker_init_response =
-        maker_init(maker_addr, qty_from, None, qty_to, Some(&asset_id), 3600).await;
+        maker_init(maker_addr, qty_from, None, qty_to, Some(&asset_id), 3600, &node2_pubkey).await;
     taker(taker_addr, maker_init_response.swapstring.clone()).await;
 
     let swaps_maker = list_swaps(maker_addr).await;
@@ -75,23 +78,18 @@ async fn swap_reverse_same_channel() {
     assert_eq!(swap_taker.status, SwapStatus::Waiting);
 
     println!("\nexecute swap");
-    maker_execute(
+    taker_pay_invoice(taker_addr, &maker_init_response.bolt11_invoice).await;
+
+    wait_for_swap_status(
         maker_addr,
-        maker_init_response.swapstring,
-        maker_init_response.payment_secret,
-        node2_pubkey.clone(),
+        &maker_init_response.payment_hash,
+        SwapStatus::Succeeded,
     )
     .await;
-
-    let swaps_maker = list_swaps(maker_addr).await;
-    assert!(swaps_maker.taker.is_empty());
-    assert_eq!(swaps_maker.maker.len(), 1);
-    let swap_maker = swaps_maker.maker.first().unwrap();
-    assert_eq!(swap_maker.status, SwapStatus::Pending);
     wait_for_swap_status(
         taker_addr,
         &maker_init_response.payment_hash,
-        SwapStatus::Pending,
+        SwapStatus::Succeeded,
     )
     .await;
 
@@ -117,22 +115,32 @@ async fn swap_reverse_same_channel() {
         .iter()
         .find(|c| c.channel_id == channel_12.channel_id)
         .unwrap();
+    // TODO: verify expected channel balance changes with new swap mechanism.
+    // Both HODL and forward payments use the same single channel.
+    // HODL: taker(node2)→maker(node1) +qty_from/1000 sats; Forward: maker(node1)→taker(node2) -HTLC_MIN_MSAT/1000 sats.
+    use self::routes::HTLC_MIN_MSAT;
+    let hodl_sat = qty_from / 1000;
+    let fwd_sat = HTLC_MIN_MSAT / 1000;
     assert_eq!(
         chan_1_12.local_balance_sat,
-        chan_1_12_before.local_balance_sat + qty_from / 1000
+        chan_1_12_before.local_balance_sat + hodl_sat - fwd_sat
     );
     assert_eq!(
         chan_2_12.local_balance_sat,
-        chan_2_12_before.local_balance_sat - qty_from / 1000
+        chan_2_12_before.local_balance_sat - hodl_sat + fwd_sat
     );
 
     println!("\nsetup reverse swap");
     let maker_addr = node2_addr;
     let taker_addr = node1_addr;
+    // qty_to must be >= HTLC_MIN_MSAT because the forward BTC keysend from the
+    // new maker (node2) to the new taker (node1) goes through the same single
+    // channel, and node1's our_htlc_minimum_msat = HTLC_MIN_MSAT applies to
+    // HTLCs arriving at node1 (channel was opened by node1).
     let qty_from = 10;
-    let qty_to = 50000;
+    let qty_to = 5000000;
     let maker_init_response =
-        maker_init(maker_addr, qty_from, Some(&asset_id), qty_to, None, 3600).await;
+        maker_init(maker_addr, qty_from, Some(&asset_id), qty_to, None, 3600, &node1_pubkey).await;
     taker(taker_addr, maker_init_response.swapstring.clone()).await;
 
     let swaps_maker = list_swaps(maker_addr).await;
@@ -155,23 +163,19 @@ async fn swap_reverse_same_channel() {
     assert_eq!(swap_taker.payment_hash, maker_init_response.payment_hash);
     assert_eq!(swap_taker.status, SwapStatus::Waiting);
 
-    println!("\nexecute swap");
-    maker_execute(
+    println!("\nexecute reverse swap");
+    taker_pay_invoice(taker_addr, &maker_init_response.bolt11_invoice).await;
+
+    wait_for_swap_status(
         maker_addr,
-        maker_init_response.swapstring,
-        maker_init_response.payment_secret,
-        node1_pubkey.clone(),
+        &maker_init_response.payment_hash,
+        SwapStatus::Succeeded,
     )
     .await;
-
-    let swaps_maker = list_swaps(maker_addr).await;
-    assert_eq!(swaps_maker.maker.len(), 1);
-    let swap_maker = swaps_maker.maker.first().unwrap();
-    assert_eq!(swap_maker.status, SwapStatus::Pending);
     wait_for_swap_status(
         taker_addr,
         &maker_init_response.payment_hash,
-        SwapStatus::Pending,
+        SwapStatus::Succeeded,
     )
     .await;
 

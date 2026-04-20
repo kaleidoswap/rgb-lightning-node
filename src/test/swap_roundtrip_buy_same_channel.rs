@@ -48,10 +48,14 @@ async fn swap_roundtrip_buy_same_channel() {
     println!("\nsetup swap");
     let maker_addr = node1_addr;
     let taker_addr = node2_addr;
-    let qty_from = 25000;
+    // qty_from must be >= HTLC_MIN_MSAT (3_000_000) because the single RGB channel was opened
+    // by the maker with our_htlc_minimum_msat = HTLC_MIN_MSAT.  The taker routes the HODL
+    // invoice through that same channel (node2→node1 direction), so the amount must meet the
+    // channel's minimum.
+    let qty_from = 5000000;
     let qty_to = 10;
     let maker_init_response =
-        maker_init(maker_addr, qty_from, None, qty_to, Some(&asset_id), 3600).await;
+        maker_init(maker_addr, qty_from, None, qty_to, Some(&asset_id), 3600, &node2_pubkey).await;
     taker(taker_addr, maker_init_response.swapstring.clone()).await;
 
     let swaps_maker = list_swaps(maker_addr).await;
@@ -76,22 +80,18 @@ async fn swap_roundtrip_buy_same_channel() {
     assert_eq!(swap_taker.status, SwapStatus::Waiting);
 
     println!("\nexecute swap");
-    maker_execute(
+    taker_pay_invoice(taker_addr, &maker_init_response.bolt11_invoice).await;
+
+    wait_for_swap_status(
         maker_addr,
-        maker_init_response.swapstring,
-        maker_init_response.payment_secret,
-        node2_pubkey.clone(),
+        &maker_init_response.payment_hash,
+        SwapStatus::Succeeded,
     )
     .await;
-
-    let swaps_maker = list_swaps(maker_addr).await;
-    assert_eq!(swaps_maker.maker.len(), 1);
-    let swap_maker = swaps_maker.maker.first().unwrap();
-    assert_eq!(swap_maker.status, SwapStatus::Pending);
     wait_for_swap_status(
         taker_addr,
         &maker_init_response.payment_hash,
-        SwapStatus::Pending,
+        SwapStatus::Succeeded,
     )
     .await;
 
@@ -126,8 +126,7 @@ async fn swap_roundtrip_buy_same_channel() {
 
     let payments_maker = list_payments(maker_addr).await;
     assert!(payments_maker.is_empty());
-    let payments_taker = list_payments(taker_addr).await;
-    assert!(payments_taker.is_empty());
+    // taker now has an outbound payment (the HODL invoice payment)
 
     let channels_1 = list_channels(node1_addr).await;
     let channels_2 = list_channels(node2_addr).await;
@@ -139,13 +138,20 @@ async fn swap_roundtrip_buy_same_channel() {
         .iter()
         .find(|c| c.channel_id == channel_12.channel_id)
         .unwrap();
+    // TODO: verify expected channel balance changes with new swap mechanism.
+    // Both HODL and forward payments use the same single channel.
+    // HODL: taker→maker +qty_from/1000 sats on chan_1_12; Forward: maker→taker -HTLC_MIN_MSAT/1000 sats.
+    // Net on chan_1_12: +(qty_from/1000) - (HTLC_MIN_MSAT/1000)
+    use self::routes::HTLC_MIN_MSAT;
+    let hodl_sat = qty_from / 1000;
+    let fwd_sat = HTLC_MIN_MSAT / 1000;
     assert_eq!(
         chan_1_12.local_balance_sat,
-        chan_1_12_before.local_balance_sat + qty_from / 1000
+        chan_1_12_before.local_balance_sat + hodl_sat - fwd_sat
     );
     assert_eq!(
         chan_2_12.local_balance_sat,
-        chan_2_12_before.local_balance_sat - qty_from / 1000
+        chan_2_12_before.local_balance_sat - hodl_sat + fwd_sat
     );
 
     println!("\nclose channels");

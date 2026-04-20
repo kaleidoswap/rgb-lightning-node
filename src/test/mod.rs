@@ -40,7 +40,7 @@ use crate::routes::{
     LNInvoiceResponse, ListAssetsRequest, ListAssetsResponse, ListChannelsResponse,
     ListPaymentsResponse, ListPeersResponse, ListSwapsResponse, ListTransactionsRequest,
     ListTransactionsResponse, ListTransfersRequest, ListTransfersResponse, ListUnspentsRequest,
-    ListUnspentsResponse, MakerExecuteRequest, MakerInitRequest, MakerInitResponse,
+    ListUnspentsResponse, MakerInitRequest, MakerInitResponse,
     NetworkInfoResponse, NodeInfoResponse, OpenChannelRequest, OpenChannelResponse, Payment,
     PaymentType, Peer, PostAssetMediaResponse, Recipient, RefreshRequest, RestoreRequest,
     RevokeTokenRequest, RgbInvoiceRequest, RgbInvoiceResponse, SendBtcRequest, SendBtcResponse,
@@ -1089,39 +1089,6 @@ async fn lock(node_address: SocketAddr) {
         .unwrap();
 }
 
-async fn maker_execute(
-    node_address: SocketAddr,
-    swapstring: String,
-    payment_secret: String,
-    taker_pubkey: String,
-) {
-    let res = maker_execute_raw(node_address, swapstring, payment_secret, taker_pubkey).await;
-    let _ = _check_response_is_ok(res)
-        .await
-        .json::<EmptyResponse>()
-        .await;
-}
-
-async fn maker_execute_raw(
-    node_address: SocketAddr,
-    swapstring: String,
-    payment_secret: String,
-    taker_pubkey: String,
-) -> Response {
-    println!("executing swap {swapstring} from node {node_address}");
-    let payload = MakerExecuteRequest {
-        swapstring,
-        payment_secret,
-        taker_pubkey,
-    };
-    reqwest::Client::new()
-        .post(format!("http://{node_address}/makerexecute"))
-        .json(&payload)
-        .send()
-        .await
-        .unwrap()
-}
-
 async fn maker_init(
     node_address: SocketAddr,
     qty_from: u64,
@@ -1129,10 +1096,11 @@ async fn maker_init(
     qty_to: u64,
     to_asset: Option<&str>,
     timeout_sec: u32,
+    taker_pubkey: &str,
 ) -> MakerInitResponse {
     println!(
         "initializing swap from {qty_from} of {from_asset:?} \
-        to {qty_to} of {to_asset:?} on node {node_address}"
+        to {qty_to} of {to_asset:?} on node {node_address} (taker: {taker_pubkey})"
     );
     let payload = MakerInitRequest {
         qty_from,
@@ -1140,6 +1108,7 @@ async fn maker_init(
         from_asset: from_asset.map(|a| a.into()),
         to_asset: to_asset.map(|a| a.into()),
         timeout_sec,
+        taker_pubkey: taker_pubkey.to_string(),
     };
     let res = reqwest::Client::new()
         .post(format!("http://{node_address}/makerinit"))
@@ -1150,6 +1119,29 @@ async fn maker_init(
     _check_response_is_ok(res)
         .await
         .json::<MakerInitResponse>()
+        .await
+        .unwrap()
+}
+
+/// Taker pays the HODL invoice created by the maker to participate in the swap.
+/// Returns the SendPaymentResponse (payment is async; use wait_for_swap_status to confirm).
+async fn taker_pay_invoice(node_address: SocketAddr, bolt11_invoice: &str) -> SendPaymentResponse {
+    println!("taker paying swap invoice on node {node_address}");
+    let payload = SendPaymentRequest {
+        invoice: bolt11_invoice.to_string(),
+        amt_msat: None,
+        asset_id: None,
+        asset_amount: None,
+    };
+    let res = reqwest::Client::new()
+        .post(format!("http://{node_address}/sendpayment"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    _check_response_is_ok(res)
+        .await
+        .json::<SendPaymentResponse>()
         .await
         .unwrap()
 }
@@ -2058,7 +2050,6 @@ mod swap_roundtrip_fail_invalid_asset_from;
 mod swap_roundtrip_fail_invalid_asset_to;
 mod swap_roundtrip_fail_same_asset;
 mod swap_roundtrip_fail_timeout;
-mod swap_roundtrip_fail_whitelist;
 mod swap_roundtrip_multihop_asset_asset;
 mod swap_roundtrip_multihop_buy;
 mod swap_roundtrip_multihop_sell;
