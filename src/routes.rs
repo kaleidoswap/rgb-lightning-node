@@ -17,8 +17,6 @@ use lightning::rgb_utils::{
     get_rgb_channel_info_path, get_rgb_payment_info_path, parse_rgb_channel_info,
     parse_rgb_payment_info, STATIC_BLINDING,
 };
-use lightning::routing::gossip::RoutingFees;
-use lightning::routing::router::{Path as LnPath, Route, RouteHint, RouteHintHop};
 use lightning::sign::EntropySource;
 use lightning::util::config::ChannelConfig;
 use lightning::{chain::channelmonitor::Balance, impl_writeable_tlv_based_enum};
@@ -38,9 +36,9 @@ use lightning::{
         router::{PaymentParameters, RouteParameters},
     },
     util::config::{ChannelHandshakeConfig, ChannelHandshakeLimits, UserConfig},
-    util::{errors::APIError as LDKAPIError, IS_SWAP_SCID},
+    util::errors::APIError as LDKAPIError,
 };
-use lightning_invoice::{Bolt11Invoice, PaymentSecret};
+use lightning_invoice::Bolt11Invoice;
 use regex::Regex;
 use rgb_lib::{
     bdk_wallet::keys::bip39::Mnemonic,
@@ -79,13 +77,13 @@ use crate::ldk::{start_ldk, stop_ldk, LdkBackgroundServices, MIN_CHANNEL_CONFIRM
 use crate::swap::{SwapData, SwapInfo, SwapString};
 use crate::utils::{
     check_already_initialized, check_channel_id, check_password_strength, check_password_validity,
-    encrypt_and_save_mnemonic, get_max_local_rgb_amount, get_mnemonic_path, get_route, hex_str,
+    encrypt_and_save_mnemonic, get_max_local_rgb_amount, get_mnemonic_path, hex_str,
     hex_str_to_compressed_pubkey, hex_str_to_vec, validate_and_parse_payment_hash,
     validate_and_parse_payment_preimage, UnlockedAppState, UserOnionMessageContents,
 };
 use crate::{
     backup::{do_backup, restore_backup},
-    rgb::{check_rgb_proxy_endpoint, get_rgb_channel_info_optional},
+    rgb::check_rgb_proxy_endpoint,
 };
 use crate::{
     disk::{self, CHANNEL_PEER_DATA},
@@ -99,7 +97,6 @@ use crate::{
 const UTXO_NUM: u8 = 4;
 
 pub(crate) const HTLC_MIN_MSAT: u64 = 3000000;
-pub(crate) const MAX_SWAP_FEE_MSAT: u64 = HTLC_MIN_MSAT;
 
 const OPENRGBCHANNEL_MIN_SAT: u64 = HTLC_MIN_MSAT / 1000 * 10 + 10;
 const OPENCHANNEL_MIN_SAT: u64 = 5506;
@@ -109,8 +106,6 @@ const OPENCHANNEL_MIN_RGB_AMT: u64 = 1;
 pub const DUST_LIMIT_MSAT: u64 = 546000;
 
 const INVOICE_MIN_MSAT: u64 = HTLC_MIN_MSAT;
-
-pub(crate) const DEFAULT_FINAL_CLTV_EXPIRY_DELTA: u32 = 14;
 
 #[derive(Deserialize, Serialize)]
 pub(crate) struct AddressResponse {
@@ -852,13 +847,6 @@ pub(crate) struct LNInvoiceResponse {
     pub(crate) invoice: String,
 }
 
-#[derive(Deserialize, Serialize)]
-pub(crate) struct MakerExecuteRequest {
-    pub(crate) swapstring: String,
-    pub(crate) payment_secret: String,
-    pub(crate) taker_pubkey: String,
-}
-
 // "from" and "to" are seen from the taker's perspective, so:
 // - "from" is what the taker will send and the maker will receive
 // - "to" is what the taker will receive and the maker will send
@@ -870,12 +858,13 @@ pub(crate) struct MakerInitRequest {
     pub(crate) from_asset: Option<String>,
     pub(crate) to_asset: Option<String>,
     pub(crate) timeout_sec: u32,
+    pub(crate) taker_pubkey: String,
 }
 
 #[derive(Deserialize, Serialize)]
 pub(crate) struct MakerInitResponse {
     pub(crate) payment_hash: String,
-    pub(crate) payment_secret: String,
+    pub(crate) bolt11_invoice: String,
     pub(crate) swapstring: String,
 }
 
@@ -2578,6 +2567,14 @@ pub(crate) async fn list_payments(
     let mut payments = vec![];
 
     for (payment_hash, payment_info) in &inbound_payments {
+        // Maker-swap HODL invoices are implementation details of the swap mechanism.
+        // They are tracked via list_swaps, not list_payments.
+        if matches!(payment_info.invoice_type, Some(InvoiceType::Hodl))
+            && unlocked_state.is_maker_swap(payment_hash)
+        {
+            continue;
+        }
+
         let rgb_payment_info_path_inbound =
             get_rgb_payment_info_path(payment_hash, &state.static_state.ldk_data_dir, true);
 
@@ -2925,219 +2922,6 @@ pub(crate) async fn lock(
     .await
 }
 
-pub(crate) async fn maker_execute(
-    State(state): State<Arc<AppState>>,
-    WithRejection(Json(payload), _): WithRejection<Json<MakerExecuteRequest>, APIError>,
-) -> Result<Json<EmptyResponse>, APIError> {
-    no_cancel(async move {
-        let guard = state.check_unlocked().await?;
-        let unlocked_state = guard.as_ref().unwrap();
-
-        let swapstring = SwapString::from_str(&payload.swapstring)
-            .map_err(|e| APIError::InvalidSwapString(payload.swapstring.clone(), e.to_string()))?;
-        let payment_secret = hex_str_to_vec(&payload.payment_secret)
-            .and_then(|data| data.try_into().ok())
-            .map(PaymentSecret)
-            .ok_or(APIError::InvalidPaymentSecret)?;
-        let taker_pk =
-            PublicKey::from_str(&payload.taker_pubkey).map_err(|_| APIError::InvalidPubkey)?;
-
-        if get_current_timestamp() > swapstring.swap_info.expiry {
-            unlocked_state.update_maker_swap_status(&swapstring.payment_hash, SwapStatus::Expired);
-            return Err(APIError::ExpiredSwapOffer);
-        }
-
-        let payment_preimage = unlocked_state
-            .channel_manager
-            .get_payment_preimage(swapstring.payment_hash, payment_secret)
-            .map_err(|_| APIError::MissingSwapPaymentPreimage)?;
-
-        let swap_info = swapstring.swap_info;
-
-        let receive_hints = unlocked_state
-            .channel_manager
-            .list_usable_channels()
-            .iter()
-            .filter(|details| {
-                match get_rgb_channel_info_optional(
-                    &details.channel_id,
-                    &state.static_state.ldk_data_dir,
-                    false,
-                ) {
-                    _ if swap_info.is_from_btc() => true,
-                    Some((rgb_info, _)) if Some(rgb_info.contract_id) == swap_info.from_asset => {
-                        true
-                    }
-                    _ => false,
-                }
-            })
-            .map(|details| {
-                let config = details.counterparty.forwarding_info.as_ref().unwrap();
-                RouteHint(vec![RouteHintHop {
-                    src_node_id: details.counterparty.node_id,
-                    short_channel_id: details.short_channel_id.unwrap(),
-                    cltv_expiry_delta: config.cltv_expiry_delta,
-                    htlc_maximum_msat: None,
-                    htlc_minimum_msat: None,
-                    fees: RoutingFees {
-                        base_msat: config.fee_base_msat,
-                        proportional_millionths: config.fee_proportional_millionths,
-                    },
-                    htlc_maximum_rgb: None,
-                }])
-            })
-            .collect();
-
-        let rgb_payment = swap_info
-            .to_asset
-            .map(|to_asset| (to_asset, swap_info.qty_to));
-        let first_leg = get_route(
-            &unlocked_state.channel_manager,
-            &unlocked_state.router,
-            unlocked_state.channel_manager.get_our_node_id(),
-            taker_pk,
-            if swap_info.is_to_btc() {
-                Some(swap_info.qty_to + HTLC_MIN_MSAT)
-            } else {
-                Some(HTLC_MIN_MSAT)
-            },
-            rgb_payment,
-            vec![],
-        );
-
-        let rgb_payment = swap_info
-            .from_asset
-            .map(|from_asset| (from_asset, swap_info.qty_from));
-        let second_leg = get_route(
-            &unlocked_state.channel_manager,
-            &unlocked_state.router,
-            taker_pk,
-            unlocked_state.channel_manager.get_our_node_id(),
-            if swap_info.is_to_btc() || swap_info.is_asset_asset() {
-                Some(HTLC_MIN_MSAT)
-            } else {
-                Some(swap_info.qty_from + HTLC_MIN_MSAT)
-            },
-            rgb_payment,
-            receive_hints,
-        );
-
-        let (mut first_leg, mut second_leg) = match (first_leg, second_leg) {
-            (Some(f), Some(s)) => (f, s),
-            _ => {
-                return Err(APIError::NoRoute);
-            }
-        };
-
-        // Set swap flag
-        second_leg.paths[0].hops[0].short_channel_id |= IS_SWAP_SCID;
-
-        // Generally in the last hop the fee_amount is set to the payment amount, so we need to
-        // override it with fee = 0
-        first_leg.paths[0]
-            .hops
-            .last_mut()
-            .expect("Path not to be empty")
-            .fee_msat = 0;
-
-        let fullpaths = first_leg.paths[0]
-            .hops
-            .clone()
-            .into_iter()
-            .map(|mut hop| {
-                if swap_info.is_to_asset() {
-                    hop.rgb_payment = Some((swap_info.to_asset.unwrap(), swap_info.qty_to));
-                }
-                hop
-            })
-            .chain(second_leg.paths[0].hops.clone().into_iter().map(|mut hop| {
-                if swap_info.is_from_asset() {
-                    hop.rgb_payment = Some((swap_info.from_asset.unwrap(), swap_info.qty_from));
-                }
-                hop
-            }))
-            .collect::<Vec<_>>();
-
-        // Skip last fee because it's equal to the payment amount
-        let total_fee = fullpaths
-            .iter()
-            .rev()
-            .skip(1)
-            .map(|hop| hop.fee_msat)
-            .sum::<u64>();
-
-        if total_fee >= MAX_SWAP_FEE_MSAT {
-            return Err(APIError::FailedPayment(format!(
-                "Fee too high: {total_fee}"
-            )));
-        }
-
-        let route = Route {
-            paths: vec![LnPath {
-                hops: fullpaths,
-                blinded_tail: None,
-            }],
-            route_params: Some(RouteParameters {
-                payment_params: PaymentParameters::for_keysend(
-                    unlocked_state.channel_manager.get_our_node_id(),
-                    DEFAULT_FINAL_CLTV_EXPIRY_DELTA,
-                    false,
-                ),
-                // This value is not used anywhere, it's set by the router
-                // when creating a route, but here we are creating it manually
-                // by composing a pre-existing list of hops
-                final_value_msat: 0,
-                max_total_routing_fee_msat: None,
-                // This value is not used anywhere, same as final_value_msat
-                rgb_payment: None,
-            }),
-        };
-
-        if swap_info.is_to_asset() {
-            write_rgb_payment_info_file(
-                &state.static_state.ldk_data_dir,
-                &swapstring.payment_hash,
-                swap_info.to_asset.unwrap(),
-                swap_info.qty_to,
-                true,
-                false,
-            );
-        }
-
-        unlocked_state.update_maker_swap_status(&swapstring.payment_hash, SwapStatus::Pending);
-
-        let payment_hash: PaymentHash = payment_preimage.into();
-        let (_status, err) = match unlocked_state
-            .channel_manager
-            .send_spontaneous_payment_with_route(
-                route,
-                payment_hash,
-                payment_preimage,
-                RecipientOnionFields::spontaneous_empty(),
-                PaymentId(swapstring.payment_hash.0),
-            ) {
-            Ok(()) => {
-                tracing::debug!("EVENT: initiated swap");
-                (HTLCStatus::Pending, None)
-            }
-            Err(e) => {
-                tracing::warn!("ERROR: failed to send payment: {:?}", e);
-                (HTLCStatus::Failed, Some(e))
-            }
-        };
-
-        match err {
-            None => Ok(Json(EmptyResponse {})),
-            Some(e) => {
-                unlocked_state
-                    .update_maker_swap_status(&swapstring.payment_hash, SwapStatus::Failed);
-                Err(APIError::FailedPayment(format!("{e:?}")))
-            }
-        }
-    })
-    .await
-}
-
 pub(crate) async fn maker_init(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<MakerInitRequest>, APIError>,
@@ -3170,18 +2954,22 @@ pub(crate) async fn maker_init(
             return Err(APIError::InvalidSwap(s!("cannot swap the same asset")));
         }
 
+        let taker_pubkey =
+            PublicKey::from_str(&payload.taker_pubkey).map_err(|_| APIError::InvalidPubkey)?;
+
         let qty_from = payload.qty_from;
         let qty_to = payload.qty_to;
 
-        let expiry = get_current_timestamp() + payload.timeout_sec as u64;
+        let created_at = get_current_timestamp();
+        let expiry = created_at + payload.timeout_sec as u64;
         let swap_info = SwapInfo {
             from_asset,
             to_asset,
             qty_from,
             qty_to,
             expiry,
+            taker_pubkey,
         };
-        let swap_data = SwapData::create_from_swap_info(&swap_info);
 
         // Check that we have enough assets to send
         if let Some(to_asset) = to_asset {
@@ -3195,19 +2983,63 @@ pub(crate) async fn maker_init(
             }
         }
 
-        let (payment_hash, payment_secret) = unlocked_state
+        // Generate our own preimage so we can store it and call claim_funds after the forward leg
+        let preimage = PaymentPreimage(unlocked_state.keys_manager.get_secure_random_bytes());
+        let payment_hash: PaymentHash = preimage.into();
+
+        // Create a HODL BOLT11 invoice: taker pays this to initiate the swap
+        let invoice_params = Bolt11InvoiceParameters {
+            amount_msats: Some(if swap_info.is_from_btc() {
+                qty_from
+            } else {
+                INVOICE_MIN_MSAT
+            }),
+            invoice_expiry_delta_secs: Some(payload.timeout_sec),
+            payment_hash: Some(payment_hash),
+            contract_id: from_asset,
+            asset_amount: if swap_info.is_from_asset() {
+                Some(qty_from)
+            } else {
+                None
+            },
+            ..Default::default()
+        };
+        let bolt11 = unlocked_state
             .channel_manager
-            .create_inbound_payment(Some(DUST_LIMIT_MSAT), payload.timeout_sec, None)
-            .unwrap();
+            .create_bolt11_invoice(invoice_params)
+            .map_err(|e| APIError::FailedInvoiceCreation(e.to_string()))?;
+
+        // Store PaymentInfo with the preimage so PaymentClaimable can call claim_funds later
+        unlocked_state.add_inbound_payment(
+            payment_hash,
+            PaymentInfo {
+                preimage: Some(preimage),
+                secret: Some(*bolt11.payment_secret()),
+                status: HTLCStatus::Pending,
+                amt_msat: Some(if swap_info.is_from_btc() {
+                    qty_from
+                } else {
+                    INVOICE_MIN_MSAT
+                }),
+                created_at,
+                updated_at: created_at,
+                payee_pubkey: unlocked_state.channel_manager.get_our_node_id(),
+                expires_at: Some(expiry),
+                claim_deadline_height: None,
+                invoice_type: Some(InvoiceType::Hodl),
+            },
+        );
+
+        // Store the maker swap (taker_pubkey is embedded in SwapInfo for the forward leg)
+        let swap_data = SwapData::create_from_swap_info(&swap_info);
         unlocked_state.add_maker_swap(payment_hash, swap_data);
 
         let swapstring = SwapString::from_swap_info(&swap_info, payment_hash).to_string();
+        let payment_hash_hex = payment_hash.0.as_hex().to_string();
 
-        let payment_secret = payment_secret.0.as_hex().to_string();
-        let payment_hash = payment_hash.0.as_hex().to_string();
         Ok(Json(MakerInitResponse {
-            payment_hash,
-            payment_secret,
+            payment_hash: payment_hash_hex,
+            bolt11_invoice: bolt11.to_string(),
             swapstring,
         }))
     })

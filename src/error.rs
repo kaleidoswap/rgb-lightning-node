@@ -77,9 +77,6 @@ pub enum APIError {
     #[error("Failed to open channel: {0}")]
     FailedOpenChannel(String),
 
-    #[error("Failed payment: {0}")]
-    FailedPayment(String),
-
     #[error("Failed to connect to peer")]
     FailedPeerConnection,
 
@@ -170,9 +167,6 @@ pub enum APIError {
     #[error("Invalid payment preimage")]
     InvalidPaymentPreimage,
 
-    #[error("Invalid payment secret")]
-    InvalidPaymentSecret,
-
     #[error("Invalid password: {0}")]
     InvalidPassword(String),
 
@@ -260,9 +254,6 @@ pub enum APIError {
     #[error("Min fee not met for transfer with TXID: {0}")]
     MinFeeNotMet(String),
 
-    #[error("Unable to find payment preimage, be sure you've provided the correct swap info")]
-    MissingSwapPaymentPreimage,
-
     #[error("Network error: {0}")]
     Network(String),
 
@@ -271,9 +262,6 @@ pub enum APIError {
 
     #[error("No uncolored UTXOs are available (hint: call createutxos)")]
     NoAvailableUtxos,
-
-    #[error("No route found")]
-    NoRoute,
 
     #[error("Wallet has not been initialized (hint: call init)")]
     NotInitialized,
@@ -457,7 +445,6 @@ impl IntoResponse for APIError {
             | APIError::FailedIssuingAsset(_)
             | APIError::FailedKeysCreation(_, _)
             | APIError::FailedOpenChannel(_)
-            | APIError::FailedPayment(_)
             | APIError::FailedPeerDisconnection(_)
             | APIError::FailedSendingOnionMessage(_)
             | APIError::IO(_)
@@ -493,7 +480,6 @@ impl IntoResponse for APIError {
             | APIError::InvalidPaymentHash(_)
             | APIError::PaymentHashAlreadyUsed
             | APIError::InvalidPaymentPreimage
-            | APIError::InvalidPaymentSecret
             | APIError::InvalidPeerInfo(_)
             | APIError::InvalidPrecision(_)
             | APIError::InvalidPubkey
@@ -511,7 +497,6 @@ impl IntoResponse for APIError {
             | APIError::InvoiceExpired
             | APIError::MediaFileEmpty
             | APIError::MediaFileNotProvided
-            | APIError::MissingSwapPaymentPreimage
             | APIError::OutputBelowDustLimit
             | APIError::ClaimDeadlineExceeded
             | APIError::UnsupportedBackupVersion { .. } => {
@@ -545,7 +530,6 @@ impl IntoResponse for APIError {
             | APIError::MinFeeNotMet(_)
             | APIError::NetworkMismatch(_, _)
             | APIError::NoAvailableUtxos
-            | APIError::NoRoute
             | APIError::NotInitialized
             | APIError::OpenChannelInProgress
             | APIError::PaymentNotFound(_)

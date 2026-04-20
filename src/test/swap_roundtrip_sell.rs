@@ -74,7 +74,7 @@ async fn swap_roundtrip_sell() {
     let qty_from = 10;
     let qty_to = 50000;
     let maker_init_response =
-        maker_init(maker_addr, qty_from, Some(&asset_id), qty_to, None, 3600).await;
+        maker_init(maker_addr, qty_from, Some(&asset_id), qty_to, None, 3600, &node2_pubkey).await;
     taker(taker_addr, maker_init_response.swapstring.clone()).await;
 
     let swaps_maker = list_swaps(maker_addr).await;
@@ -99,22 +99,18 @@ async fn swap_roundtrip_sell() {
     assert_eq!(swap_taker.status, SwapStatus::Waiting);
 
     println!("\nexecute swap");
-    maker_execute(
+    taker_pay_invoice(taker_addr, &maker_init_response.bolt11_invoice).await;
+
+    wait_for_swap_status(
         maker_addr,
-        maker_init_response.swapstring,
-        maker_init_response.payment_secret,
-        node2_pubkey.clone(),
+        &maker_init_response.payment_hash,
+        SwapStatus::Succeeded,
     )
     .await;
-
-    let swaps_maker = list_swaps(maker_addr).await;
-    assert_eq!(swaps_maker.maker.len(), 1);
-    let swap_maker = swaps_maker.maker.first().unwrap();
-    assert_eq!(swap_maker.status, SwapStatus::Pending);
     wait_for_swap_status(
         taker_addr,
         &maker_init_response.payment_hash,
-        SwapStatus::Pending,
+        SwapStatus::Succeeded,
     )
     .await;
 
@@ -146,8 +142,7 @@ async fn swap_roundtrip_sell() {
 
     let payments_maker = list_payments(maker_addr).await;
     assert!(payments_maker.is_empty());
-    let payments_taker = list_payments(taker_addr).await;
-    assert!(payments_taker.is_empty());
+    // taker now has an outbound payment (the HODL invoice payment)
 
     let channels_1 = list_channels(node1_addr).await;
     let channels_2 = list_channels(node2_addr).await;
@@ -167,23 +162,26 @@ async fn swap_roundtrip_sell() {
         .iter()
         .find(|c| c.channel_id == channel_21.channel_id)
         .unwrap();
-    let btc_leg_diff = (HTLC_MIN_MSAT + qty_to) / 1000;
-    let htlc_min_sat = HTLC_MIN_MSAT / 1000;
+    // New 2-step swap: HODL payment (taker→maker via chan_21 RGB channel) + forward keysend (maker→taker via chan_12 BTC)
+    let hodl_diff_sat = HTLC_MIN_MSAT / 1000; // 3000 sats (carrier msat for RGB HODL invoice)
+    let fwd_diff_sat = qty_to / 1000; // 50 sats
+    // chan_12: node1→node2 BTC channel, maker sends forward leg
     assert_eq!(
         chan_1_12.local_balance_sat,
-        chan_1_12_before.local_balance_sat - btc_leg_diff
-    );
-    assert_eq!(
-        chan_1_21.local_balance_sat,
-        chan_1_21_before.local_balance_sat + htlc_min_sat
+        chan_1_12_before.local_balance_sat - fwd_diff_sat
     );
     assert_eq!(
         chan_2_12.local_balance_sat,
-        chan_2_12_before.local_balance_sat + btc_leg_diff
+        chan_2_12_before.local_balance_sat + fwd_diff_sat
     );
+    // chan_21: node2→node1 RGB channel, taker sends HODL payment
     assert_eq!(
         chan_2_21.local_balance_sat,
-        chan_2_21_before.local_balance_sat - htlc_min_sat
+        chan_2_21_before.local_balance_sat - hodl_diff_sat
+    );
+    assert_eq!(
+        chan_1_21.local_balance_sat,
+        chan_1_21_before.local_balance_sat + hodl_diff_sat
     );
 
     println!("\nclose channels");

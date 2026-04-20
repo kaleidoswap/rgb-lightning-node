@@ -12,5 +12,5 @@ async fn swap_roundtrip_fail_btc2btc() {
     let test_dir_node1 = format!("{TEST_DIR_BASE}node1");
     let (node1_addr, _) = start_node(&test_dir_node1, NODE1_PEER_PORT, false).await;
 
-    maker_init(node1_addr, 50000, None, 50000, None, 3600).await;
+    maker_init(node1_addr, 50000, None, 50000, None, 3600, "02a1633cafcc01ebfb6d78e39f687a1f0995c62fc95f51ead10a02ee0be551b5dc").await;
 }

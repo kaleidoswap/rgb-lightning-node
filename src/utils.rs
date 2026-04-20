@@ -6,10 +6,6 @@ use bitcoin::secp256k1::PublicKey;
 use futures::Future;
 use lightning::ln::channel_state::ChannelDetails;
 use lightning::ln::types::ChannelId;
-use lightning::routing::router::{
-    Payee, PaymentParameters, Route, RouteHint, RouteParameters, Router as _,
-    DEFAULT_MAX_TOTAL_CLTV_EXPIRY_DELTA, MAX_PATH_LENGTH_ESTIMATE,
-};
 use lightning::{
     onion_message::packet::OnionMessageContents,
     sign::KeysManager,
@@ -33,9 +29,8 @@ use std::{
 use tokio::sync::{Mutex as TokioMutex, MutexGuard as TokioMutexGuard};
 use tokio_util::sync::CancellationToken;
 
-use crate::ldk::{ChannelIdsMap, Router};
+use crate::ldk::ChannelIdsMap;
 use crate::rgb::{get_rgb_channel_info_optional, RgbLibWalletWrapper};
-use crate::routes::{DEFAULT_FINAL_CLTV_EXPIRY_DELTA, HTLC_MIN_MSAT};
 use crate::{
     args::UserArgs,
     disk::FilesystemLogger,
@@ -109,7 +104,6 @@ pub(crate) struct UnlockedAppState {
     pub(crate) maker_swaps: Arc<Mutex<SwapMap>>,
     pub(crate) taker_swaps: Arc<Mutex<SwapMap>>,
     pub(crate) rgb_wallet_wrapper: Arc<RgbLibWalletWrapper>,
-    pub(crate) router: Arc<Router>,
     pub(crate) output_sweeper: Arc<OutputSweeper>,
     pub(crate) rgb_send_lock: Arc<Mutex<bool>>,
     pub(crate) channel_ids_map: Arc<Mutex<ChannelIdsMap>>,
@@ -407,46 +401,6 @@ pub(crate) fn get_max_local_rgb_amount<'r>(
     }
 
     max_balance
-}
-
-pub(crate) fn get_route(
-    channel_manager: &crate::ldk::ChannelManager,
-    router: &crate::ldk::Router,
-    start: PublicKey,
-    dest: PublicKey,
-    final_value_msat: Option<u64>,
-    rgb_payment: Option<(ContractId, u64)>,
-    hints: Vec<RouteHint>,
-) -> Option<Route> {
-    let inflight_htlcs = channel_manager.compute_inflight_htlcs();
-    let payment_params = PaymentParameters {
-        payee: Payee::Clear {
-            node_id: dest,
-            route_hints: hints,
-            features: None,
-            final_cltv_expiry_delta: DEFAULT_FINAL_CLTV_EXPIRY_DELTA,
-        },
-        expiry_time: None,
-        max_total_cltv_expiry_delta: DEFAULT_MAX_TOTAL_CLTV_EXPIRY_DELTA,
-        max_path_count: 1,
-        max_path_length: MAX_PATH_LENGTH_ESTIMATE,
-        max_channel_saturation_power_of_half: 2,
-        previously_failed_channels: vec![],
-        previously_failed_blinded_path_idxs: vec![],
-    };
-    let route = router.find_route(
-        &start,
-        &RouteParameters {
-            payment_params,
-            final_value_msat: final_value_msat.unwrap_or(HTLC_MIN_MSAT),
-            max_total_routing_fee_msat: None,
-            rgb_payment,
-        },
-        None,
-        inflight_htlcs,
-    );
-
-    route.ok()
 }
 
 pub(crate) fn validate_and_parse_payment_hash(

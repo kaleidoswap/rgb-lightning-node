@@ -1,3 +1,4 @@
+use bitcoin::secp256k1::PublicKey;
 use lightning::{impl_writeable_tlv_based, types::payment::PaymentHash};
 use rgb_lib::ContractId;
 use std::convert::TryInto;
@@ -45,6 +46,7 @@ pub(crate) struct SwapInfo {
     pub(crate) from_asset: Option<ContractId>,
     pub(crate) to_asset: Option<ContractId>,
     pub(crate) expiry: u64,
+    pub(crate) taker_pubkey: PublicKey,
 }
 
 impl_writeable_tlv_based!(SwapInfo, {
@@ -53,6 +55,7 @@ impl_writeable_tlv_based!(SwapInfo, {
     (2, from_asset, required),
     (3, to_asset, required),
     (4, expiry, required),
+    (5, taker_pubkey, required),
 });
 
 impl From<SwapData> for SwapInfo {
@@ -63,6 +66,7 @@ impl From<SwapData> for SwapInfo {
             from_asset: value.swap_info.from_asset,
             to_asset: value.swap_info.to_asset,
             expiry: value.swap_info.expiry,
+            taker_pubkey: value.swap_info.taker_pubkey,
         }
     }
 }
@@ -88,6 +92,7 @@ impl SwapInfo {
         self.to_asset.is_some()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn is_asset_asset(&self) -> bool {
         self.is_from_asset() && self.is_to_asset()
     }
@@ -112,7 +117,7 @@ impl fmt::Display for SwapString {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "{}/{}/{}/{}/{}/{}",
+            "{}/{}/{}/{}/{}/{}/{}",
             self.swap_info.qty_from,
             self.swap_info
                 .from_asset
@@ -125,6 +130,7 @@ impl fmt::Display for SwapString {
                 .unwrap_or("btc".into()),
             self.swap_info.expiry,
             self.payment_hash,
+            self.swap_info.taker_pubkey,
         )
     }
 }
@@ -140,8 +146,9 @@ impl FromStr for SwapString {
         let to_asset = iter.next();
         let expiry = iter.next();
         let payment_hash = iter.next();
+        let taker_pubkey = iter.next();
 
-        if payment_hash.is_none() || iter.next().is_some() {
+        if taker_pubkey.is_none() || iter.next().is_some() {
             return Err("Wrong number of parts");
         }
 
@@ -161,6 +168,7 @@ impl FromStr for SwapString {
         let payment_hash = hex_str_to_vec(payment_hash.unwrap())
             .and_then(|vec| vec.try_into().ok())
             .map(PaymentHash);
+        let taker_pubkey = PublicKey::from_str(taker_pubkey.unwrap()).ok();
 
         if qty_from.is_err()
             || from_asset.is_err()
@@ -168,6 +176,7 @@ impl FromStr for SwapString {
             || to_asset.is_err()
             || expiry.is_err()
             || payment_hash.is_none()
+            || taker_pubkey.is_none()
         {
             return Err("Unable to parse");
         }
@@ -178,6 +187,7 @@ impl FromStr for SwapString {
         let to_asset = to_asset.unwrap();
         let expiry = expiry.unwrap();
         let payment_hash = payment_hash.unwrap();
+        let taker_pubkey = taker_pubkey.unwrap();
 
         if qty_from == 0 || qty_to == 0 || expiry == 0 {
             return Err("qty_from, qty_to and expiry should be positive");
@@ -189,6 +199,7 @@ impl FromStr for SwapString {
             from_asset,
             to_asset,
             expiry,
+            taker_pubkey,
         };
 
         if swap_info.same_asset() {

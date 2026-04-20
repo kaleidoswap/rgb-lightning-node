@@ -127,7 +127,7 @@ async fn swap_roundtrip_multihop_buy() {
     let taker_addr = node3_addr;
     let qty_from = 36000;
     let qty_to = 10;
-    let maker_init_response = maker_init(maker_addr, 36000, None, 10, Some(&asset_id), 500).await;
+    let maker_init_response = maker_init(maker_addr, 36000, None, 10, Some(&asset_id), 500, &node3_pubkey).await;
     taker(taker_addr, maker_init_response.swapstring.clone()).await;
 
     let swaps_maker = list_swaps(maker_addr).await;
@@ -152,18 +152,14 @@ async fn swap_roundtrip_multihop_buy() {
     assert_eq!(swap_taker.status, SwapStatus::Waiting);
 
     println!("\nexecute swap");
-    maker_execute(
+    taker_pay_invoice(taker_addr, &maker_init_response.bolt11_invoice).await;
+
+    wait_for_swap_status(
         maker_addr,
-        maker_init_response.swapstring,
-        maker_init_response.payment_secret,
-        node3_pubkey.clone(),
+        &maker_init_response.payment_hash,
+        SwapStatus::Succeeded,
     )
     .await;
-
-    let swaps_maker = list_swaps(maker_addr).await;
-    assert_eq!(swaps_maker.maker.len(), 1);
-    let swap_maker = swaps_maker.maker.first().unwrap();
-    assert_eq!(swap_maker.status, SwapStatus::Pending);
     wait_for_swap_status(
         taker_addr,
         &maker_init_response.payment_hash,
@@ -204,8 +200,7 @@ async fn swap_roundtrip_multihop_buy() {
 
     let payments_maker = list_payments(maker_addr).await;
     assert!(payments_maker.is_empty());
-    let payments_taker = list_payments(taker_addr).await;
-    assert!(payments_taker.is_empty());
+    // taker now has an outbound payment (the HODL invoice payment)
 
     let channels_1_before = list_channels(node1_addr).await;
     let channels_2_before = list_channels(node2_addr).await;
@@ -242,40 +237,48 @@ async fn swap_roundtrip_multihop_buy() {
         .iter()
         .find(|c| c.channel_id == channel_32.channel_id)
         .unwrap();
-    let btc_leg_diff = (HTLC_MIN_MSAT + qty_from) / 1000;
-    let htlc_min_sat = HTLC_MIN_MSAT / 1000;
+    // New 2-step HODL swap:
+    //  HODL payment (taker→maker multi-hop: node3 → node2 → node1 via chan_32→chan_21)
+    //  forward keysend (maker→taker multi-hop: node1 → node2 → node3 via chan_12→chan_23)
+    // Each leg is a separate LN payment.  In LN, the sender of each payment pays
+    // the intermediate hops' fees; each single-direction multi-hop payment incurs
+    // one forwarding fee (at node2, the middle hop).
+    let hodl_diff_sat = qty_from / 1000; // 36 sats
+    let fwd_diff_sat = HTLC_MIN_MSAT / 1000; // 3000 sats
     let fees = 1;
+    // forward leg (maker → taker): node1 pays fee at node2
     assert_eq!(
         chan_1_12.local_balance_sat,
-        chan_1_12_before.local_balance_sat - htlc_min_sat - (fees * 2)
+        chan_1_12_before.local_balance_sat - fwd_diff_sat - fees
     );
     assert_eq!(
         chan_2_12.local_balance_sat,
-        chan_2_12_before.local_balance_sat + htlc_min_sat + (fees * 2)
+        chan_2_12_before.local_balance_sat + fwd_diff_sat + fees
     );
     assert_eq!(
         chan_2_23.local_balance_sat,
-        chan_2_23_before.local_balance_sat - htlc_min_sat - fees
+        chan_2_23_before.local_balance_sat - fwd_diff_sat
     );
     assert_eq!(
         chan_3_23.local_balance_sat,
-        chan_3_23_before.local_balance_sat + htlc_min_sat + fees
+        chan_3_23_before.local_balance_sat + fwd_diff_sat
     );
+    // HODL leg (taker → maker): node3 pays fee at node2
     assert_eq!(
         chan_3_32.local_balance_sat,
-        chan_3_32_before.local_balance_sat - btc_leg_diff - fees
+        chan_3_32_before.local_balance_sat - hodl_diff_sat - fees
     );
     assert_eq!(
         chan_2_32.local_balance_sat,
-        chan_2_32_before.local_balance_sat + btc_leg_diff + fees
+        chan_2_32_before.local_balance_sat + hodl_diff_sat + fees
     );
     assert_eq!(
         chan_2_21.local_balance_sat,
-        chan_2_21_before.local_balance_sat - btc_leg_diff
+        chan_2_21_before.local_balance_sat - hodl_diff_sat
     );
     assert_eq!(
         chan_1_21.local_balance_sat,
-        chan_1_21_before.local_balance_sat + btc_leg_diff
+        chan_1_21_before.local_balance_sat + hodl_diff_sat
     );
 
     println!("\nclose channels");

@@ -19,6 +19,7 @@ async fn swap_fail_invalid_asset_to() {
         1000,
         Some("rgb:inexistent"),
         5000,
+        "02a1633cafcc01ebfb6d78e39f687a1f0995c62fc95f51ead10a02ee0be551b5dc",
     )
     .await;
 }

@@ -16,5 +16,5 @@ async fn swap_roundtrip_fail_same_asset() {
 
     let asset_id = issue_asset_nia(node1_addr).await.asset_id;
 
-    maker_init(node1_addr, 1, Some(&asset_id), 1, Some(&asset_id), 3600).await;
+    maker_init(node1_addr, 1, Some(&asset_id), 1, Some(&asset_id), 3600, "02a1633cafcc01ebfb6d78e39f687a1f0995c62fc95f51ead10a02ee0be551b5dc").await;
 }
