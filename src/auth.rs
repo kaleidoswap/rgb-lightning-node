@@ -16,10 +16,11 @@ use crate::{
 
 const REVOKED_TOKENS_FILE: &str = "revoked_tokens.txt";
 
-const READ_ONLY_OPS: [&str; 23] = [
+const READ_ONLY_OPS: [&str; 24] = [
     "/assetbalance",
     "/assetmetadata",
     "/btcbalance",
+    "/decodeoffer",
     "/checkindexerurl",
     "/checkproxyendpoint",
     "/decodelninvoice",
