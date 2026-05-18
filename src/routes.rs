@@ -13,7 +13,7 @@ use hex::DisplayHex;
 use lightning::ln::{channelmanager::OptionalOfferPaymentParams, types::ChannelId};
 use lightning::offers::offer::{self, Offer};
 use lightning::onion_message::messenger::Destination;
-use lightning::rgb_utils::{RgbKvStoreExt, STATIC_BLINDING};
+use lightning::rgb_utils::RgbKvStoreExt;
 use lightning::routing::gossip::RoutingFees;
 use lightning::routing::router::{Path as LnPath, Route, RouteHint, RouteHintHop};
 use lightning::sign::EntropySource;
@@ -30,7 +30,7 @@ use lightning::{
 };
 use lightning::{
     ln::channelmanager::{PaymentId, RecipientOnionFields, Retry},
-    rgb_utils::{write_rgb_payment_info_file, RgbInfo},
+    rgb_utils::{write_rgb_payment_info, RgbInfo},
     routing::{
         gossip::NodeId,
         router::{PaymentParameters, RouteParameters},
@@ -2235,7 +2235,7 @@ pub(crate) async fn keysend(
             },
         )?;
         if let Some((contract_id, rgb_amount)) = rgb_payment {
-            write_rgb_payment_info_file(
+            write_rgb_payment_info(
                 &payment_hash,
                 contract_id,
                 rgb_amount,
@@ -2430,7 +2430,6 @@ pub(crate) async fn list_channels(
             channel.short_channel_id = Some(id);
         }
 
-        // Read RGB channel info from KVStore
         let channel_id_str = chan_info.channel_id.0.as_hex().to_string();
         if let Ok(rgb_info) = unlocked_state
             .kv_store
@@ -2847,7 +2846,7 @@ pub(crate) async fn maker_execute(
         let first_leg = get_route(
             &unlocked_state.channel_manager,
             &unlocked_state.router,
-            &state.static_state.ldk_data_dir,
+            unlocked_state.kv_store.as_ref(),
             unlocked_state.channel_manager.get_our_node_id(),
             taker_pk,
             if swap_info.is_to_btc() {
@@ -2865,7 +2864,7 @@ pub(crate) async fn maker_execute(
         let second_leg = get_route(
             &unlocked_state.channel_manager,
             &unlocked_state.router,
-            &state.static_state.ldk_data_dir,
+            unlocked_state.kv_store.as_ref(),
             taker_pk,
             unlocked_state.channel_manager.get_our_node_id(),
             if swap_info.is_to_btc() || swap_info.is_asset_asset() {
@@ -2949,7 +2948,7 @@ pub(crate) async fn maker_execute(
         };
 
         if swap_info.is_to_asset() {
-            write_rgb_payment_info_file(
+            write_rgb_payment_info(
                 &swapstring.payment_hash,
                 swap_info.to_asset.unwrap(),
                 swap_info.qty_to,
@@ -3726,7 +3725,7 @@ pub(crate) async fn send_payment(
             )?;
             let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
             if let Some((contract_id, rgb_amount)) = rgb_payment {
-                write_rgb_payment_info_file(
+                write_rgb_payment_info(
                     &payment_hash,
                     contract_id,
                     rgb_amount,

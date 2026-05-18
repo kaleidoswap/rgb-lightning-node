@@ -131,25 +131,20 @@ const VANILLA_SYNC_LOOKBACK: u32 = 20;
 #[cfg(test)]
 pub(crate) static IGNORE_INBOUND_CHANNELS_ON_NODE: Mutex<Option<PublicKey>> = Mutex::new(None);
 
-/// Save config to database (source of truth) and sync to file for rust-lightning compatibility.
+/// Writes config to the DB (source of truth) and mirrors to a file for rust-lightning compatibility.
 fn save_config_and_sync_file(
     database: &sea_orm::DatabaseConnection,
     storage_dir_path: &Path,
     key: &str,
     value: &str,
 ) -> Result<(), APIError> {
-    // Save to database (source of truth)
     let db = RlnDatabase::new(database.clone());
     db.set_config(key, value)?;
-
-    // Write to file for rust-lightning compatibility
     fs::write(storage_dir_path.join(key), value).map_err(APIError::IO)?;
-
     Ok(())
 }
 
-/// Sync config from database to files on startup.
-/// This ensures files are restored with DB as source of truth.
+/// Restores rust-lightning compatibility files from DB on startup.
 fn sync_config_to_files(
     database: &sea_orm::DatabaseConnection,
     storage_dir_path: &Path,
@@ -602,8 +597,7 @@ fn find_and_update_rgb_chan_amt(
 
         if let Ok(keys) = kv_store.list(RGB_PRIMARY_NS, namespace) {
             for key in keys {
-                // keys that contain payment_hash but are not just the payment_hash
-                // are proxy keys in format: {channel_id}{payment_hash}
+                // proxy keys have format `{channel_id}{payment_hash}`; bare payment_hash is skipped
                 if key.contains(&payment_hash_str) && key != payment_hash_str {
                     if let Ok(data) = kv_store.read(RGB_PRIMARY_NS, namespace, &key) {
                         let rgb_payment_info: RgbPaymentInfo = match bincode::deserialize(&data) {
@@ -614,7 +608,6 @@ fn find_and_update_rgb_chan_amt(
                             }
                         };
 
-                        // extract channel_id from the key (format: {channel_id}{payment_hash})
                         let channel_id_str = key.replace(&payment_hash_str, "");
 
                         if rgb_payment_info.swap_payment && receiver != rgb_payment_info.inbound {
@@ -676,11 +669,7 @@ fn handle_funding_prepare_err(
     }
 }
 
-async fn handle_open_chan_fail(
-    channel_id: &ChannelId,
-    static_state: &StaticState,
-    unlocked_state: Arc<UnlockedAppState>,
-) {
+async fn handle_open_chan_fail(channel_id: &ChannelId, unlocked_state: Arc<UnlockedAppState>) {
     tracing::info!("Handling open channel failure for channel {channel_id}");
     let channel_id_str = channel_id.0.as_hex().to_string();
     let kv_store_dyn: Arc<dyn KVStoreSync + Send + Sync> =
@@ -979,8 +968,7 @@ async fn handle_ldk_events(
             {
                 tracing::error!(
                         "ERROR: Channel went away before we could fund it. The peer disconnected or refused the channel.");
-                handle_open_chan_fail(&final_channel_id, &static_state, unlocked_state.clone())
-                    .await;
+                handle_open_chan_fail(&final_channel_id, unlocked_state.clone()).await;
             }
         }
         Event::FundingTxBroadcastSafe { .. } => {
@@ -1350,7 +1338,7 @@ async fn handle_ldk_events(
 
             let funding_txid = funding_txo.txid.to_string();
 
-            // Check if we have a stored PSBT (initiator case)
+            // stored PSBT means we are the initiator
             match unlocked_state
                 .kv_store
                 .read(PSBT_NAMESPACE, "", &funding_txid)
@@ -1450,7 +1438,7 @@ async fn handle_ldk_events(
 
             // the ChannelClosed event gets fired also after node crashes/restarts, so it's better
             // to handle the failure here (regardless what the DiscardFunding event documents)
-            handle_open_chan_fail(&channel_id, &static_state, unlocked_state.clone()).await;
+            handle_open_chan_fail(&channel_id, unlocked_state.clone()).await;
         }
         Event::DiscardFunding { channel_id, .. } => {
             tracing::info!(
@@ -1461,7 +1449,7 @@ async fn handle_ldk_events(
             // this will probably do nothing, since the ChannelClosed event will be triggered
             // before, but in case of splicing this should be the correct place to handle the
             // failure
-            handle_open_chan_fail(&channel_id, &static_state, unlocked_state.clone()).await;
+            handle_open_chan_fail(&channel_id, unlocked_state.clone()).await;
         }
         Event::HTLCIntercepted {
             is_swap,
@@ -1856,7 +1844,6 @@ pub(crate) async fn start_ldk(
 ) -> Result<(LdkBackgroundServices, Arc<UnlockedAppState>), APIError> {
     let static_state = &app_state.static_state;
 
-    // Sync config from database to files
     sync_config_to_files(&static_state.database, &static_state.storage_dir_path)?;
 
     let ldk_data_dir = static_state.ldk_data_dir.clone();
@@ -1976,7 +1963,6 @@ pub(crate) async fn start_ldk(
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap();
 
-    // Initialize Persistence using shared database connection
     let kv_store = Arc::new(SeaOrmKvStore::from_connection(Arc::clone(
         &static_state.database,
     )));
@@ -2432,7 +2418,6 @@ pub(crate) async fn start_ldk(
         }
     });
 
-    // Read payment info from KVStore
     let inbound_payments = Arc::new(Mutex::new({
         match kv_store.read("", "", INBOUND_PAYMENTS_KEY) {
             Ok(bytes) => InboundPaymentInfoStorage::read(&mut &bytes[..]).unwrap_or_else(|_| {
@@ -2470,7 +2455,6 @@ pub(crate) async fn start_ldk(
     // Persist ChannelManager and NetworkGraph
     let persister = KVStoreSyncWrapper(Arc::clone(&kv_store));
 
-    // Read swaps info from KVStore
     let maker_swaps = Arc::new(Mutex::new({
         match kv_store.read("", "", MAKER_SWAPS_KEY) {
             Ok(bytes) => SwapMap::read(&mut &bytes[..]).unwrap_or_else(|_| SwapMap {
@@ -2494,7 +2478,6 @@ pub(crate) async fn start_ldk(
         }
     }));
 
-    // Read channel IDs info from KVStore
     let channel_ids_map = Arc::new(Mutex::new({
         match kv_store.read("", "", CHANNEL_IDS_KEY) {
             Ok(bytes) => ChannelIdsMap::read(&mut &bytes[..]).unwrap_or_else(|_| ChannelIdsMap {

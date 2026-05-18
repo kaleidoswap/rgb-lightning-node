@@ -7,14 +7,13 @@ use std::str::FromStr;
 use bitcoin::secp256k1::PublicKey;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
-    ActiveValue, ColumnTrait, DatabaseConnection, EntityTrait, ModelTrait, QueryFilter,
-    TransactionTrait,
+    ActiveValue, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, TransactionTrait,
 };
 
 use crate::database::entities::{
-    ChannelPeerActMod, ChannelPeerColumn, ChannelPeerEntity, ConfigActMod, ConfigColumn,
-    ConfigEntity, DbMnemonic, DbMnemonicActMod, MnemonicColumn, MnemonicEntity, RevokedTokenActMod,
-    RevokedTokenColumn, RevokedTokenEntity,
+    channel_peer, config, mnemonic,
+    prelude::{ChannelPeer, Config, Mnemonic, RevokedToken},
+    revoked_token,
 };
 use crate::error::APIError;
 use crate::runtime::block_on;
@@ -35,68 +34,64 @@ impl RlnDatabase {
     pub fn add_revoked_tokens(&self, token_id_hexes: Vec<String>) -> Result<(), APIError> {
         let now = crate::utils::get_current_timestamp() as i64;
 
-        block_on(self.connection.transaction::<_, (), sea_orm::DbErr>(
-            move |txn| {
-                Box::pin(async move {
-                    for hex in token_id_hexes {
-                        let token = RevokedTokenActMod {
-                            token_id: ActiveValue::Set(hex),
-                            revoked_at: ActiveValue::Set(now),
-                        };
-                        RevokedTokenEntity::insert(token)
-                            .on_conflict(
-                                OnConflict::column(RevokedTokenColumn::TokenId)
-                                    .do_nothing()
-                                    .to_owned(),
-                            )
-                            .exec(txn)
-                            .await?;
-                    }
-                    Ok(())
-                })
-            },
-        ))
+        block_on(
+            self.connection
+                .transaction::<_, (), sea_orm::DbErr>(move |txn| {
+                    Box::pin(async move {
+                        for hex in token_id_hexes {
+                            let token = revoked_token::ActiveModel {
+                                token_id: ActiveValue::Set(hex),
+                                revoked_at: ActiveValue::Set(now),
+                            };
+                            RevokedToken::insert(token)
+                                .on_conflict(
+                                    OnConflict::column(revoked_token::Column::TokenId)
+                                        .do_nothing()
+                                        .to_owned(),
+                                )
+                                .exec(txn)
+                                .await?;
+                        }
+                        Ok(())
+                    })
+                }),
+        )
         .map_err(|e| match e {
-            sea_orm::TransactionError::Connection(err) | sea_orm::TransactionError::Transaction(err) => {
-                APIError::from(err)
-            }
+            sea_orm::TransactionError::Connection(err)
+            | sea_orm::TransactionError::Transaction(err) => APIError::from(err),
         })?;
 
         Ok(())
     }
 
     pub fn delete_channel_peer(&self, pubkey: &str) -> Result<(), APIError> {
-        let result = block_on(
-            ChannelPeerEntity::find()
-                .filter(ChannelPeerColumn::Pubkey.eq(pubkey))
-                .one(self.get_connection()),
+        block_on(
+            ChannelPeer::delete_many()
+                .filter(channel_peer::Column::Pubkey.eq(pubkey))
+                .exec(self.get_connection()),
         )?;
-
-        if let Some(peer) = result {
-            block_on(peer.delete(self.get_connection()))?;
-        }
 
         Ok(())
     }
 
     pub fn get_config(&self, key: &str) -> Result<Option<String>, APIError> {
         let result = block_on(
-            ConfigEntity::find()
-                .filter(ConfigColumn::Key.eq(key))
+            Config::find()
+                .filter(config::Column::Key.eq(key))
                 .one(self.get_connection()),
         )?;
 
         Ok(result.map(|r| r.value))
     }
 
-    pub fn get_mnemonic(&self) -> Result<Option<DbMnemonic>, APIError> {
+    pub fn get_mnemonic(&self) -> Result<Option<mnemonic::Model>, APIError> {
         Ok(block_on(
-            MnemonicEntity::find_by_id(1).one(self.get_connection()),
+            Mnemonic::find_by_id(1).one(self.get_connection()),
         )?)
     }
 
     pub fn load_revoked_tokens(&self) -> Result<HashSet<Vec<u8>>, APIError> {
-        let results = block_on(RevokedTokenEntity::find().all(self.get_connection()))?;
+        let results = block_on(RevokedToken::find().all(self.get_connection()))?;
 
         let mut revoked = HashSet::new();
         for record in results {
@@ -109,7 +104,7 @@ impl RlnDatabase {
     }
 
     pub fn mnemonic_exists(&self) -> Result<bool, APIError> {
-        Ok(block_on(MnemonicEntity::find_by_id(1).one(self.get_connection()))?.is_some())
+        Ok(block_on(Mnemonic::find_by_id(1).one(self.get_connection()))?.is_some())
     }
 
     pub fn persist_channel_peer(
@@ -119,17 +114,17 @@ impl RlnDatabase {
     ) -> Result<(), APIError> {
         let now = crate::utils::get_current_timestamp() as i64;
 
-        let peer = ChannelPeerActMod {
+        let peer = channel_peer::ActiveModel {
             pubkey: ActiveValue::Set(pubkey.to_string()),
             address: ActiveValue::Set(address.to_string()),
             created_at: ActiveValue::Set(now),
         };
 
         block_on(
-            ChannelPeerEntity::insert(peer)
+            ChannelPeer::insert(peer)
                 .on_conflict(
-                    OnConflict::column(ChannelPeerColumn::Pubkey)
-                        .update_column(ChannelPeerColumn::Address)
+                    OnConflict::column(channel_peer::Column::Pubkey)
+                        .update_column(channel_peer::Column::Address)
                         .to_owned(),
                 )
                 .exec(self.get_connection()),
@@ -140,7 +135,7 @@ impl RlnDatabase {
     }
 
     pub fn read_channel_peer_data(&self) -> Result<HashMap<PublicKey, SocketAddr>, APIError> {
-        let results = block_on(ChannelPeerEntity::find().all(self.get_connection()))?;
+        let results = block_on(ChannelPeer::find().all(self.get_connection()))?;
 
         let mut peer_data = HashMap::new();
         for record in results {
@@ -158,20 +153,20 @@ impl RlnDatabase {
     pub fn save_mnemonic(&self, encrypted_mnemonic: String) -> Result<(), APIError> {
         let now = crate::utils::get_current_timestamp() as i64;
 
-        let mnemonic = DbMnemonicActMod {
-            id: ActiveValue::Set(1),
+        let mnemonic = mnemonic::ActiveModel {
+            idx: ActiveValue::Set(1),
             encrypted_mnemonic: ActiveValue::Set(encrypted_mnemonic),
             created_at: ActiveValue::Set(now),
             updated_at: ActiveValue::Set(now),
         };
 
         block_on(
-            MnemonicEntity::insert(mnemonic)
+            Mnemonic::insert(mnemonic)
                 .on_conflict(
-                    OnConflict::column(MnemonicColumn::Id)
+                    OnConflict::column(mnemonic::Column::Idx)
                         .update_columns([
-                            MnemonicColumn::EncryptedMnemonic,
-                            MnemonicColumn::UpdatedAt,
+                            mnemonic::Column::EncryptedMnemonic,
+                            mnemonic::Column::UpdatedAt,
                         ])
                         .to_owned(),
                 )
@@ -184,7 +179,7 @@ impl RlnDatabase {
     pub fn set_config(&self, key: &str, value: &str) -> Result<(), APIError> {
         let now = crate::utils::get_current_timestamp() as i64;
 
-        let config = ConfigActMod {
+        let config = config::ActiveModel {
             key: ActiveValue::Set(key.to_string()),
             value: ActiveValue::Set(value.to_string()),
             created_at: ActiveValue::Set(now),
@@ -192,10 +187,10 @@ impl RlnDatabase {
         };
 
         block_on(
-            ConfigEntity::insert(config)
+            Config::insert(config)
                 .on_conflict(
-                    OnConflict::column(ConfigColumn::Key)
-                        .update_columns([ConfigColumn::Value, ConfigColumn::UpdatedAt])
+                    OnConflict::column(config::Column::Key)
+                        .update_columns([config::Column::Value, config::Column::UpdatedAt])
                         .to_owned(),
                 )
                 .exec(self.get_connection()),

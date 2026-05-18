@@ -12,11 +12,10 @@ impl MigrationTrait for Migration {
                     .table(Mnemonic::Table)
                     .if_not_exists()
                     .col(
-                        ColumnDef::new(Mnemonic::Id)
+                        ColumnDef::new(Mnemonic::Idx)
                             .integer()
                             .not_null()
-                            .primary_key()
-                            .default(1),
+                            .primary_key(),
                     )
                     .col(string(Mnemonic::EncryptedMnemonic))
                     .col(big_unsigned(Mnemonic::CreatedAt))
@@ -126,7 +125,7 @@ impl MigrationTrait for Migration {
 #[derive(DeriveIden)]
 enum Mnemonic {
     Table,
-    Id,
+    Idx,
     EncryptedMnemonic,
     CreatedAt,
     UpdatedAt,

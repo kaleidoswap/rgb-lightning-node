@@ -97,7 +97,6 @@ pub(crate) struct StaticState {
     pub(crate) ldk_data_dir: PathBuf,
     pub(crate) logger: Arc<FilesystemLogger>,
     pub(crate) max_media_upload_size_mb: u16,
-    /// Shared database connection for mnemonic storage and LDK KVStore
     pub(crate) database: Arc<DatabaseConnection>,
 }
 
@@ -217,6 +216,22 @@ pub(crate) fn check_port_is_available(port: u16) -> Result<(), AppError> {
 
 pub(crate) fn get_db_path(storage_dir_path: &Path) -> PathBuf {
     storage_dir_path.join("rln_db")
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn adjust_canonicalization<P: AsRef<Path>>(p: P) -> String {
+    p.as_ref().display().to_string()
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn adjust_canonicalization<P: AsRef<Path>>(p: P) -> String {
+    const VERBATIM_PREFIX: &str = r#"\\?\"#;
+    let p = p.as_ref().display().to_string();
+    if let Some(stripped) = p.strip_prefix(VERBATIM_PREFIX) {
+        stripped.to_string()
+    } else {
+        p
+    }
 }
 
 pub(crate) fn encrypt_and_save_mnemonic(
@@ -353,11 +368,10 @@ pub(crate) async fn start_daemon(args: &UserArgs) -> Result<Arc<AppState>, AppEr
     let ldk_data_dir = args.storage_dir_path.join(LDK_DIR);
     let logger = Arc::new(FilesystemLogger::new(ldk_data_dir.clone()));
 
-    // Initialize the shared database connection
     let db_path = get_db_path(&args.storage_dir_path);
-    let connection_string = format!("sqlite:{}?mode=rwc", db_path.display());
+    let connection_string = format!("sqlite:{}?mode=rwc", adjust_canonicalization(&db_path));
     let mut opt = ConnectOptions::new(connection_string);
-    // Use single connection to avoid deadlocks
+    // single connection to avoid deadlocks under block_on
     opt.max_connections(1)
         .min_connections(0)
         .connect_timeout(Duration::from_secs(8))
@@ -397,7 +411,6 @@ pub(crate) async fn start_daemon(args: &UserArgs) -> Result<Arc<AppState>, AppEr
         revoked_tokens: Arc::new(Mutex::new(HashSet::new())),
     });
 
-    // load revoked tokens from database if authentication is enabled
     if app_state.root_public_key.is_some() {
         let loaded_tokens = app_state.load_revoked_tokens()?;
         *app_state.revoked_tokens.lock().unwrap() = loaded_tokens;
@@ -436,7 +449,7 @@ pub(crate) fn get_max_local_rgb_amount<'r>(
 pub(crate) fn get_route(
     channel_manager: &crate::ldk::ChannelManager,
     router: &crate::ldk::Router,
-    ldk_data_dir_path: &Path,
+    kv_store: &dyn KVStoreSync,
     start: PublicKey,
     dest: PublicKey,
     final_value_msat: Option<u64>,
@@ -451,8 +464,8 @@ pub(crate) fn get_route(
             .iter()
             .filter(|channel| match rgb_payment {
                 Some((contract_id, _)) => {
-                    get_rgb_channel_info_optional(&channel.channel_id, ldk_data_dir_path, false)
-                        .is_some_and(|(rgb_info, _)| rgb_info.contract_id == contract_id)
+                    get_rgb_channel_info_optional(&channel.channel_id, false, kv_store)
+                        .is_some_and(|rgb_info| rgb_info.contract_id == contract_id)
                 }
                 None => true,
             })

@@ -4,18 +4,16 @@ use bitcoin::io;
 use lightning::util::persist::KVStoreSync;
 use sea_orm::sea_query::OnConflict;
 
-use crate::database::entities::{KvStoreActMod, KvStoreColumn, KvStoreEntity};
+use crate::database::entities::{kv_store, prelude::KvStore};
 use crate::runtime::block_on;
 use sea_orm::{ActiveValue, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 
-/// sea-orm based KVStore implementation for LDK persistence.
 pub struct SeaOrmKvStore {
     connection: Arc<DatabaseConnection>,
 }
 
 impl SeaOrmKvStore {
-    /// create a SeaOrmKvStore from an existing shared connection.
-    /// does not run migrations (assumes they were already run).
+    /// Caller must ensure migrations have already been run.
     pub fn from_connection(connection: Arc<DatabaseConnection>) -> Self {
         Self { connection }
     }
@@ -35,10 +33,10 @@ impl KVStoreSync for SeaOrmKvStore {
         tracing::trace!(primary_namespace, secondary_namespace, key, "KVStore read");
 
         let result = block_on(
-            KvStoreEntity::find()
-                .filter(KvStoreColumn::PrimaryNamespace.eq(primary_namespace))
-                .filter(KvStoreColumn::SecondaryNamespace.eq(secondary_namespace))
-                .filter(KvStoreColumn::Key.eq(key))
+            KvStore::find()
+                .filter(kv_store::Column::PrimaryNamespace.eq(primary_namespace))
+                .filter(kv_store::Column::SecondaryNamespace.eq(secondary_namespace))
+                .filter(kv_store::Column::Key.eq(key))
                 .one(self.get_connection()),
         )
         .map_err(|e| {
@@ -81,7 +79,7 @@ impl KVStoreSync for SeaOrmKvStore {
             "KVStore write"
         );
 
-        let model = KvStoreActMod {
+        let model = kv_store::ActiveModel {
             primary_namespace: ActiveValue::Set(primary_namespace.to_string()),
             secondary_namespace: ActiveValue::Set(secondary_namespace.to_string()),
             key: ActiveValue::Set(key.to_string()),
@@ -89,14 +87,14 @@ impl KVStoreSync for SeaOrmKvStore {
         };
 
         block_on(
-            KvStoreEntity::insert(model)
+            KvStore::insert(model)
                 .on_conflict(
                     OnConflict::columns([
-                        KvStoreColumn::PrimaryNamespace,
-                        KvStoreColumn::SecondaryNamespace,
-                        KvStoreColumn::Key,
+                        kv_store::Column::PrimaryNamespace,
+                        kv_store::Column::SecondaryNamespace,
+                        kv_store::Column::Key,
                     ])
-                    .update_column(KvStoreColumn::Value)
+                    .update_column(kv_store::Column::Value)
                     .to_owned(),
                 )
                 .exec(self.get_connection()),
@@ -131,10 +129,10 @@ impl KVStoreSync for SeaOrmKvStore {
         );
 
         block_on(
-            KvStoreEntity::delete_many()
-                .filter(KvStoreColumn::PrimaryNamespace.eq(primary_namespace))
-                .filter(KvStoreColumn::SecondaryNamespace.eq(secondary_namespace))
-                .filter(KvStoreColumn::Key.eq(key))
+            KvStore::delete_many()
+                .filter(kv_store::Column::PrimaryNamespace.eq(primary_namespace))
+                .filter(kv_store::Column::SecondaryNamespace.eq(secondary_namespace))
+                .filter(kv_store::Column::Key.eq(key))
                 .exec(self.get_connection()),
         )
         .map_err(|e| {
@@ -159,9 +157,9 @@ impl KVStoreSync for SeaOrmKvStore {
         tracing::trace!(primary_namespace, secondary_namespace, "KVStore list");
 
         let results = block_on(
-            KvStoreEntity::find()
-                .filter(KvStoreColumn::PrimaryNamespace.eq(primary_namespace))
-                .filter(KvStoreColumn::SecondaryNamespace.eq(secondary_namespace))
+            KvStore::find()
+                .filter(kv_store::Column::PrimaryNamespace.eq(primary_namespace))
+                .filter(kv_store::Column::SecondaryNamespace.eq(secondary_namespace))
                 .all(self.get_connection()),
         )
         .map_err(|e| {
