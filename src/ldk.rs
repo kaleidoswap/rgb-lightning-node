@@ -25,8 +25,9 @@ use lightning::onion_message::messenger::{
 };
 use lightning::rgb_utils::{
     get_rgb_channel_info_pending, is_channel_rgb, update_rgb_channel_amount, RgbKvStoreExt,
-    RgbPaymentInfo, RGB_PAYMENT_INFO_INBOUND_NS, RGB_PAYMENT_INFO_OUTBOUND_NS, RGB_PRIMARY_NS,
-    STATIC_BLINDING,
+    RgbPaymentInfo, BITCOIN_NETWORK_FNAME, INDEXER_URL_FNAME, RGB_PAYMENT_INFO_INBOUND_NS,
+    RGB_PAYMENT_INFO_OUTBOUND_NS, RGB_PRIMARY_NS, STATIC_BLINDING, WALLET_ACCOUNT_XPUB_COLORED_FNAME,
+    WALLET_ACCOUNT_XPUB_VANILLA_FNAME, WALLET_FINGERPRINT_FNAME, WALLET_MASTER_FINGERPRINT_FNAME,
 };
 use lightning::routing::gossip;
 use lightning::routing::gossip::{NodeId, P2PGossipSync};
@@ -105,12 +106,6 @@ const TAKER_SWAPS_KEY: &str = "taker_swaps";
 const OUTPUT_SPENDER_TXES_KEY: &str = "output_spender_txes";
 const PSBT_NAMESPACE: &str = "psbt";
 const PENDING_FUNDING_NAMESPACE: &str = "pending_funding";
-const CONFIG_INDEXER_URL: &str = "indexer_url";
-const CONFIG_BITCOIN_NETWORK: &str = "bitcoin_network";
-const CONFIG_WALLET_FINGERPRINT: &str = "wallet_fingerprint";
-const CONFIG_WALLET_ACCOUNT_XPUB_VANILLA: &str = "wallet_account_xpub_vanilla";
-const CONFIG_WALLET_ACCOUNT_XPUB_COLORED: &str = "wallet_account_xpub_colored";
-const CONFIG_WALLET_MASTER_FINGERPRINT: &str = "wallet_master_fingerprint";
 
 use crate::error::APIError;
 use crate::rgb::{check_rgb_proxy_endpoint, get_rgb_channel_info_optional, RgbLibWalletWrapper};
@@ -131,17 +126,9 @@ const VANILLA_SYNC_LOOKBACK: u32 = 20;
 #[cfg(test)]
 pub(crate) static IGNORE_INBOUND_CHANNELS_ON_NODE: Mutex<Option<PublicKey>> = Mutex::new(None);
 
-/// Writes config to the DB (source of truth) and mirrors to a file for rust-lightning compatibility.
-fn save_config_and_sync_file(
-    database: &sea_orm::DatabaseConnection,
-    storage_dir_path: &Path,
-    key: &str,
-    value: &str,
-) -> Result<(), APIError> {
-    let db = RlnDatabase::new(database.clone());
-    db.set_config(key, value)?;
-    fs::write(storage_dir_path.join(key), value).map_err(APIError::IO)?;
-    Ok(())
+/// Mirrors a config value to a file for rust-lightning compatibility.
+fn mirror_config_file(storage_dir_path: &Path, fname: &str, value: &str) -> Result<(), APIError> {
+    fs::write(storage_dir_path.join(fname), value).map_err(APIError::IO)
 }
 
 /// Restores rust-lightning compatibility files from DB on startup.
@@ -150,20 +137,30 @@ fn sync_config_to_files(
     storage_dir_path: &Path,
 ) -> Result<(), APIError> {
     let db = RlnDatabase::new(database.clone());
-
-    for key in [
-        CONFIG_INDEXER_URL,
-        CONFIG_BITCOIN_NETWORK,
-        CONFIG_WALLET_FINGERPRINT,
-        CONFIG_WALLET_ACCOUNT_XPUB_VANILLA,
-        CONFIG_WALLET_ACCOUNT_XPUB_COLORED,
-        CONFIG_WALLET_MASTER_FINGERPRINT,
+    let Some(config) = db.get_config()? else {
+        return Ok(());
+    };
+    for (fname, value) in [
+        (INDEXER_URL_FNAME, config.indexer_url.as_deref()),
+        (BITCOIN_NETWORK_FNAME, config.bitcoin_network.as_deref()),
+        (WALLET_FINGERPRINT_FNAME, config.wallet_fingerprint.as_deref()),
+        (
+            WALLET_ACCOUNT_XPUB_VANILLA_FNAME,
+            config.wallet_account_xpub_vanilla.as_deref(),
+        ),
+        (
+            WALLET_ACCOUNT_XPUB_COLORED_FNAME,
+            config.wallet_account_xpub_colored.as_deref(),
+        ),
+        (
+            WALLET_MASTER_FINGERPRINT_FNAME,
+            config.wallet_master_fingerprint.as_deref(),
+        ),
     ] {
-        if let Some(value) = db.get_config(key)? {
-            fs::write(storage_dir_path.join(key), &value).map_err(APIError::IO)?;
+        if let Some(v) = value {
+            mirror_config_file(storage_dir_path, fname, v)?;
         }
     }
-
     Ok(())
 }
 
@@ -1923,18 +1920,12 @@ pub(crate) async fn start_ldk(
         }
     };
     let storage_dir_path = app_state.static_state.storage_dir_path.clone();
-    save_config_and_sync_file(
-        &app_state.static_state.database,
-        &storage_dir_path,
-        CONFIG_INDEXER_URL,
-        indexer_url,
-    )?;
-    save_config_and_sync_file(
-        &app_state.static_state.database,
-        &storage_dir_path,
-        CONFIG_BITCOIN_NETWORK,
-        &bitcoin_network.to_string(),
-    )?;
+    let db = RlnDatabase::new((*app_state.static_state.database).clone());
+    db.set_indexer_url(indexer_url)?;
+    mirror_config_file(&storage_dir_path, INDEXER_URL_FNAME, indexer_url)?;
+    let bitcoin_network_str = bitcoin_network.to_string();
+    db.set_bitcoin_network(&bitcoin_network_str)?;
+    mirror_config_file(&storage_dir_path, BITCOIN_NETWORK_FNAME, &bitcoin_network_str)?;
 
     // Initialize the FeeEstimator
     // BitcoindClient implements the FeeEstimator trait, so it'll act as our fee estimator.
@@ -2153,29 +2144,31 @@ pub(crate) async fn start_ldk(
         skip_consistency_check: false,
         vanilla_sync_lookback: VANILLA_SYNC_LOOKBACK,
     })?;
-    save_config_and_sync_file(
-        &static_state.database,
-        &static_state.storage_dir_path,
-        CONFIG_WALLET_FINGERPRINT,
-        &account_xpub_colored.fingerprint().to_string(),
+    let db = RlnDatabase::new((*static_state.database).clone());
+    let storage_dir_path = &static_state.storage_dir_path;
+    let fingerprint = account_xpub_colored.fingerprint().to_string();
+    let xpub_colored = account_xpub_colored.to_string();
+    let xpub_vanilla = account_xpub_vanilla.to_string();
+    let master_fingerprint_str = master_fingerprint.to_string();
+    db.set_wallet_fingerprint(&fingerprint)?;
+    mirror_config_file(storage_dir_path, WALLET_FINGERPRINT_FNAME, &fingerprint)?;
+    db.set_wallet_account_xpub_colored(&xpub_colored)?;
+    mirror_config_file(
+        storage_dir_path,
+        WALLET_ACCOUNT_XPUB_COLORED_FNAME,
+        &xpub_colored,
     )?;
-    save_config_and_sync_file(
-        &static_state.database,
-        &static_state.storage_dir_path,
-        CONFIG_WALLET_ACCOUNT_XPUB_COLORED,
-        &account_xpub_colored.to_string(),
+    db.set_wallet_account_xpub_vanilla(&xpub_vanilla)?;
+    mirror_config_file(
+        storage_dir_path,
+        WALLET_ACCOUNT_XPUB_VANILLA_FNAME,
+        &xpub_vanilla,
     )?;
-    save_config_and_sync_file(
-        &static_state.database,
-        &static_state.storage_dir_path,
-        CONFIG_WALLET_ACCOUNT_XPUB_VANILLA,
-        &account_xpub_vanilla.to_string(),
-    )?;
-    save_config_and_sync_file(
-        &static_state.database,
-        &static_state.storage_dir_path,
-        CONFIG_WALLET_MASTER_FINGERPRINT,
-        &master_fingerprint.to_string(),
+    db.set_wallet_master_fingerprint(&master_fingerprint_str)?;
+    mirror_config_file(
+        storage_dir_path,
+        WALLET_MASTER_FINGERPRINT_FNAME,
+        &master_fingerprint_str,
     )?;
 
     let rgb_wallet_wrapper = Arc::new(RgbLibWalletWrapper::new(

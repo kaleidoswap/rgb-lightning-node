@@ -11,12 +11,14 @@ use sea_orm::{
 };
 
 use crate::database::entities::{
-    channel_peer, config, mnemonic,
-    prelude::{ChannelPeer, Config, Mnemonic, RevokedToken},
+    channel_peer, config,
+    prelude::{ChannelPeer, Config, RevokedToken},
     revoked_token,
 };
 use crate::error::APIError;
 use crate::runtime::block_on;
+
+const CONFIG_IDX: i32 = 1;
 
 pub struct RlnDatabase {
     connection: DatabaseConnection,
@@ -74,20 +76,14 @@ impl RlnDatabase {
         Ok(())
     }
 
-    pub fn get_config(&self, key: &str) -> Result<Option<String>, APIError> {
-        let result = block_on(
-            Config::find()
-                .filter(config::Column::Key.eq(key))
-                .one(self.get_connection()),
-        )?;
-
-        Ok(result.map(|r| r.value))
+    pub fn get_config(&self) -> Result<Option<config::Model>, APIError> {
+        Ok(block_on(
+            Config::find_by_id(CONFIG_IDX).one(self.get_connection()),
+        )?)
     }
 
-    pub fn get_mnemonic(&self) -> Result<Option<mnemonic::Model>, APIError> {
-        Ok(block_on(
-            Mnemonic::find_by_id(1).one(self.get_connection()),
-        )?)
+    pub fn is_initialized(&self) -> Result<bool, APIError> {
+        Ok(self.get_config()?.is_some())
     }
 
     pub fn load_revoked_tokens(&self) -> Result<HashSet<Vec<u8>>, APIError> {
@@ -101,10 +97,6 @@ impl RlnDatabase {
         }
 
         Ok(revoked)
-    }
-
-    pub fn mnemonic_exists(&self) -> Result<bool, APIError> {
-        Ok(block_on(Mnemonic::find_by_id(1).one(self.get_connection()))?.is_some())
     }
 
     pub fn persist_channel_peer(
@@ -153,20 +145,26 @@ impl RlnDatabase {
     pub fn save_mnemonic(&self, encrypted_mnemonic: String) -> Result<(), APIError> {
         let now = crate::utils::get_current_timestamp() as i64;
 
-        let mnemonic = mnemonic::ActiveModel {
-            idx: ActiveValue::Set(1),
+        let row = config::ActiveModel {
+            idx: ActiveValue::Set(CONFIG_IDX),
             encrypted_mnemonic: ActiveValue::Set(encrypted_mnemonic),
+            indexer_url: ActiveValue::NotSet,
+            bitcoin_network: ActiveValue::NotSet,
+            wallet_fingerprint: ActiveValue::NotSet,
+            wallet_account_xpub_vanilla: ActiveValue::NotSet,
+            wallet_account_xpub_colored: ActiveValue::NotSet,
+            wallet_master_fingerprint: ActiveValue::NotSet,
             created_at: ActiveValue::Set(now),
             updated_at: ActiveValue::Set(now),
         };
 
         block_on(
-            Mnemonic::insert(mnemonic)
+            Config::insert(row)
                 .on_conflict(
-                    OnConflict::column(mnemonic::Column::Idx)
+                    OnConflict::column(config::Column::Idx)
                         .update_columns([
-                            mnemonic::Column::EncryptedMnemonic,
-                            mnemonic::Column::UpdatedAt,
+                            config::Column::EncryptedMnemonic,
+                            config::Column::UpdatedAt,
                         ])
                         .to_owned(),
                 )
@@ -176,26 +174,39 @@ impl RlnDatabase {
         Ok(())
     }
 
-    pub fn set_config(&self, key: &str, value: &str) -> Result<(), APIError> {
+    fn update_config_field(&self, column: config::Column, value: &str) -> Result<(), APIError> {
         let now = crate::utils::get_current_timestamp() as i64;
-
-        let config = config::ActiveModel {
-            key: ActiveValue::Set(key.to_string()),
-            value: ActiveValue::Set(value.to_string()),
-            created_at: ActiveValue::Set(now),
-            updated_at: ActiveValue::Set(now),
-        };
-
         block_on(
-            Config::insert(config)
-                .on_conflict(
-                    OnConflict::column(config::Column::Key)
-                        .update_columns([config::Column::Value, config::Column::UpdatedAt])
-                        .to_owned(),
-                )
+            Config::update_many()
+                .filter(config::Column::Idx.eq(CONFIG_IDX))
+                .col_expr(column, value.into())
+                .col_expr(config::Column::UpdatedAt, now.into())
                 .exec(self.get_connection()),
         )?;
-
         Ok(())
+    }
+
+    pub fn set_indexer_url(&self, value: &str) -> Result<(), APIError> {
+        self.update_config_field(config::Column::IndexerUrl, value)
+    }
+
+    pub fn set_bitcoin_network(&self, value: &str) -> Result<(), APIError> {
+        self.update_config_field(config::Column::BitcoinNetwork, value)
+    }
+
+    pub fn set_wallet_fingerprint(&self, value: &str) -> Result<(), APIError> {
+        self.update_config_field(config::Column::WalletFingerprint, value)
+    }
+
+    pub fn set_wallet_account_xpub_vanilla(&self, value: &str) -> Result<(), APIError> {
+        self.update_config_field(config::Column::WalletAccountXpubVanilla, value)
+    }
+
+    pub fn set_wallet_account_xpub_colored(&self, value: &str) -> Result<(), APIError> {
+        self.update_config_field(config::Column::WalletAccountXpubColored, value)
+    }
+
+    pub fn set_wallet_master_fingerprint(&self, value: &str) -> Result<(), APIError> {
+        self.update_config_field(config::Column::WalletMasterFingerprint, value)
     }
 }

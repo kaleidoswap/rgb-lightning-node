@@ -3,5 +3,4 @@
 pub use super::channel_peer::Entity as ChannelPeer;
 pub use super::config::Entity as Config;
 pub use super::kv_store::Entity as KvStore;
-pub use super::mnemonic::Entity as Mnemonic;
 pub use super::revoked_token::Entity as RevokedToken;

@@ -5,5 +5,4 @@ pub mod prelude;
 pub mod channel_peer;
 pub mod config;
 pub mod kv_store;
-pub mod mnemonic;
 pub mod revoked_token;

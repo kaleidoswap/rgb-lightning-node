@@ -165,7 +165,7 @@ impl Writeable for UserOnionMessageContents {
 
 pub(crate) fn check_already_initialized(database: &DatabaseConnection) -> Result<(), APIError> {
     let db = crate::database::RlnDatabase::new(database.clone());
-    if db.mnemonic_exists()? {
+    if db.is_initialized()? {
         return Err(APIError::AlreadyInitialized);
     }
     Ok(())
@@ -185,10 +185,10 @@ pub(crate) fn check_password_validity(
     database: &DatabaseConnection,
 ) -> Result<Mnemonic, APIError> {
     let db = crate::database::RlnDatabase::new(database.clone());
-    if let Some(mnemonic_record) = db.get_mnemonic()? {
+    if let Some(config) = db.get_config()? {
         let mcrypt = new_magic_crypt!(password, 256);
         let mnemonic_str = mcrypt
-            .decrypt_base64_to_string(mnemonic_record.encrypted_mnemonic)
+            .decrypt_base64_to_string(config.encrypted_mnemonic)
             .map_err(|_| APIError::WrongPassword)?;
         Ok(Mnemonic::from_str(&mnemonic_str).expect("valid mnemonic"))
     } else {

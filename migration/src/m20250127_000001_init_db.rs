@@ -9,24 +9,6 @@ impl MigrationTrait for Migration {
         manager
             .create_table(
                 Table::create()
-                    .table(Mnemonic::Table)
-                    .if_not_exists()
-                    .col(
-                        ColumnDef::new(Mnemonic::Idx)
-                            .integer()
-                            .not_null()
-                            .primary_key(),
-                    )
-                    .col(string(Mnemonic::EncryptedMnemonic))
-                    .col(big_unsigned(Mnemonic::CreatedAt))
-                    .col(big_unsigned(Mnemonic::UpdatedAt))
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .create_table(
-                Table::create()
                     .table(KvStore::Table)
                     .if_not_exists()
                     .col(string(KvStore::PrimaryNamespace))
@@ -49,14 +31,20 @@ impl MigrationTrait for Migration {
                     .table(Config::Table)
                     .if_not_exists()
                     .col(
-                        ColumnDef::new(Config::Key)
-                            .string()
+                        ColumnDef::new(Config::Idx)
+                            .integer()
                             .not_null()
                             .primary_key(),
                     )
-                    .col(ColumnDef::new(Config::Value).string().not_null())
-                    .col(ColumnDef::new(Config::CreatedAt).big_integer().not_null())
-                    .col(ColumnDef::new(Config::UpdatedAt).big_integer().not_null())
+                    .col(string(Config::EncryptedMnemonic))
+                    .col(string_null(Config::IndexerUrl))
+                    .col(string_null(Config::BitcoinNetwork))
+                    .col(string_null(Config::WalletFingerprint))
+                    .col(string_null(Config::WalletAccountXpubVanilla))
+                    .col(string_null(Config::WalletAccountXpubColored))
+                    .col(string_null(Config::WalletMasterFingerprint))
+                    .col(big_unsigned(Config::CreatedAt))
+                    .col(big_unsigned(Config::UpdatedAt))
                     .to_owned(),
             )
             .await?;
@@ -115,20 +103,8 @@ impl MigrationTrait for Migration {
             .await?;
         manager
             .drop_table(Table::drop().table(KvStore::Table).to_owned())
-            .await?;
-        manager
-            .drop_table(Table::drop().table(Mnemonic::Table).to_owned())
             .await
     }
-}
-
-#[derive(DeriveIden)]
-enum Mnemonic {
-    Table,
-    Idx,
-    EncryptedMnemonic,
-    CreatedAt,
-    UpdatedAt,
 }
 
 #[derive(DeriveIden)]
@@ -143,8 +119,14 @@ enum KvStore {
 #[derive(DeriveIden)]
 enum Config {
     Table,
-    Key,
-    Value,
+    Idx,
+    EncryptedMnemonic,
+    IndexerUrl,
+    BitcoinNetwork,
+    WalletFingerprint,
+    WalletAccountXpubVanilla,
+    WalletAccountXpubColored,
+    WalletMasterFingerprint,
     CreatedAt,
     UpdatedAt,
 }

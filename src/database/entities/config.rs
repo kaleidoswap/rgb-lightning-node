@@ -13,27 +13,39 @@ impl EntityName for Entity {
 
 #[derive(Clone, Debug, PartialEq, DeriveModel, DeriveActiveModel, Eq)]
 pub struct Model {
-    pub key: String,
-    pub value: String,
+    pub idx: i32,
+    pub encrypted_mnemonic: String,
+    pub indexer_url: Option<String>,
+    pub bitcoin_network: Option<String>,
+    pub wallet_fingerprint: Option<String>,
+    pub wallet_account_xpub_vanilla: Option<String>,
+    pub wallet_account_xpub_colored: Option<String>,
+    pub wallet_master_fingerprint: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveColumn)]
 pub enum Column {
-    Key,
-    Value,
+    Idx,
+    EncryptedMnemonic,
+    IndexerUrl,
+    BitcoinNetwork,
+    WalletFingerprint,
+    WalletAccountXpubVanilla,
+    WalletAccountXpubColored,
+    WalletMasterFingerprint,
     CreatedAt,
     UpdatedAt,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DerivePrimaryKey)]
 pub enum PrimaryKey {
-    Key,
+    Idx,
 }
 
 impl PrimaryKeyTrait for PrimaryKey {
-    type ValueType = String;
+    type ValueType = i32;
     fn auto_increment() -> bool {
         false
     }
@@ -46,8 +58,14 @@ impl ColumnTrait for Column {
     type EntityName = Entity;
     fn def(&self) -> ColumnDef {
         match self {
-            Self::Key => ColumnType::String(StringLen::None).def(),
-            Self::Value => ColumnType::String(StringLen::None).def(),
+            Self::Idx => ColumnType::Integer.def(),
+            Self::EncryptedMnemonic => ColumnType::String(StringLen::None).def(),
+            Self::IndexerUrl => ColumnType::String(StringLen::None).def().null(),
+            Self::BitcoinNetwork => ColumnType::String(StringLen::None).def().null(),
+            Self::WalletFingerprint => ColumnType::String(StringLen::None).def().null(),
+            Self::WalletAccountXpubVanilla => ColumnType::String(StringLen::None).def().null(),
+            Self::WalletAccountXpubColored => ColumnType::String(StringLen::None).def().null(),
+            Self::WalletMasterFingerprint => ColumnType::String(StringLen::None).def().null(),
             Self::CreatedAt => ColumnType::BigInteger.def(),
             Self::UpdatedAt => ColumnType::BigInteger.def(),
         }
