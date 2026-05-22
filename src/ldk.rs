@@ -84,7 +84,7 @@ use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::ToSocketAddrs;
 use std::net::{SocketAddr, TcpListener};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
@@ -125,44 +125,6 @@ const VANILLA_SYNC_LOOKBACK: u32 = 20;
 
 #[cfg(test)]
 pub(crate) static IGNORE_INBOUND_CHANNELS_ON_NODE: Mutex<Option<PublicKey>> = Mutex::new(None);
-
-/// Mirrors a config value to a file for rust-lightning compatibility.
-fn mirror_config_file(storage_dir_path: &Path, fname: &str, value: &str) -> Result<(), APIError> {
-    fs::write(storage_dir_path.join(fname), value).map_err(APIError::IO)
-}
-
-/// Restores rust-lightning compatibility files from DB on startup.
-fn sync_config_to_files(
-    database: &sea_orm::DatabaseConnection,
-    storage_dir_path: &Path,
-) -> Result<(), APIError> {
-    let db = RlnDatabase::new(database.clone());
-    let Some(config) = db.get_config()? else {
-        return Ok(());
-    };
-    for (fname, value) in [
-        (INDEXER_URL_FNAME, config.indexer_url.as_deref()),
-        (BITCOIN_NETWORK_FNAME, config.bitcoin_network.as_deref()),
-        (WALLET_FINGERPRINT_FNAME, config.wallet_fingerprint.as_deref()),
-        (
-            WALLET_ACCOUNT_XPUB_VANILLA_FNAME,
-            config.wallet_account_xpub_vanilla.as_deref(),
-        ),
-        (
-            WALLET_ACCOUNT_XPUB_COLORED_FNAME,
-            config.wallet_account_xpub_colored.as_deref(),
-        ),
-        (
-            WALLET_MASTER_FINGERPRINT_FNAME,
-            config.wallet_master_fingerprint.as_deref(),
-        ),
-    ] {
-        if let Some(v) = value {
-            mirror_config_file(storage_dir_path, fname, v)?;
-        }
-    }
-    Ok(())
-}
 
 pub(crate) struct LdkBackgroundServices {
     stop_processing: Arc<AtomicBool>,
@@ -1841,8 +1803,6 @@ pub(crate) async fn start_ldk(
 ) -> Result<(LdkBackgroundServices, Arc<UnlockedAppState>), APIError> {
     let static_state = &app_state.static_state;
 
-    sync_config_to_files(&static_state.database, &static_state.storage_dir_path)?;
-
     let ldk_data_dir = static_state.ldk_data_dir.clone();
     let ldk_data_dir_path = PathBuf::from(&ldk_data_dir);
     let logger = static_state.logger.clone();
@@ -1919,13 +1879,17 @@ pub(crate) async fn start_ldk(
             BitcoinNetwork::Regtest => PROXY_ENDPOINT_LOCAL,
         }
     };
-    let storage_dir_path = app_state.static_state.storage_dir_path.clone();
     let db = RlnDatabase::new((*app_state.static_state.database).clone());
+    let kv_store = Arc::new(SeaOrmKvStore::from_connection(Arc::clone(
+        &static_state.database,
+    )));
+    let kv_store_dyn: Arc<dyn KVStoreSync + Send + Sync> =
+        Arc::clone(&kv_store) as Arc<dyn KVStoreSync + Send + Sync>;
     db.set_indexer_url(indexer_url)?;
-    mirror_config_file(&storage_dir_path, INDEXER_URL_FNAME, indexer_url)?;
+    kv_store.write_config(INDEXER_URL_FNAME, indexer_url);
     let bitcoin_network_str = bitcoin_network.to_string();
     db.set_bitcoin_network(&bitcoin_network_str)?;
-    mirror_config_file(&storage_dir_path, BITCOIN_NETWORK_FNAME, &bitcoin_network_str)?;
+    kv_store.write_config(BITCOIN_NETWORK_FNAME, &bitcoin_network_str);
 
     // Initialize the FeeEstimator
     // BitcoindClient implements the FeeEstimator trait, so it'll act as our fee estimator.
@@ -1954,12 +1918,6 @@ pub(crate) async fn start_ldk(
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap();
 
-    let kv_store = Arc::new(SeaOrmKvStore::from_connection(Arc::clone(
-        &static_state.database,
-    )));
-
-    let kv_store_dyn: Arc<dyn KVStoreSync + Send + Sync> =
-        Arc::clone(&kv_store) as Arc<dyn KVStoreSync + Send + Sync>;
     let keys_manager = Arc::new(KeysManager::new(
         &ldk_seed,
         cur.as_secs(),
@@ -2144,32 +2102,18 @@ pub(crate) async fn start_ldk(
         skip_consistency_check: false,
         vanilla_sync_lookback: VANILLA_SYNC_LOOKBACK,
     })?;
-    let db = RlnDatabase::new((*static_state.database).clone());
-    let storage_dir_path = &static_state.storage_dir_path;
     let fingerprint = account_xpub_colored.fingerprint().to_string();
     let xpub_colored = account_xpub_colored.to_string();
     let xpub_vanilla = account_xpub_vanilla.to_string();
     let master_fingerprint_str = master_fingerprint.to_string();
     db.set_wallet_fingerprint(&fingerprint)?;
-    mirror_config_file(storage_dir_path, WALLET_FINGERPRINT_FNAME, &fingerprint)?;
+    kv_store.write_config(WALLET_FINGERPRINT_FNAME, &fingerprint);
     db.set_wallet_account_xpub_colored(&xpub_colored)?;
-    mirror_config_file(
-        storage_dir_path,
-        WALLET_ACCOUNT_XPUB_COLORED_FNAME,
-        &xpub_colored,
-    )?;
+    kv_store.write_config(WALLET_ACCOUNT_XPUB_COLORED_FNAME, &xpub_colored);
     db.set_wallet_account_xpub_vanilla(&xpub_vanilla)?;
-    mirror_config_file(
-        storage_dir_path,
-        WALLET_ACCOUNT_XPUB_VANILLA_FNAME,
-        &xpub_vanilla,
-    )?;
+    kv_store.write_config(WALLET_ACCOUNT_XPUB_VANILLA_FNAME, &xpub_vanilla);
     db.set_wallet_master_fingerprint(&master_fingerprint_str)?;
-    mirror_config_file(
-        storage_dir_path,
-        WALLET_MASTER_FINGERPRINT_FNAME,
-        &master_fingerprint_str,
-    )?;
+    kv_store.write_config(WALLET_MASTER_FINGERPRINT_FNAME, &master_fingerprint_str);
 
     let rgb_wallet_wrapper = Arc::new(RgbLibWalletWrapper::new(
         Arc::new(Mutex::new(rgb_wallet)),
