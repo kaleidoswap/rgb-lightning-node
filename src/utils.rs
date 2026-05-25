@@ -1,4 +1,3 @@
-use crate::database::RlnDatabase;
 use crate::kv_store::SeaOrmKvStore;
 use amplify::s;
 use bitcoin::io;
@@ -69,8 +68,8 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
-    pub(crate) fn get_db(&self) -> RlnDatabase {
-        RlnDatabase::new((*self.static_state.database).clone())
+    pub(crate) fn get_db(&self) -> SeaOrmKvStore {
+        SeaOrmKvStore::from_connection(Arc::clone(&self.static_state.database))
     }
 
     pub(crate) fn get_changing_state(&self) -> MutexGuard<'_, bool> {
@@ -164,7 +163,7 @@ impl Writeable for UserOnionMessageContents {
 }
 
 pub(crate) fn check_already_initialized(database: &DatabaseConnection) -> Result<(), APIError> {
-    let db = crate::database::RlnDatabase::new(database.clone());
+    let db = SeaOrmKvStore::from_connection(Arc::new(database.clone()));
     if db.is_initialized()? {
         return Err(APIError::AlreadyInitialized);
     }
@@ -184,7 +183,7 @@ pub(crate) fn check_password_validity(
     password: &str,
     database: &DatabaseConnection,
 ) -> Result<Mnemonic, APIError> {
-    let db = crate::database::RlnDatabase::new(database.clone());
+    let db = SeaOrmKvStore::from_connection(Arc::new(database.clone()));
     if let Some(config) = db.get_config()? {
         let mcrypt = new_magic_crypt!(password, 256);
         let mnemonic_str = mcrypt
@@ -241,7 +240,7 @@ pub(crate) fn encrypt_and_save_mnemonic(
 ) -> Result<(), APIError> {
     let mcrypt = new_magic_crypt!(password, 256);
     let encrypted_mnemonic = mcrypt.encrypt_str_to_base64(mnemonic);
-    let db = crate::database::RlnDatabase::new(database.clone());
+    let db = SeaOrmKvStore::from_connection(Arc::new(database.clone()));
     db.save_mnemonic(encrypted_mnemonic)?;
     tracing::info!("Created a new wallet");
     Ok(())
@@ -371,20 +370,20 @@ pub(crate) async fn start_daemon(args: &UserArgs) -> Result<Arc<AppState>, AppEr
     let db_path = get_db_path(&args.storage_dir_path);
     let connection_string = format!("sqlite:{}?mode=rwc", adjust_canonicalization(&db_path));
     let mut opt = ConnectOptions::new(connection_string);
-    // single connection to avoid deadlocks under block_on
-    opt.max_connections(1)
-        .min_connections(0)
+    opt.max_connections(8)
+        .min_connections(1)
         .connect_timeout(Duration::from_secs(8))
-        .idle_timeout(Duration::from_secs(8))
-        .max_lifetime(Duration::from_secs(8));
+        .idle_timeout(Duration::from_secs(5 * 60))
+        .max_lifetime(Duration::from_secs(60 * 60));
 
-    let database = crate::runtime::block_on(Database::connect(opt)).map_err(|e| {
+    let database = Database::connect(opt).await.map_err(|e| {
         AppError::IO(std::io::Error::other(format!(
             "Database connection failed: {e}"
         )))
     })?;
 
-    crate::runtime::block_on(Migrator::up(&database, None))
+    Migrator::up(&database, None)
+        .await
         .map_err(|e| AppError::IO(std::io::Error::other(format!("Migration failed: {e}"))))?;
 
     tracing::info!(db_path = %db_path.display(), "Shared database initialized");

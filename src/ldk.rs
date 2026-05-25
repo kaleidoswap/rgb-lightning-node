@@ -26,8 +26,9 @@ use lightning::onion_message::messenger::{
 use lightning::rgb_utils::{
     get_rgb_channel_info_pending, is_channel_rgb, update_rgb_channel_amount, RgbKvStoreExt,
     RgbPaymentInfo, BITCOIN_NETWORK_FNAME, INDEXER_URL_FNAME, RGB_PAYMENT_INFO_INBOUND_NS,
-    RGB_PAYMENT_INFO_OUTBOUND_NS, RGB_PRIMARY_NS, STATIC_BLINDING, WALLET_ACCOUNT_XPUB_COLORED_FNAME,
-    WALLET_ACCOUNT_XPUB_VANILLA_FNAME, WALLET_FINGERPRINT_FNAME, WALLET_MASTER_FINGERPRINT_FNAME,
+    RGB_PAYMENT_INFO_OUTBOUND_NS, RGB_PRIMARY_NS, STATIC_BLINDING,
+    WALLET_ACCOUNT_XPUB_COLORED_FNAME, WALLET_ACCOUNT_XPUB_VANILLA_FNAME, WALLET_FINGERPRINT_FNAME,
+    WALLET_MASTER_FINGERPRINT_FNAME,
 };
 use lightning::routing::gossip;
 use lightning::routing::gossip::{NodeId, P2PGossipSync};
@@ -95,7 +96,6 @@ use tokio::sync::watch::Sender;
 use tokio::task::JoinHandle;
 
 use crate::bitcoind::BitcoindClient;
-use crate::database::RlnDatabase;
 use crate::disk::{self, FilesystemLogger};
 
 const INBOUND_PAYMENTS_KEY: &str = "inbound_payments";
@@ -1771,7 +1771,7 @@ impl OutputSpender for RgbOutputSpender {
             let rgb_wallet_wrapper_copy = self.rgb_wallet_wrapper.clone();
             let closing_txid_copy = closing_txid.clone();
             let consignment_path_copy = consignment_path.clone();
-            let res = crate::runtime::block_on(tokio::task::spawn_blocking(move || {
+            let res = futures::executor::block_on(tokio::task::spawn_blocking(move || {
                 rgb_wallet_wrapper_copy.post_consignment(
                     &proxy_url,
                     recipient_id,
@@ -1879,16 +1879,15 @@ pub(crate) async fn start_ldk(
             BitcoinNetwork::Regtest => PROXY_ENDPOINT_LOCAL,
         }
     };
-    let db = RlnDatabase::new((*app_state.static_state.database).clone());
     let kv_store = Arc::new(SeaOrmKvStore::from_connection(Arc::clone(
         &static_state.database,
     )));
     let kv_store_dyn: Arc<dyn KVStoreSync + Send + Sync> =
         Arc::clone(&kv_store) as Arc<dyn KVStoreSync + Send + Sync>;
-    db.set_indexer_url(indexer_url)?;
+    kv_store.set_indexer_url(indexer_url)?;
     kv_store.write_config(INDEXER_URL_FNAME, indexer_url);
     let bitcoin_network_str = bitcoin_network.to_string();
-    db.set_bitcoin_network(&bitcoin_network_str)?;
+    kv_store.set_bitcoin_network(&bitcoin_network_str)?;
     kv_store.write_config(BITCOIN_NETWORK_FNAME, &bitcoin_network_str);
 
     // Initialize the FeeEstimator
@@ -2106,13 +2105,13 @@ pub(crate) async fn start_ldk(
     let xpub_colored = account_xpub_colored.to_string();
     let xpub_vanilla = account_xpub_vanilla.to_string();
     let master_fingerprint_str = master_fingerprint.to_string();
-    db.set_wallet_fingerprint(&fingerprint)?;
+    kv_store.set_wallet_fingerprint(&fingerprint)?;
     kv_store.write_config(WALLET_FINGERPRINT_FNAME, &fingerprint);
-    db.set_wallet_account_xpub_colored(&xpub_colored)?;
+    kv_store.set_wallet_account_xpub_colored(&xpub_colored)?;
     kv_store.write_config(WALLET_ACCOUNT_XPUB_COLORED_FNAME, &xpub_colored);
-    db.set_wallet_account_xpub_vanilla(&xpub_vanilla)?;
+    kv_store.set_wallet_account_xpub_vanilla(&xpub_vanilla)?;
     kv_store.write_config(WALLET_ACCOUNT_XPUB_VANILLA_FNAME, &xpub_vanilla);
-    db.set_wallet_master_fingerprint(&master_fingerprint_str)?;
+    kv_store.set_wallet_master_fingerprint(&master_fingerprint_str)?;
     kv_store.write_config(WALLET_MASTER_FINGERPRINT_FNAME, &master_fingerprint_str);
 
     let rgb_wallet_wrapper = Arc::new(RgbLibWalletWrapper::new(
@@ -2511,7 +2510,7 @@ pub(crate) async fn start_ldk(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            let db = RlnDatabase::new((*connect_db).clone());
+            let db = SeaOrmKvStore::from_connection(Arc::clone(&connect_db));
             match db.read_channel_peer_data() {
                 Ok(info) => {
                     for node_id in connect_cm
