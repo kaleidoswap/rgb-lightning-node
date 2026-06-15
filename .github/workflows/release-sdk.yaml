@@ -299,15 +299,33 @@ jobs:
           event-type: rln-release
           client-payload: '{"version": "${{ needs.resolve-version.outputs.version }}"}'
 
-  trigger-wdk:
-    name: Trigger wdk-rgb-lightning release
+  trigger-rln-bare:
+    name: Trigger rgb-lightning-node-bare release
     runs-on: ubuntu-latest
     needs: [resolve-version, github-release]
     steps:
-      - name: Dispatch rln-release to wdk-rgb-lightning
+      - name: Dispatch rln-release to rgb-lightning-node-bare
         uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ secrets.REPO_DISPATCH_TOKEN }}
-          repository: UTEXO-Protocol/wdk-rgb-lightning
+          repository: UTEXO-Protocol/rgb-lightning-node-bare
           event-type: rln-release
-          client-payload: '{"version": "${{ needs.resolve-version.outputs.version }}"}'
+          client-payload: '{"version": "${{ needs.resolve-version.outputs.tag }}"}'
+
+  trigger-rln-nodejs:
+    name: Trigger rgb-lightning-node-nodejs release
+    runs-on: ubuntu-latest
+    needs: [resolve-version, github-release]
+    steps:
+      - name: Dispatch rln-release to rgb-lightning-node-nodejs
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.REPO_DISPATCH_TOKEN }}
+          repository: UTEXO-Protocol/rgb-lightning-node-nodejs
+          event-type: rln-release
+          client-payload: '{"version": "${{ needs.resolve-version.outputs.tag }}"}'
+
+  # NOTE: wdk-rgb-lightning is NOT triggered from here. It is dispatched by
+  # the rgb-lightning-node-nodejs release workflow once that binding has
+  # finished publishing its prebuilds, so the wdk release always runs after
+  # the native bindings exist. See rgb-lightning-node-nodejs/.github/workflows/release.yml.
