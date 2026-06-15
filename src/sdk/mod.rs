@@ -12,12 +12,12 @@ use crate::core_types::async_order::{
 };
 use crate::core_types::{FEE_RATE, MIN_CHANNEL_CONFIRMATIONS};
 use crate::error::APIError;
-#[cfg(feature = "vss")]
-use crate::ldk::derive_vss_identity;
 use crate::ldk::{
     clear_rgb_payment_pending, start_ldk, write_rgb_payment_info_file, InvoiceType, PaymentInfo,
     VirtualChannelSessionStatus,
 };
+#[cfg(feature = "vss")]
+use crate::ldk::{derive_vss_identity, derive_vss_identity_from_key_source};
 use crate::rgb::{check_rgb_proxy_endpoint, get_rgb_channel_info_optional};
 use crate::signer::{
     read_key_source_file, validate_bootstrap_payload, validate_key_source_matches_bootstrap,
@@ -1858,8 +1858,22 @@ pub(crate) async fn vss_clear_fence(
             .clone()
             .ok_or_else(|| APIError::FailedVssInit("VSS is not configured".to_string()))?;
 
-        let mnemonic = check_password_validity(&request.password, &state.db())?;
-        let identity = derive_vss_identity(&mnemonic, state.static_state.network.into())?;
+        // Internal-mnemonic mode authenticates with the password and derives
+        // the `m/535'/1'` identity. External-signer mode holds no mnemonic, so
+        // it reconstructs the bootstrap identity from the persisted
+        // key_source.json — the same store id start_ldk acquired the fence
+        // under. Without this branch, external-signer nodes could never clear
+        // a leftover fence and would be wedged after their first shutdown.
+        // [[derive_vss_identity_from_key_source]]
+        let identity = match read_key_source_file(&state.static_state.storage_dir_path)
+            .map_err(|e| APIError::ExternalSignerProtocolError(e.to_string()))?
+        {
+            Some(key_source) => derive_vss_identity_from_key_source(&key_source)?,
+            None => {
+                let mnemonic = check_password_validity(&request.password, &state.db())?;
+                derive_vss_identity(&mnemonic, state.static_state.network.into())?
+            }
+        };
 
         tokio::task::spawn_blocking(move || {
             let store = crate::vss_kv_store::VssKvStore::new(

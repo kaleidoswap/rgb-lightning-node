@@ -485,7 +485,10 @@ refuses to start to avoid corrupting state. After a previous owner shuts
 down its fence is intentionally left behind; on a legitimate device wipe and
 restore the operator must call `POST /vssclearfence` (or
 `SdkNode::vss_clear_fence`) once between `init` and `unlock` to take over
-the store.
+the store. In internal-mnemonic mode this is authenticated by the wallet
+password; in external-signer mode (no mnemonic on the node) the password is
+ignored and the VSS identity is reconstructed from the persisted
+`key_source.json`, matching the identity the node acquires the fence under.
 
 VSS replication is best-effort: a write that fails to reach the server is
 queued and retried on later successful writes. The number of pending writes is

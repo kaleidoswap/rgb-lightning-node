@@ -3198,6 +3198,163 @@ pub(crate) fn derive_vss_identity(
     })
 }
 
+/// Derive the VSS identity in external-signer mode, where the node does not
+/// hold the mnemonic and so cannot reproduce the `m/535'/1'` private
+/// derivation [`derive_vss_identity`] uses.
+///
+/// Instead we deterministically hash the public bootstrap identity (node id,
+/// account xpubs, master fingerprint, protocol version) into a 32-byte seed
+/// and use it directly as the VSS signing key. This mirrors how
+/// [`derive_async_payments_compat_seed_from_bootstrap`] derives the
+/// async-payments preimage root in external-signer mode, with a distinct
+/// domain-separation tag so the VSS signing key and the APay seed are never
+/// the same secret.
+///
+/// Properties:
+/// - **Stable across restarts.** The bootstrap identity is re-derived from
+///   the same mnemonic on every launch and persisted in the key-source file,
+///   so the same wallet always maps to the same VSS store id + signing key.
+/// - **Not mnemonic-equivalent.** The VSS identity here differs from the
+///   `m/535'/1'` identity an internal-mnemonic node would produce for the
+///   same seed, because the external signer never exposes that private
+///   derivation. A wallet that backs up in external-signer mode must restore
+///   in external-signer mode (which is the only mode WDK uses). Making the
+///   two modes converge would require the external signer itself to expose a
+///   VSS key derivation — out of scope here.
+#[cfg(feature = "vss")]
+pub(crate) fn derive_vss_identity_from_bootstrap(
+    bootstrap: &crate::signer::types::BootstrapData,
+) -> Result<VssIdentity, APIError> {
+    derive_vss_identity_from_public_material(
+        &bootstrap.identity.node_id,
+        &bootstrap.identity.account_xpub_vanilla,
+        &bootstrap.identity.account_xpub_colored,
+        &bootstrap.identity.master_fingerprint,
+        &bootstrap.protocol_version,
+    )
+}
+
+/// Derive the same bootstrap VSS identity from the persisted `key_source.json`
+/// instead of a live [`BootstrapData`].
+///
+/// `vss_clear_fence` runs on a *locked* node, so it has no unlock request and
+/// therefore no in-memory bootstrap. But the bootstrap identity is mirrored
+/// verbatim into the key-source file at external-signer init
+/// ([`crate::signer::KeySourceFile::from_bootstrap`]), so this reconstructs a
+/// VSS identity byte-identical to the one [`derive_vss_identity_from_bootstrap`]
+/// produces at unlock — which is exactly what the single-writer fence needs so
+/// the clear targets the same store id the running node acquired. The
+/// `key_source_matches_bootstrap_identity` test pins that equivalence.
+#[cfg(feature = "vss")]
+pub(crate) fn derive_vss_identity_from_key_source(
+    key_source: &crate::signer::KeySourceFile,
+) -> Result<VssIdentity, APIError> {
+    derive_vss_identity_from_public_material(
+        &key_source.node_id,
+        &key_source.account_xpub_vanilla,
+        &key_source.account_xpub_colored,
+        &key_source.master_fingerprint,
+        &key_source.protocol_version,
+    )
+}
+
+/// Shared core for the external-signer VSS identity. Hashing the same fields in
+/// the same order is what guarantees the unlock-time (bootstrap) and
+/// fence-clear-time (key-source) derivations agree; keep both callers routed
+/// through here rather than duplicating the seed layout.
+#[cfg(feature = "vss")]
+fn derive_vss_identity_from_public_material(
+    node_id: &str,
+    account_xpub_vanilla: &str,
+    account_xpub_colored: &str,
+    master_fingerprint: &str,
+    protocol_version: &str,
+) -> Result<VssIdentity, APIError> {
+    let mut seed_material = Vec::new();
+    seed_material.extend_from_slice(b"rln-vss-identity-v1");
+    seed_material.extend_from_slice(node_id.as_bytes());
+    seed_material.extend_from_slice(account_xpub_vanilla.as_bytes());
+    seed_material.extend_from_slice(account_xpub_colored.as_bytes());
+    seed_material.extend_from_slice(master_fingerprint.as_bytes());
+    seed_material.extend_from_slice(protocol_version.as_bytes());
+    let seed = <sha256::Hash as BitcoinHash>::hash(&seed_material).to_byte_array();
+
+    let secp = Secp256k1_30::new();
+    let signing_key = rgb_lib::bitcoin::secp256k1::SecretKey::from_slice(&seed).map_err(|e| {
+        APIError::FailedVssInit(format!(
+            "VSS identity: invalid derived key from bootstrap: {e}"
+        ))
+    })?;
+    let pubkey_hex = hex_str(&signing_key.public_key(&secp).serialize());
+    Ok(VssIdentity {
+        signing_key,
+        pubkey_hex,
+    })
+}
+
+#[cfg(all(test, feature = "vss"))]
+mod vss_bootstrap_identity_tests {
+    use super::*;
+    use crate::signer::types::{BootstrapData, SignerIdentity};
+
+    fn fake_bootstrap(node_id: &str) -> BootstrapData {
+        BootstrapData {
+            identity: SignerIdentity {
+                node_id: node_id.to_string(),
+                account_xpub_vanilla: "xv".to_string(),
+                account_xpub_colored: "xc".to_string(),
+                master_fingerprint: "deadbeef".to_string(),
+            },
+            protocol_version: "1".to_string(),
+            api_level: 1,
+        }
+    }
+
+    #[test]
+    fn deterministic_for_same_bootstrap() {
+        let b = fake_bootstrap(&"02".repeat(33));
+        let a = derive_vss_identity_from_bootstrap(&b).expect("derive");
+        let c = derive_vss_identity_from_bootstrap(&b).expect("derive");
+        assert_eq!(a.pubkey_hex, c.pubkey_hex);
+        assert_eq!(a.signing_key, c.signing_key);
+    }
+
+    #[test]
+    fn differs_for_different_bootstrap() {
+        let a =
+            derive_vss_identity_from_bootstrap(&fake_bootstrap(&"02".repeat(33))).expect("derive");
+        let b =
+            derive_vss_identity_from_bootstrap(&fake_bootstrap(&"03".repeat(33))).expect("derive");
+        assert_ne!(a.pubkey_hex, b.pubkey_hex);
+    }
+
+    #[test]
+    fn domain_separated_from_async_payments_seed() {
+        // The VSS signing key must not equal the APay preimage seed, even
+        // though both hash the same public bootstrap material.
+        let b = fake_bootstrap(&"02".repeat(33));
+        let vss = derive_vss_identity_from_bootstrap(&b).expect("derive");
+        let apay = crate::signer::types::derive_async_payments_compat_seed_from_bootstrap(&b);
+        assert_ne!(vss.signing_key.secret_bytes(), apay);
+    }
+
+    #[test]
+    fn key_source_matches_bootstrap_identity() {
+        // The fence-clear path derives the VSS identity from the persisted
+        // key_source.json, while unlock derives it from the live bootstrap.
+        // Both must resolve to the same store id + signing key, otherwise
+        // `vss_clear_fence` would delete the wrong fence and the running
+        // node's store would stay locked.
+        let b = fake_bootstrap(&"02".repeat(33));
+        let key_source = crate::signer::KeySourceFile::from_bootstrap(&b);
+        let from_bootstrap = derive_vss_identity_from_bootstrap(&b).expect("derive bootstrap");
+        let from_key_source =
+            derive_vss_identity_from_key_source(&key_source).expect("derive key source");
+        assert_eq!(from_bootstrap.pubkey_hex, from_key_source.pubkey_hex);
+        assert_eq!(from_bootstrap.signing_key, from_key_source.signing_key);
+    }
+}
+
 /// Restore the RGB wallet directory from VSS if (a) VSS is configured for this
 /// node, (b) the local wallet directory for `expected_fingerprint` is absent,
 /// and (c) VSS has a backup for the given store. Mirrors the KV-side
@@ -3393,10 +3550,22 @@ pub(crate) async fn start_ldk(
     // derivation. [[derive_vss_identity]]
     #[cfg(feature = "vss")]
     let vss_identity: Option<VssIdentity> = if static_state.vss_url.is_some() {
-        internal_mnemonic
-            .as_ref()
-            .map(|mnemonic| derive_vss_identity(mnemonic, static_state.network.into()))
-            .transpose()?
+        // Internal-mnemonic mode derives the VSS identity from the seed at
+        // `m/535'/1'`. External-signer mode never holds the mnemonic, so it
+        // derives a stable identity from the public bootstrap instead — see
+        // [[derive_vss_identity_from_bootstrap]]. Either path yields a VSS
+        // identity stable across restarts for the same wallet.
+        match internal_mnemonic.as_ref() {
+            Some(mnemonic) => Some(derive_vss_identity(mnemonic, static_state.network.into())?),
+            None => {
+                let bootstrap = external_bootstrap.as_ref().ok_or_else(|| {
+                    APIError::FailedVssInit(
+                        "VSS identity: external-signer mode is missing bootstrap data".into(),
+                    )
+                })?;
+                Some(derive_vss_identity_from_bootstrap(bootstrap)?)
+            }
+        }
     } else {
         None
     };

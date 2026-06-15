@@ -178,6 +178,11 @@ pub(crate) struct JsonSdkUnlockRequest {
     pub announce_addresses: Vec<String>,
     #[serde(default)]
     pub announce_alias: Option<String>,
+    // None / omitted → P2P gossip (default). Some(url) → Rapid Gossip Sync
+    // against the given RGS server. Added to `UnlockRequest` upstream in the
+    // gossip integration (#42).
+    #[serde(default)]
+    pub gossip_rgs_server_url: Option<String>,
 }
 
 impl From<JsonSdkUnlockRequest> for SdkUnlockRequest {
@@ -192,6 +197,7 @@ impl From<JsonSdkUnlockRequest> for SdkUnlockRequest {
             proxy_endpoint: j.proxy_endpoint,
             announce_addresses: j.announce_addresses,
             announce_alias: j.announce_alias,
+            gossip_rgs_server_url: j.gossip_rgs_server_url,
         }
     }
 }
