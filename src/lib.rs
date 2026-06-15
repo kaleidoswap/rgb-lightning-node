@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
+mod apay_merkle;
 mod args;
 mod async_order;
 mod auth;

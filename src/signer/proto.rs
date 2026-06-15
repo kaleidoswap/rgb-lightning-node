@@ -221,10 +221,16 @@ struct SignMessageV1 {
 }
 
 #[derive(Clone, PartialEq, Message)]
+struct SignMessageRawV1 {
+    #[prost(string, tag = "1")]
+    pub message_hex: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
 struct NodeRequestV1 {
     #[prost(
         oneof = "node_request_v1::Kind",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25"
     )]
     pub kind: Option<node_request_v1::Kind>,
 }
@@ -275,6 +281,8 @@ mod node_request_v1 {
         SignGossipMessage(SignGossipMessageV1),
         #[prost(message, tag = "9")]
         SignMessage(SignMessageV1),
+        #[prost(message, tag = "25")]
+        SignMessageRaw(SignMessageRawV1),
     }
 }
 
@@ -1283,6 +1291,9 @@ impl From<NodeRequest> for NodeRequestV1 {
             NodeRequest::SignMessage { message } => {
                 node_request_v1::Kind::SignMessage(SignMessageV1 { message })
             }
+            NodeRequest::SignMessageRaw { message_hex } => {
+                node_request_v1::Kind::SignMessageRaw(SignMessageRawV1 { message_hex })
+            }
         };
         Self { kind: Some(kind) }
     }
@@ -1392,6 +1403,9 @@ impl TryFrom<NodeRequestV1> for NodeRequest {
                 message_hex: v.message_hex,
             }),
             node_request_v1::Kind::SignMessage(v) => Ok(Self::SignMessage { message: v.message }),
+            node_request_v1::Kind::SignMessageRaw(v) => Ok(Self::SignMessageRaw {
+                message_hex: v.message_hex,
+            }),
         }
     }
 }
@@ -2248,6 +2262,16 @@ mod tests {
     fn request_roundtrip() {
         let request = SignerRequest::Node(NodeRequest::SignMessage {
             message: "hello".to_string(),
+        });
+        let wire = encode_signer_request(&request).expect("encode");
+        let decoded = decode_signer_request(&wire).expect("decode");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn raw_message_request_roundtrip() {
+        let request = SignerRequest::Node(NodeRequest::SignMessageRaw {
+            message_hex: "00ff".to_string(),
         });
         let wire = encode_signer_request(&request).expect("encode");
         let decoded = decode_signer_request(&wire).expect("decode");

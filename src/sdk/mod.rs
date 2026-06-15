@@ -2,9 +2,8 @@
 // If route-level business logic changes, keep SDK equivalents in sync.
 
 use crate::async_order::{
-    read_async_payments_next_hash_index, write_async_payments_next_hash_index,
-    AsyncOrderNewResultWire, AsyncOrderOutboundInvoiceResultWire, ASYNC_ORDER_MAX_HASH_BATCH_SIZE,
-    ASYNC_ORDER_RESPONSE_TIMEOUT_SECS,
+    write_async_payments_next_hash_index, AsyncOrderNewResultWire,
+    AsyncOrderOutboundInvoiceResultWire, ASYNC_ORDER_RESPONSE_TIMEOUT_SECS,
 };
 use crate::core_types::async_order::{
     AsyncOrderNewRequest, AsyncOrderNewResponse, AsyncOrderOutboundInvoiceRequest,
@@ -1168,14 +1167,7 @@ pub(crate) async fn async_order_new(
         )));
     }
 
-    let params = unlocked_state
-        .async_payments_preimage_root
-        .prepare_async_order_new_params(
-            read_async_payments_next_hash_index(unlocked_state.kv_store.as_ref(), &host_node_id)
-                .map_err(|err| APIError::Unexpected(err.message))?,
-            ASYNC_ORDER_MAX_HASH_BATCH_SIZE,
-        )
-        .map_err(|err| APIError::InvalidRequest(err.message))?;
+    let params = unlocked_state.prepare_apay_order_params(&host_node_id)?;
     let hashes = params.hashes.clone();
     let first_hash_index = hashes
         .first()
@@ -1185,6 +1177,15 @@ pub(crate) async fn async_order_new(
         .last()
         .map(|entry| entry.hash_index)
         .expect("validated async_order.new hash batch is non-empty");
+
+    let params = unlocked_state.attach_apay_signatures(
+        params,
+        &crate::utils::hex_str(&host_node_id.serialize()),
+        first_hash_index,
+        request.username.as_deref(),
+        request.domain.as_deref(),
+    )?;
+
     let request_id = new_jsonrpc_request_id();
 
     let response_rx = unlocked_state

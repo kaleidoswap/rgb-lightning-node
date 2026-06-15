@@ -35,6 +35,144 @@ use super::vls_adapter::{ExternalSignerBackend, VlsSignerAdapter};
 use super::RlnEntropySource;
 use super::RlnKeysInterface;
 
+const ZBASE32_ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
+
+fn zbase32_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity((data.len() * 8).div_ceil(5));
+    let mut bit_buffer = 0u16;
+    let mut pending_bits = 0u8;
+
+    for byte in data {
+        bit_buffer = (bit_buffer << 8) | u16::from(*byte);
+        pending_bits += 8;
+        while pending_bits >= 5 {
+            pending_bits -= 5;
+            let alphabet_index = ((bit_buffer >> pending_bits) & 0x1f) as usize;
+            out.push(ZBASE32_ALPHABET[alphabet_index] as char);
+        }
+    }
+
+    if pending_bits > 0 {
+        let alphabet_index = ((bit_buffer << (5 - pending_bits)) & 0x1f) as usize;
+        out.push(ZBASE32_ALPHABET[alphabet_index] as char);
+    }
+
+    out
+}
+
+fn ln_signed_message_from_compact(signature_hex: &str, recovery_id: u8) -> Result<String, ()> {
+    RecoveryId::from_i32(i32::from(recovery_id)).map_err(|_| ())?;
+    let compact_signature = Vec::<u8>::from_hex(signature_hex).map_err(|_| ())?;
+    if compact_signature.len() != 64 {
+        return Err(());
+    }
+
+    let mut recoverable_signature = Vec::with_capacity(65);
+    recoverable_signature.push(31 + recovery_id);
+    recoverable_signature.extend_from_slice(&compact_signature);
+    Ok(zbase32_encode(&recoverable_signature))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::hashes::{sha256d, Hash};
+    use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
+    use std::sync::Mutex;
+
+    use crate::signer::proto::{decode_signer_request, encode_signer_response};
+    use crate::signer::transport::ExternalSignerTransport;
+    use crate::signer::vls_adapter::VlsSignerAdapter;
+
+    struct RawMessageTransport {
+        signature_hex: String,
+        recovery_id: u8,
+        seen_message_hex: Mutex<Option<String>>,
+    }
+
+    impl ExternalSignerTransport for RawMessageTransport {
+        fn call(&self, request: &[u8]) -> Result<Vec<u8>, RlnSignerError> {
+            let req = decode_signer_request(request)?;
+            let response = match req {
+                ExternalSignerRequest::Node(ExternalNodeRequest::SignMessageRaw {
+                    message_hex,
+                }) => {
+                    *self.seen_message_hex.lock().expect("lock") = Some(message_hex);
+                    ExternalSignerResponse::Node(ExternalNodeResponse::RecoverableSignature {
+                        signature_hex: self.signature_hex.clone(),
+                        recovery_id: self.recovery_id,
+                    })
+                }
+                other => {
+                    return Err(RlnSignerError::Protocol(format!(
+                        "unexpected request: {other:?}"
+                    )))
+                }
+            };
+            encode_signer_response(&response)
+        }
+    }
+
+    #[test]
+    fn zbase32_encode_matches_known_vectors() {
+        assert_eq!(zbase32_encode(&[]), "");
+        assert_eq!(zbase32_encode(&[0x00]), "yy");
+        assert_eq!(zbase32_encode(&[0x80]), "oy");
+        assert_eq!(zbase32_encode(&[0x8b, 0x88, 0x80]), "tqrey");
+    }
+
+    #[test]
+    fn ln_signed_message_conversion_matches_ldk() {
+        let secp = Secp256k1::new();
+        let secret = SecretKey::from_slice(&[1u8; 32]).expect("secret");
+        let message: &[u8] = b"\x00\xffapay";
+        let digest = sha256d::Hash::hash(&[&b"Lightning Signed Message:"[..], message].concat());
+        let signature =
+            secp.sign_ecdsa_recoverable(&Message::from_digest(digest.to_byte_array()), &secret);
+        let (recovery_id, compact) = signature.serialize_compact();
+
+        let actual = ln_signed_message_from_compact(
+            &compact.to_lower_hex_string(),
+            recovery_id.to_i32() as u8,
+        )
+        .expect("convert");
+        let expected = lightning::util::message_signing::sign(message, &secret);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn external_sign_message_uses_raw_hex_and_returns_zbase32() {
+        let secp = Secp256k1::new();
+        let secret = SecretKey::from_slice(&[2u8; 32]).expect("secret");
+        let message: &[u8] = b"\x00\xffapay";
+        let digest = sha256d::Hash::hash(&[&b"Lightning Signed Message:"[..], message].concat());
+        let signature =
+            secp.sign_ecdsa_recoverable(&Message::from_digest(digest.to_byte_array()), &secret);
+        let (recovery_id, compact) = signature.serialize_compact();
+
+        let transport = Arc::new(RawMessageTransport {
+            signature_hex: compact.to_lower_hex_string(),
+            recovery_id: recovery_id.to_i32() as u8,
+            seen_message_hex: Mutex::new(None),
+        });
+        let signer = ExternalSigner {
+            backend: Arc::new(VlsSignerAdapter::new(transport.clone())),
+        };
+
+        let signed_message = signer.sign_message(message).expect("sign");
+
+        assert_eq!(
+            transport.seen_message_hex.lock().expect("lock").as_deref(),
+            Some("00ff61706179")
+        );
+        assert_eq!(
+            signed_message,
+            lightning::util::message_signing::sign(message, &secret)
+        );
+    }
+}
+
 /// Transport-backed external signer: LDK `NodeSigner` / channel / PSBT ops delegate to the host.
 /// Bootstrap currently carries only public signer identity/config, while runtime signer
 /// operations fetch all signing-capable material through the external signer backend.
@@ -556,15 +694,18 @@ impl NodeSigner for ExternalSigner {
     }
 
     fn sign_message(&self, msg: &[u8]) -> Result<String, ()> {
-        let req = ExternalSignerRequest::Node(ExternalNodeRequest::SignMessage {
-            message: String::from_utf8(msg.to_vec()).map_err(|_| ())?,
+        let req = ExternalSignerRequest::Node(ExternalNodeRequest::SignMessageRaw {
+            message_hex: msg.to_lower_hex_string(),
         });
         let resp = self.backend.call(req).map_err(|_| ())?;
-        let ExternalSignerResponse::Node(ExternalNodeResponse::Signature { signature_hex }) = resp
+        let ExternalSignerResponse::Node(ExternalNodeResponse::RecoverableSignature {
+            signature_hex,
+            recovery_id,
+        }) = resp
         else {
             return Err(());
         };
-        Ok(signature_hex)
+        ln_signed_message_from_compact(&signature_hex, recovery_id)
     }
 }
 

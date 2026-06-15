@@ -403,3 +403,126 @@ mod uniffi_smoke_tests {
         assert!(matches!(res, Err(RlnError::InvalidRequest)));
     }
 }
+
+#[cfg(all(test, feature = "vls"))]
+mod external_apay_signing_tests {
+    use std::{str::FromStr, sync::Arc};
+
+    use bitcoin::{
+        hex::FromHex,
+        secp256k1::{PublicKey, Secp256k1, SecretKey},
+    };
+    use lightning::{
+        sign::{KeysManager, NodeSigner},
+        util::message_signing,
+    };
+
+    use crate::{
+        async_order::{
+            apay_attest_bytes, apay_commit_bytes, build_apay_address_attestation,
+            build_apay_batch_commitment, AsyncOrderNewHashWire,
+        },
+        kv_store::test_support::MemoryKvStore,
+        signer::{ExternalSigner, ExternalSignerTransport},
+        uniffi_api::UniffiExternalSignerTransport,
+    };
+
+    fn external_signer_from_seed(seed_hex: String) -> (ExternalSigner, PublicKey) {
+        let host = crate::NativeExternalSigner::new(seed_hex, "regtest".to_string(), Some(true))
+            .expect("native signer");
+        let transport: Arc<dyn ExternalSignerTransport> =
+            Arc::new(UniffiExternalSignerTransport::new(host));
+        let attachment =
+            crate::ldk::attach_external_signer_transport(transport).expect("attachment");
+        let node_id =
+            PublicKey::from_str(&attachment.bootstrap.identity.node_id).expect("bootstrap node id");
+        let signer = ExternalSigner::from_attachment(&attachment).expect("external signer");
+        (signer, node_id)
+    }
+
+    fn decode_fixed<const N: usize>(hex: &str) -> [u8; N] {
+        Vec::<u8>::from_hex(hex)
+            .expect("valid hex")
+            .try_into()
+            .expect("expected length")
+    }
+
+    #[test]
+    fn external_message_signing_matches_internal_mode() {
+        let (signer, node_id) = external_signer_from_seed("33".repeat(32));
+        let message: &[u8] = b"\x00\xff\xfe binary commitment bytes";
+
+        let external_sig = NodeSigner::sign_message(&signer, message).expect("external sign");
+        assert!(message_signing::verify(message, &external_sig, &node_id));
+
+        let keys_manager = KeysManager::new(
+            &[0x33u8; 32],
+            42,
+            42,
+            true,
+            std::env::temp_dir().join(format!("rln-signer-parity-{}", uuid::Uuid::new_v4())),
+            Arc::new(MemoryKvStore::default()),
+        );
+        let secp = Secp256k1::new();
+        let internal_node_id =
+            PublicKey::from_secret_key(&secp, &keys_manager.get_node_secret_key());
+        assert_eq!(internal_node_id, node_id);
+
+        let internal_sig = message_signing::sign(message, &keys_manager.get_node_secret_key());
+        assert_eq!(external_sig, internal_sig);
+    }
+
+    #[test]
+    fn external_signatures_verify() {
+        let (signer, node_id) = external_signer_from_seed("44".repeat(32));
+        let node_id_hex = node_id.to_string();
+        let secp = Secp256k1::new();
+        let host_pubkey = PublicKey::from_secret_key(
+            &secp,
+            &SecretKey::from_slice(&[9u8; 32]).expect("host secret"),
+        );
+        let host_pubkey_hex = host_pubkey.to_string();
+
+        let prepared = signer
+            .prepare_async_payments_hashes(host_pubkey_hex.clone(), 1, 4)
+            .expect("prepare hashes");
+        assert_eq!(prepared.len(), 4);
+        let hashes: Vec<AsyncOrderNewHashWire> = prepared
+            .iter()
+            .map(|entry| AsyncOrderNewHashWire {
+                hash_index: entry.hash_index,
+                payment_hash: entry.payment_hash_hex.clone(),
+            })
+            .collect();
+
+        let batch = build_apay_batch_commitment(
+            &node_id_hex,
+            &host_pubkey_hex,
+            1,
+            &hashes,
+            1_000,
+            2_000,
+            |msg| NodeSigner::sign_message(&signer, msg),
+        )
+        .expect("batch commitment");
+
+        let commit = apay_commit_bytes(
+            &decode_fixed::<33>(&node_id_hex),
+            &decode_fixed::<33>(&batch.host_pubkey),
+            &decode_fixed::<16>(&batch.batch_id),
+            &decode_fixed::<32>(&batch.batch_root),
+            batch.batch_size,
+            batch.created_at,
+            batch.expires_at,
+        );
+        assert!(message_signing::verify(&commit, &batch.batch_sig, &node_id));
+
+        let address_sig =
+            build_apay_address_attestation(&node_id_hex, "utexo.com", "xalkan", 0, |msg| {
+                NodeSigner::sign_message(&signer, msg)
+            })
+            .expect("address attestation");
+        let attest = apay_attest_bytes(&decode_fixed::<33>(&node_id_hex), "utexo.com", "xalkan", 0);
+        assert!(message_signing::verify(&attest, &address_sig, &node_id));
+    }
+}

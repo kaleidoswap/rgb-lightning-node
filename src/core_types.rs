@@ -18,6 +18,10 @@ pub mod async_order {
     #[derive(Clone, Debug, Deserialize, Serialize)]
     pub(crate) struct AsyncOrderNewRequest {
         pub(crate) host_node_id: String,
+        #[serde(default)]
+        pub(crate) username: Option<String>,
+        #[serde(default)]
+        pub(crate) domain: Option<String>,
     }
 
     #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -109,6 +109,183 @@ pub struct AsyncOrderNewHashWire {
 pub(crate) struct AsyncOrderNewParamsWire {
     pub(crate) protocol_version: u64,
     pub(crate) hashes: Vec<AsyncOrderNewHashWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) batch: Option<ApayBatchCommitmentWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) address_sig: Option<String>,
+}
+
+pub(crate) const APAY_BATCH_EXPIRY_SECS: u64 = 365 * 24 * 60 * 60;
+const APAY_BATCH_ID_TAG: &[u8] = b"UTEXO_APAY_BATCH_ID_V1";
+pub(crate) const APAY_HASH_BATCH_TAG: &[u8] = b"UTEXO_APAY_HASH_BATCH_V1";
+pub(crate) const APAY_LNADDR_TAG: &[u8] = b"UTEXO_APAY_LNADDR_V1";
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ApayBatchCommitmentWire {
+    pub(crate) host_pubkey: String,
+    pub(crate) batch_id: String,
+    pub(crate) batch_root: String,
+    pub(crate) batch_size: u64,
+    pub(crate) batch_sig: String,
+    pub(crate) created_at: u64,
+    pub(crate) expires_at: u64,
+}
+
+fn apay_hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn apay_decode_hex_fixed<const N: usize>(
+    field: &str,
+    s: &str,
+) -> Result<[u8; N], JsonRpcErrorWire> {
+    let s = s.trim();
+    if s.len() != 2 * N {
+        return Err(JsonRpcErrorWire::invalid_params(format!(
+            "{field} must be {N}-byte hex"
+        )));
+    }
+    let mut out = [0u8; N];
+    for (slot, pair) in out.iter_mut().zip(s.as_bytes().chunks_exact(2)) {
+        let high = apay_hex_nibble(pair[0]).ok_or_else(|| {
+            JsonRpcErrorWire::invalid_params(format!("{field} must be {N}-byte hex"))
+        })?;
+        let low = apay_hex_nibble(pair[1]).ok_or_else(|| {
+            JsonRpcErrorWire::invalid_params(format!("{field} must be {N}-byte hex"))
+        })?;
+        *slot = (high << 4) | low;
+    }
+    Ok(out)
+}
+
+pub(crate) fn apay_derive_batch_id(recipient_pubkey: &[u8; 33], start_index: u64) -> [u8; 16] {
+    let mut material = Vec::with_capacity(APAY_BATCH_ID_TAG.len() + recipient_pubkey.len() + 8);
+    material.extend_from_slice(APAY_BATCH_ID_TAG);
+    material.extend_from_slice(recipient_pubkey);
+    material.extend_from_slice(&start_index.to_be_bytes());
+    let digest = sha256::Hash::hash(&material).to_byte_array();
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&digest[..16]);
+    id
+}
+
+pub(crate) fn apay_batch_root(
+    recipient_pubkey: &[u8; 33],
+    batch_id: &[u8; 16],
+    hashes: &[AsyncOrderNewHashWire],
+) -> Result<[u8; 32], JsonRpcErrorWire> {
+    if hashes.is_empty() {
+        return Err(JsonRpcErrorWire::invalid_hash_batch());
+    }
+    let mut leaves = Vec::with_capacity(hashes.len());
+    for entry in hashes {
+        let payment_hash = validate_and_parse_payment_hash(&entry.payment_hash)
+            .map_err(|_| JsonRpcErrorWire::invalid_params("invalid_payment_hash"))?;
+        leaves.push(crate::apay_merkle::leaf_hash(
+            recipient_pubkey,
+            batch_id,
+            entry.hash_index,
+            &payment_hash.0,
+        ));
+    }
+    Ok(crate::apay_merkle::root(&leaves))
+}
+
+pub(crate) fn apay_commit_bytes(
+    recipient_pubkey: &[u8; 33],
+    host_pubkey: &[u8; 33],
+    batch_id: &[u8; 16],
+    batch_root: &[u8; 32],
+    batch_size: u64,
+    created_at: u64,
+    expires_at: u64,
+) -> Vec<u8> {
+    let mut data = Vec::with_capacity(APAY_HASH_BATCH_TAG.len() + 33 + 33 + 16 + 32 + 24);
+    data.extend_from_slice(APAY_HASH_BATCH_TAG);
+    data.extend_from_slice(recipient_pubkey);
+    data.extend_from_slice(host_pubkey);
+    data.extend_from_slice(batch_id);
+    data.extend_from_slice(batch_root);
+    data.extend_from_slice(&batch_size.to_be_bytes());
+    data.extend_from_slice(&created_at.to_be_bytes());
+    data.extend_from_slice(&expires_at.to_be_bytes());
+    data
+}
+
+pub(crate) fn apay_attest_bytes(
+    recipient_pubkey: &[u8; 33],
+    domain: &str,
+    username: &str,
+    expires_at: u64,
+) -> Vec<u8> {
+    let mut data =
+        Vec::with_capacity(APAY_LNADDR_TAG.len() + 33 + domain.len() + username.len() + 8);
+    data.extend_from_slice(APAY_LNADDR_TAG);
+    data.extend_from_slice(recipient_pubkey);
+    data.extend_from_slice(domain.as_bytes());
+    data.extend_from_slice(username.as_bytes());
+    data.extend_from_slice(&expires_at.to_be_bytes());
+    data
+}
+
+pub(crate) fn build_apay_address_attestation<F>(
+    recipient_pubkey_hex: &str,
+    domain: &str,
+    username: &str,
+    expires_at: u64,
+    sign: F,
+) -> Result<String, JsonRpcErrorWire>
+where
+    F: FnOnce(&[u8]) -> Result<String, ()>,
+{
+    let recipient_pubkey = apay_decode_hex_fixed::<33>("recipient_pubkey", recipient_pubkey_hex)?;
+    let attest = apay_attest_bytes(&recipient_pubkey, domain, username, expires_at);
+    sign(&attest)
+        .map_err(|_| JsonRpcErrorWire::internal_error("apay_attest_sign_failed".to_owned()))
+}
+
+pub(crate) fn build_apay_batch_commitment<F>(
+    recipient_pubkey_hex: &str,
+    host_pubkey_hex: &str,
+    start_index: u64,
+    hashes: &[AsyncOrderNewHashWire],
+    created_at: u64,
+    expires_at: u64,
+    sign: F,
+) -> Result<ApayBatchCommitmentWire, JsonRpcErrorWire>
+where
+    F: FnOnce(&[u8]) -> Result<String, ()>,
+{
+    let recipient_pubkey = apay_decode_hex_fixed::<33>("recipient_pubkey", recipient_pubkey_hex)?;
+    let host_pubkey = apay_decode_hex_fixed::<33>("host_pubkey", host_pubkey_hex)?;
+    let batch_id = apay_derive_batch_id(&recipient_pubkey, start_index);
+    let batch_root = apay_batch_root(&recipient_pubkey, &batch_id, hashes)?;
+    let commit = apay_commit_bytes(
+        &recipient_pubkey,
+        &host_pubkey,
+        &batch_id,
+        &batch_root,
+        hashes.len() as u64,
+        created_at,
+        expires_at,
+    );
+    let batch_sig = sign(&commit)
+        .map_err(|_| JsonRpcErrorWire::internal_error("apay_batch_sign_failed".to_owned()))?;
+    Ok(ApayBatchCommitmentWire {
+        host_pubkey: hex_str(&host_pubkey),
+        batch_id: hex_str(&batch_id),
+        batch_root: hex_str(&batch_root),
+        batch_size: hashes.len() as u64,
+        batch_sig,
+        created_at,
+        expires_at,
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -323,6 +500,10 @@ struct AsyncOrderNewLspRequest {
     peer_pubkey: String,
     protocol_version: u64,
     hashes: Vec<AsyncOrderNewHashWire>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch: Option<ApayBatchCommitmentWire>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address_sig: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -457,6 +638,8 @@ impl AsyncOrderLspClient {
             peer_pubkey: hex_str(&sender_node_id.serialize()),
             protocol_version: params.protocol_version,
             hashes: params.hashes,
+            batch: params.batch,
+            address_sig: params.address_sig,
         };
         let mut builder = self
             .client
@@ -667,6 +850,8 @@ impl AsyncPaymentsPreimageRoot {
         Ok(AsyncOrderNewParamsWire {
             protocol_version: PROTOCOL_VERSION,
             hashes,
+            batch: None,
+            address_sig: None,
         })
     }
 }
@@ -1519,13 +1704,13 @@ fn validate_async_payments_next_hash_index(next_index: u64) -> Result<(), JsonRp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kv_store::test_support::MemoryKvStore;
     use crate::utils::new_jsonrpc_request_id;
     use axum::{extract::Json, http::StatusCode, routing::post, Router};
     use bitcoin::secp256k1::{Secp256k1, SecretKey};
-    use std::collections::HashMap as StdHashMap;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::net::TcpListener;
     use tokio::time::sleep;
@@ -1554,81 +1739,6 @@ mod tests {
         ) -> Result<AsyncOrderOutboundInvoiceResultWire, JsonRpcErrorWire> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.result.clone())
-        }
-    }
-
-    #[derive(Default)]
-    struct MemoryKvStore {
-        entries: StdMutex<StdHashMap<(String, String, String), Vec<u8>>>,
-    }
-
-    impl KVStoreSync for MemoryKvStore {
-        fn read(
-            &self,
-            primary_namespace: &str,
-            secondary_namespace: &str,
-            key: &str,
-        ) -> Result<Vec<u8>, io::Error> {
-            self.entries
-                .lock()
-                .unwrap()
-                .get(&(
-                    primary_namespace.to_owned(),
-                    secondary_namespace.to_owned(),
-                    key.to_owned(),
-                ))
-                .cloned()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing key"))
-        }
-
-        fn write(
-            &self,
-            primary_namespace: &str,
-            secondary_namespace: &str,
-            key: &str,
-            buf: Vec<u8>,
-        ) -> Result<(), io::Error> {
-            self.entries.lock().unwrap().insert(
-                (
-                    primary_namespace.to_owned(),
-                    secondary_namespace.to_owned(),
-                    key.to_owned(),
-                ),
-                buf,
-            );
-            Ok(())
-        }
-
-        fn remove(
-            &self,
-            primary_namespace: &str,
-            secondary_namespace: &str,
-            key: &str,
-            _lazy: bool,
-        ) -> Result<(), io::Error> {
-            self.entries.lock().unwrap().remove(&(
-                primary_namespace.to_owned(),
-                secondary_namespace.to_owned(),
-                key.to_owned(),
-            ));
-            Ok(())
-        }
-
-        fn list(
-            &self,
-            primary_namespace: &str,
-            secondary_namespace: &str,
-        ) -> Result<Vec<String>, io::Error> {
-            Ok(self
-                .entries
-                .lock()
-                .unwrap()
-                .keys()
-                .filter(|(primary, secondary, _)| {
-                    primary == primary_namespace && secondary == secondary_namespace
-                })
-                .map(|(_, _, key)| key.clone())
-                .collect())
         }
     }
 
@@ -1719,6 +1829,8 @@ mod tests {
                             .to_owned(),
                 },
             ],
+            batch: None,
+            address_sig: None,
         }
     }
 
@@ -2644,5 +2756,147 @@ mod tests {
             err.message,
             "async_order_lsp_request_failed: POST /internal/async_order/new timed out"
         );
+    }
+}
+
+#[cfg(test)]
+mod apay_commit_tests {
+    use super::*;
+
+    fn recipient_pubkey() -> [u8; 33] {
+        apay_decode_hex_fixed::<33>("recipient_pubkey", &format!("02{}", "11".repeat(32))).unwrap()
+    }
+    fn host_pubkey() -> [u8; 33] {
+        apay_decode_hex_fixed::<33>("host_pubkey", &format!("03{}", "22".repeat(32))).unwrap()
+    }
+    fn batch_id() -> [u8; 16] {
+        apay_decode_hex_fixed::<16>("batch_id", "000102030405060708090a0b0c0d0e0f").unwrap()
+    }
+    fn fixture_hashes() -> Vec<AsyncOrderNewHashWire> {
+        (1u64..=5)
+            .map(|i| AsyncOrderNewHashWire {
+                hash_index: i,
+                payment_hash: hex_str(&[i as u8; 32]),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn batch_root_matches_reference() {
+        let root = apay_batch_root(&recipient_pubkey(), &batch_id(), &fixture_hashes()).unwrap();
+        assert_eq!(
+            hex_str(&root),
+            "2a89ca7e910bae70bc3f03f0252ec22de83cc40a5b4ba1582b649be5ea667132"
+        );
+    }
+
+    #[test]
+    fn batch_root_reports_invalid_payment_hash() {
+        let mut hashes = fixture_hashes();
+        hashes[0].payment_hash = "not-hex".to_owned();
+        let err = apay_batch_root(&recipient_pubkey(), &batch_id(), &hashes).unwrap_err();
+        assert_eq!(err.message, "invalid_payment_hash");
+    }
+
+    #[test]
+    fn commit_bytes_match_reference() {
+        let root = apay_batch_root(&recipient_pubkey(), &batch_id(), &fixture_hashes()).unwrap();
+        let commit = apay_commit_bytes(
+            &recipient_pubkey(),
+            &host_pubkey(),
+            &batch_id(),
+            &root,
+            5,
+            1_700_000_000,
+            0,
+        );
+        assert_eq!(
+            hex_str(&commit),
+            "555445584f5f415041595f484153485f42415443485f5631021111111111111111111111111111111111111111111111111111111111111111032222222222222222222222222222222222222222222222222222222222222222000102030405060708090a0b0c0d0e0f2a89ca7e910bae70bc3f03f0252ec22de83cc40a5b4ba1582b649be5ea6671320000000000000005000000006553f1000000000000000000"
+        );
+    }
+
+    #[test]
+    fn attest_bytes_match_reference() {
+        let attest = apay_attest_bytes(&recipient_pubkey(), "utexo.com", "alice", 0);
+        assert_eq!(
+            hex_str(&attest),
+            "555445584f5f415041595f4c4e414444525f5631021111111111111111111111111111111111111111111111111111111111111111757465786f2e636f6d616c6963650000000000000000"
+        );
+    }
+
+    #[test]
+    fn derive_batch_id_is_deterministic() {
+        let a = apay_derive_batch_id(&recipient_pubkey(), 1);
+        let b = apay_derive_batch_id(&recipient_pubkey(), 1);
+        let c = apay_derive_batch_id(&recipient_pubkey(), 2);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn build_commitment_signs_commit() {
+        let hashes = fixture_hashes();
+        let rp_hex = format!("02{}", "11".repeat(32));
+        let hp_hex = format!("03{}", "22".repeat(32));
+        let commitment =
+            build_apay_batch_commitment(&rp_hex, &hp_hex, 1, &hashes, 1_700_000_000, 0, |msg| {
+                Ok(hex_str(msg))
+            })
+            .unwrap();
+        let bid = apay_derive_batch_id(&recipient_pubkey(), 1);
+        let root = apay_batch_root(&recipient_pubkey(), &bid, &hashes).unwrap();
+        assert_eq!(commitment.batch_id, hex_str(&bid));
+        assert_eq!(commitment.batch_root, hex_str(&root));
+        assert_eq!(commitment.batch_size, 5);
+        let expected_commit = apay_commit_bytes(
+            &recipient_pubkey(),
+            &host_pubkey(),
+            &bid,
+            &root,
+            5,
+            1_700_000_000,
+            0,
+        );
+        assert_eq!(commitment.batch_sig, hex_str(&expected_commit));
+    }
+
+    #[test]
+    fn build_attestation_signs_attest() {
+        let rp_hex = format!("02{}", "11".repeat(32));
+        let sig = build_apay_address_attestation(&rp_hex, "utexo.com", "alice", 0, |msg| {
+            Ok(hex_str(msg))
+        })
+        .unwrap();
+        let expected = apay_attest_bytes(&recipient_pubkey(), "utexo.com", "alice", 0);
+        assert_eq!(sig, hex_str(&expected));
+    }
+
+    #[test]
+    fn build_commitment_reports_invalid_pubkey_field() {
+        let hashes = fixture_hashes();
+        let hp_hex = format!("03{}", "22".repeat(32));
+        let err = build_apay_batch_commitment("02", &hp_hex, 1, &hashes, 1_700_000_000, 0, |_| {
+            Ok(String::new())
+        })
+        .unwrap_err();
+        assert_eq!(err.message, "recipient_pubkey must be 33-byte hex");
+
+        let rp_hex = format!("02{}", "11".repeat(32));
+        let err =
+            build_apay_batch_commitment(&rp_hex, "not-hex", 1, &hashes, 1_700_000_000, 0, |_| {
+                Ok(String::new())
+            })
+            .unwrap_err();
+        assert_eq!(err.message, "host_pubkey must be 33-byte hex");
+    }
+
+    #[test]
+    fn build_attestation_reports_invalid_recipient_pubkey() {
+        let err = build_apay_address_attestation("not-hex", "utexo.com", "alice", 0, |_| {
+            Ok(String::new())
+        })
+        .unwrap_err();
+        assert_eq!(err.message, "recipient_pubkey must be 33-byte hex");
     }
 }

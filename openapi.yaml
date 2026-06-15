@@ -1266,10 +1266,27 @@ components:
       type: object
       required:
         - host_node_id
+      dependentRequired:
+        username:
+          - domain
+        domain:
+          - username
       properties:
         host_node_id:
           type: string
           example: 02123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0
+        username:
+          type: string
+          description: >-
+            Optional. LSP-assigned Lightning Address localpart. When supplied together with `domain`,
+            the recipient signs a `recipient_pubkey <-> username@domain` address attestation and includes it with the order.
+            Source it from the LSP's `GET /lightning_address/by_pubkey/{pubkey}` so it matches what the LSP serves.
+          example: xalkan
+        domain:
+          type: string
+          description: >-
+            Optional. Lightning Address domain; required together with `username` to produce the address attestation.
+          example: utexo.com
     AsyncOrderNewResponse:
       type: object
       required:

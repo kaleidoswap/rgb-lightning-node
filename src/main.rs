@@ -1,3 +1,4 @@
+mod apay_merkle;
 mod args;
 mod async_order;
 mod auth;

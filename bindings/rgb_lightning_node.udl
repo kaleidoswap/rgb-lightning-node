@@ -120,6 +120,8 @@ interface SdkNode {
     SendRgbResponse send_rgb(SendRgbRequest request);
     [Throws=RlnError]
     AsyncOrderNewResponse apay_new(string host_node_id);
+    [Throws=RlnError]
+    AsyncOrderNewResponse apay_new_with_address(string host_node_id, string username, string domain);
 };
 
 [Error]

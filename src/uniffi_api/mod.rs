@@ -1400,7 +1400,29 @@ impl SdkNode {
         let state = self.handle.app_state();
         let response = block_on_sdk(sdk::async_order_new(
             state,
-            AsyncOrderNewRequest { host_node_id },
+            AsyncOrderNewRequest {
+                host_node_id,
+                username: None,
+                domain: None,
+            },
+        ))?;
+        Ok(response)
+    }
+
+    pub fn apay_new_with_address(
+        &self,
+        host_node_id: String,
+        username: String,
+        domain: String,
+    ) -> Result<AsyncOrderNewResponse, RlnError> {
+        let state = self.handle.app_state();
+        let response = block_on_sdk(sdk::async_order_new(
+            state,
+            AsyncOrderNewRequest {
+                host_node_id,
+                username: Some(username),
+                domain: Some(domain),
+            },
         ))?;
         Ok(response)
     }
@@ -1684,6 +1706,15 @@ pub fn sdk_send_rgb(request: SendRgbRequest) -> Result<SendRgbResponse, RlnError
 pub fn sdk_apay_new(host_node_id: String) -> Result<AsyncOrderNewResponse, RlnError> {
     let handle = NodeHandle::from_app_state(get_uniffi_app_state()?);
     SdkNode { handle }.apay_new(host_node_id)
+}
+
+pub fn sdk_apay_new_with_address(
+    host_node_id: String,
+    username: String,
+    domain: String,
+) -> Result<AsyncOrderNewResponse, RlnError> {
+    let handle = NodeHandle::from_app_state(get_uniffi_app_state()?);
+    SdkNode { handle }.apay_new_with_address(host_node_id, username, domain)
 }
 
 uniffi::include_scaffolding!("rgb_lightning_node");
