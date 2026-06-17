@@ -78,7 +78,7 @@ pub(crate) static FATAL_ERROR: OnceLock<String> = OnceLock::new();
 // how long a fatal shutdown waits for an in-progress state change (unlock or lock)
 const STATE_CHANGE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() -> Result<()> {
     let args = args::parse_startup_args()?;
 
