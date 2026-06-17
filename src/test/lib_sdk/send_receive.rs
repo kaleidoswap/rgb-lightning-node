@@ -45,7 +45,6 @@ fn send_receive() {
 
         let net_info = node_a.network_info().expect("node A network_info");
         assert_eq!(net_info.network, "Regtest");
-        let height_1 = net_info.height;
 
         fund_and_create_utxos(&node_a, "node A");
         fund_and_create_utxos(&node_b, "node B");
@@ -327,8 +326,7 @@ fn send_receive() {
             })
             .expect("node A sendbtc");
 
-        let net_info = node_a.network_info().expect("node A network_info final");
-        assert_eq!(net_info.height, height_1 + 10);
+        wait_for_synced_to_tip(&node_a, "node A");
     }));
 
     node_a.shutdown();

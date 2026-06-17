@@ -195,6 +195,16 @@ struct AsyncPaymentsHashEntryV1 {
 }
 
 #[derive(Clone, PartialEq, Message)]
+struct GetAsyncPaymentPreimageV1 {
+    #[prost(string, tag = "1")]
+    pub host_node_id_hex: String,
+    #[prost(uint64, tag = "2")]
+    pub hash_index: u64,
+    #[prost(string, tag = "3")]
+    pub payment_hash_hex: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
 struct SignInvoiceV1 {
     #[prost(string, tag = "1")]
     pub hrp: String,
@@ -230,7 +240,7 @@ struct SignMessageRawV1 {
 struct NodeRequestV1 {
     #[prost(
         oneof = "node_request_v1::Kind",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26"
     )]
     pub kind: Option<node_request_v1::Kind>,
 }
@@ -271,6 +281,8 @@ mod node_request_v1 {
         VerifyInboundPayment(VerifyInboundPaymentV1),
         #[prost(message, tag = "20")]
         GetPaymentPreimage(GetPaymentPreimageV1),
+        #[prost(message, tag = "26")]
+        GetAsyncPaymentPreimage(GetAsyncPaymentPreimageV1),
         #[prost(message, tag = "5")]
         Ecdh(EcdhV1),
         #[prost(message, tag = "6")]
@@ -1270,6 +1282,15 @@ impl From<NodeRequest> for NodeRequestV1 {
                 payment_hash_hex,
                 payment_secret_hex,
             }),
+            NodeRequest::GetAsyncPaymentPreimage {
+                host_node_id_hex,
+                hash_index,
+                payment_hash_hex,
+            } => node_request_v1::Kind::GetAsyncPaymentPreimage(GetAsyncPaymentPreimageV1 {
+                host_node_id_hex,
+                hash_index,
+                payment_hash_hex,
+            }),
             NodeRequest::Ecdh {
                 recipient,
                 other_key,
@@ -1387,6 +1408,13 @@ impl TryFrom<NodeRequestV1> for NodeRequest {
                 payment_hash_hex: v.payment_hash_hex,
                 payment_secret_hex: v.payment_secret_hex,
             }),
+            node_request_v1::Kind::GetAsyncPaymentPreimage(v) => {
+                Ok(Self::GetAsyncPaymentPreimage {
+                    host_node_id_hex: v.host_node_id_hex,
+                    hash_index: v.hash_index,
+                    payment_hash_hex: v.payment_hash_hex,
+                })
+            }
             node_request_v1::Kind::Ecdh(v) => Ok(Self::Ecdh {
                 recipient: v.recipient,
                 other_key: v.other_key,
@@ -2272,6 +2300,18 @@ mod tests {
     fn raw_message_request_roundtrip() {
         let request = SignerRequest::Node(NodeRequest::SignMessageRaw {
             message_hex: "00ff".to_string(),
+        });
+        let wire = encode_signer_request(&request).expect("encode");
+        let decoded = decode_signer_request(&wire).expect("decode");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn get_async_payment_preimage_request_roundtrip() {
+        let request = SignerRequest::Node(NodeRequest::GetAsyncPaymentPreimage {
+            host_node_id_hex: "03".repeat(33),
+            hash_index: 9,
+            payment_hash_hex: "ab".repeat(32),
         });
         let wire = encode_signer_request(&request).expect("encode");
         let decoded = decode_signer_request(&wire).expect("decode");

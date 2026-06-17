@@ -266,6 +266,16 @@ impl ExternalSigner {
             .prepare_async_payments_hashes(host_node_id_hex, start_index, batch_size)
     }
 
+    pub(crate) fn get_async_payment_preimage(
+        &self,
+        host_node_id_hex: String,
+        hash_index: u64,
+        payment_hash_hex: String,
+    ) -> Result<String, RlnSignerError> {
+        self.backend
+            .node_get_async_payment_preimage(host_node_id_hex, hash_index, payment_hash_hex)
+    }
+
     fn recipient_label(recipient: Recipient) -> &'static str {
         match recipient {
             Recipient::Node => "node",

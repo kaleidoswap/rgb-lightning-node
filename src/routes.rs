@@ -2897,6 +2897,8 @@ pub(crate) async fn keysend(
                 payee_pubkey: dest_pubkey,
                 description_hash: None,
                 payment_idx: None,
+                async_hash_index: None,
+                async_host_node_id: None,
 
                 updated_at: created_at,
             },
@@ -3540,6 +3542,8 @@ pub(crate) async fn ln_invoice(
                 invoice_type: Some(invoice_type),
                 description_hash: description_hash_from_invoice(&invoice),
                 payment_idx: None,
+                async_hash_index: None,
+                async_host_node_id: None,
             },
         );
 
@@ -4642,6 +4646,8 @@ pub(crate) async fn send_payment(
                     invoice_type: None,
                     description_hash: None,
                     payment_idx: None,
+                    async_hash_index: None,
+                    async_host_node_id: None,
                 },
             )?;
 
@@ -4750,6 +4756,8 @@ pub(crate) async fn send_payment(
                     invoice_type: None,
                     description_hash: description_hash_from_invoice(&invoice),
                     payment_idx: None,
+                    async_hash_index: None,
+                    async_host_node_id: None,
                 },
             )?;
             let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());

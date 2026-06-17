@@ -89,6 +89,12 @@ pub(crate) trait ExternalSignerBackend: Send + Sync {
         start_index: u64,
         batch_size: u32,
     ) -> Result<Vec<AsyncPaymentsHashEntry>, RlnSignerError>;
+    fn node_get_async_payment_preimage(
+        &self,
+        host_node_id_hex: String,
+        hash_index: u64,
+        payment_hash_hex: String,
+    ) -> Result<String, RlnSignerError>;
     fn generate_channel_keys_id(
         &self,
         inbound: bool,
@@ -452,6 +458,28 @@ impl ExternalSignerBackend for VlsSignerAdapter {
             }
             other => Err(RlnSignerError::Protocol(format!(
                 "unexpected response for prepare_async_payments_hashes: {other:?}"
+            ))),
+        }
+    }
+
+    fn node_get_async_payment_preimage(
+        &self,
+        host_node_id_hex: String,
+        hash_index: u64,
+        payment_hash_hex: String,
+    ) -> Result<String, RlnSignerError> {
+        match self.call(ExternalSignerRequest::Node(
+            ExternalNodeRequest::GetAsyncPaymentPreimage {
+                host_node_id_hex,
+                hash_index,
+                payment_hash_hex,
+            },
+        ))? {
+            ExternalSignerResponse::Node(ExternalNodeResponse::PaymentPreimage {
+                payment_preimage_hex,
+            }) => Ok(payment_preimage_hex),
+            other => Err(RlnSignerError::Protocol(format!(
+                "unexpected response for node_get_async_payment_preimage: {other:?}"
             ))),
         }
     }

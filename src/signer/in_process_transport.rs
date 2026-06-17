@@ -199,6 +199,15 @@ mod tests {
             Err(RlnSignerError::Unsupported("unused".to_string()))
         }
 
+        fn node_get_async_payment_preimage(
+            &self,
+            _host_node_id_hex: String,
+            _hash_index: u64,
+            _payment_hash_hex: String,
+        ) -> Result<String, RlnSignerError> {
+            Err(RlnSignerError::Unsupported("unused".to_string()))
+        }
+
         fn generate_channel_keys_id(
             &self,
             _inbound: bool,

@@ -2524,6 +2524,8 @@ pub(crate) async fn keysend(
             invoice_type: None,
             description_hash: None,
             payment_idx: None,
+            async_hash_index: None,
+            async_host_node_id: None,
         },
     )?;
     if let Some((contract_id, rgb_amount)) = rgb_payment {
@@ -3044,6 +3046,8 @@ pub(crate) async fn send_payment(
                 invoice_type: None,
                 description_hash: None,
                 payment_idx: None,
+                async_hash_index: None,
+                async_host_node_id: None,
             },
         )?;
 
@@ -3142,6 +3146,8 @@ pub(crate) async fn send_payment(
                 invoice_type: None,
                 description_hash: crate::routes::description_hash_from_invoice(&invoice),
                 payment_idx: None,
+                async_hash_index: None,
+                async_host_node_id: None,
             },
         )?;
         let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
@@ -3750,6 +3756,8 @@ pub(crate) async fn create_ln_invoice(
             invoice_type: Some(invoice_type),
             description_hash: crate::routes::description_hash_from_invoice(&invoice),
             payment_idx: None,
+            async_hash_index: None,
+            async_host_node_id: None,
         },
     );
 
@@ -4476,6 +4484,15 @@ mod tests {
             _start_index: u64,
             _batch_size: u32,
         ) -> Result<Vec<crate::signer::types::AsyncPaymentsHashEntry>, RlnSignerError> {
+            Self::unsupported()
+        }
+
+        fn node_get_async_payment_preimage(
+            &self,
+            _host_node_id_hex: String,
+            _hash_index: u64,
+            _payment_hash_hex: String,
+        ) -> Result<String, RlnSignerError> {
             Self::unsupported()
         }
 

@@ -144,9 +144,9 @@ use crate::signer::{
 use crate::swap::SwapData;
 use crate::utils::{
     check_port_is_available, connect_peer_if_necessary, do_connect_peer, get_current_timestamp,
-    hex_str, validate_and_parse_payment_hash, AppState, StaticState, UnlockedAppState,
-    ELECTRUM_URL_MAINNET, ELECTRUM_URL_REGTEST, ELECTRUM_URL_SIGNET, ELECTRUM_URL_TESTNET,
-    ELECTRUM_URL_TESTNET4, PROXY_ENDPOINT_LOCAL, PROXY_ENDPOINT_PUBLIC,
+    hex_str, validate_and_parse_payment_hash, validate_and_parse_payment_preimage, AppState,
+    StaticState, UnlockedAppState, ELECTRUM_URL_MAINNET, ELECTRUM_URL_REGTEST, ELECTRUM_URL_SIGNET,
+    ELECTRUM_URL_TESTNET, ELECTRUM_URL_TESTNET4, PROXY_ENDPOINT_LOCAL, PROXY_ENDPOINT_PUBLIC,
 };
 
 const VIRTUAL_CHANNEL_DOMAIN_SEPARATOR: &[u8] = b"rln_virtual_channels_v0";
@@ -254,6 +254,8 @@ pub(crate) struct PaymentInfo {
     pub(crate) invoice_type: Option<InvoiceType>,
     pub(crate) description_hash: Option<[u8; 32]>,
     pub(crate) payment_idx: Option<u64>,
+    pub(crate) async_hash_index: Option<u64>,
+    pub(crate) async_host_node_id: Option<PublicKey>,
 }
 
 impl_writeable_tlv_based!(PaymentInfo, {
@@ -269,6 +271,8 @@ impl_writeable_tlv_based!(PaymentInfo, {
     (18, invoice_type, option),
     (20, description_hash, option),
     (22, payment_idx, option),
+    (24, async_hash_index, option),
+    (26, async_host_node_id, option),
 });
 
 pub(crate) struct InboundPaymentInfoStorage {
@@ -677,6 +681,8 @@ impl UnlockedAppState {
                     invoice_type,
                     description_hash: None,
                     payment_idx: None,
+                    async_hash_index: None,
+                    async_host_node_id: None,
                 };
                 self.stamp_payment_idx(&mut payment_info);
                 e.insert(payment_info);
@@ -1132,6 +1138,8 @@ struct AsyncOrderRecipientInvoiceProvider {
     async_payments_preimage_root: Arc<AsyncPaymentsPreimageRoot>,
     kv_store: Arc<SyncedKvStore>,
     next_payment_idx: Arc<std::sync::atomic::AtomicU64>,
+    external_signer_mode: bool,
+    external_signer: Option<Arc<ExternalSigner>>,
 }
 
 impl AsyncOrderRecipientInvoiceProvider {
@@ -1149,7 +1157,7 @@ impl AsyncOrderRecipientInvoiceProvider {
 impl AsyncOrderInvoiceProvider for AsyncOrderRecipientInvoiceProvider {
     fn request_outbound_invoice(
         &self,
-        _sender_node_id: PublicKey,
+        sender_node_id: PublicKey,
         params: AsyncOrderRequestInvoiceParamsWire,
     ) -> Result<AsyncOrderOutboundInvoiceResultWire, JsonRpcErrorWire> {
         let hash_index = Self::parse_u64_field(&params.hash_index, "hash_index")?;
@@ -1179,21 +1187,48 @@ impl AsyncOrderInvoiceProvider for AsyncOrderRecipientInvoiceProvider {
         };
 
         let requested_payment_hash = validate_and_parse_payment_hash(&params.payment_hash)
-            .map_err(|_| {
-                JsonRpcErrorWire::application_error(
-                    ASYNC_ERROR_INVOICE_HASH_MISMATCH,
-                    "invoice_hash_mismatch",
+            .map_err(|_| JsonRpcErrorWire::invalid_params("async_order_invalid_payment_hash"))?;
+
+        let invoice_preimage = if self.external_signer_mode {
+            let external_signer = self.external_signer.as_ref().ok_or_else(|| {
+                JsonRpcErrorWire::internal_error(
+                    "async_order_external_signer_unavailable".to_owned(),
                 )
             })?;
-        let material = self
-            .async_payments_preimage_root
-            .derive_hash_material(hash_index)?;
-        if material.payment_hash != requested_payment_hash {
-            return Err(JsonRpcErrorWire::application_error(
-                ASYNC_ERROR_INVOICE_HASH_MISMATCH,
-                "invoice_hash_mismatch",
-            ));
-        }
+            let derived = external_signer
+                .prepare_async_payments_hashes(hex_str(&sender_node_id.serialize()), hash_index, 1)
+                .map_err(|err| {
+                    JsonRpcErrorWire::internal_error(format!(
+                        "async_order_signer_derive_failed: {err}"
+                    ))
+                })?;
+            let derived_hash = derived
+                .first()
+                .and_then(|entry| validate_and_parse_payment_hash(&entry.payment_hash_hex).ok())
+                .ok_or_else(|| {
+                    JsonRpcErrorWire::internal_error(
+                        "async_order_external_signer_derived_hash_error".to_owned(),
+                    )
+                })?;
+            if derived_hash != requested_payment_hash {
+                return Err(JsonRpcErrorWire::application_error(
+                    ASYNC_ERROR_INVOICE_HASH_MISMATCH,
+                    "invoice_hash_mismatch",
+                ));
+            }
+            None
+        } else {
+            let material = self
+                .async_payments_preimage_root
+                .derive_hash_material(hash_index)?;
+            if material.payment_hash != requested_payment_hash {
+                return Err(JsonRpcErrorWire::application_error(
+                    ASYNC_ERROR_INVOICE_HASH_MISMATCH,
+                    "invoice_hash_mismatch",
+                ));
+            }
+            Some(material.payment_preimage)
+        };
 
         let mut inbound = self.inbound_payments.lock().unwrap();
         if let Some(existing) = inbound.payments.get(&requested_payment_hash) {
@@ -1243,7 +1278,7 @@ impl AsyncOrderInvoiceProvider for AsyncOrderRecipientInvoiceProvider {
             &mut inbound,
             requested_payment_hash,
             PaymentInfo {
-                preimage: Some(material.payment_preimage),
+                preimage: invoice_preimage,
                 secret: Some(*invoice.payment_secret()),
                 status: HTLCStatus::Pending,
                 amt_msat: Some(amount_msat),
@@ -1257,6 +1292,8 @@ impl AsyncOrderInvoiceProvider for AsyncOrderRecipientInvoiceProvider {
                 }),
                 description_hash: crate::routes::description_hash_from_invoice(&invoice),
                 payment_idx: None,
+                async_hash_index: self.external_signer_mode.then_some(hash_index),
+                async_host_node_id: self.external_signer_mode.then_some(sender_node_id),
             },
         )?;
 
@@ -2128,14 +2165,68 @@ async fn handle_ldk_events(
                 InvoiceType::Hodl {
                     async_payment_recipient: true,
                 } => {
-                    let Some(stored_preimage) = invoice.preimage else {
-                        tracing::error!(
-                            "Missing stored preimage for async recipient invoice {:?}",
-                            payment_hash
-                        );
-                        return Err(ReplayEvent());
+                    let async_preimage = match invoice.preimage {
+                        Some(preimage) => preimage,
+                        None if unlocked_state.external_signer_mode => {
+                            let (
+                                Some(external_signer),
+                                Some(async_host_node_id),
+                                Some(async_hash_index),
+                            ) = (
+                                unlocked_state.external_signer.as_ref(),
+                                invoice.async_host_node_id,
+                                invoice.async_hash_index,
+                            )
+                            else {
+                                tracing::error!(
+                                    "Async recipient invoice for payment hash {:?} is missing the external-signer claim context",
+                                    payment_hash
+                                );
+                                return Err(ReplayEvent());
+                            };
+                            match external_signer.get_async_payment_preimage(
+                                hex_str(&async_host_node_id.serialize()),
+                                async_hash_index,
+                                hex_str(&payment_hash.0),
+                            ) {
+                                Ok(preimage_hex) => {
+                                    match validate_and_parse_payment_preimage(
+                                        &preimage_hex,
+                                        &payment_hash,
+                                    ) {
+                                        Ok(preimage) => preimage,
+                                        Err(_) => {
+                                            tracing::error!(
+                                                "The external signer returned an invalid async preimage for payment hash {:?}; failing back",
+                                                payment_hash
+                                            );
+                                            unlocked_state
+                                                .fail_htlc_backwards_and_update_inbound_payment(
+                                                    payment_hash,
+                                                    HTLCStatus::Failed,
+                                                );
+                                            return Ok(());
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        "Async preimage fetch from external signer failed for payment hash {:?}: {err}; will retry",
+                                        payment_hash
+                                    );
+                                    return Err(ReplayEvent());
+                                }
+                            }
+                        }
+                        None => {
+                            tracing::error!(
+                                "Missing stored preimage for async recipient invoice {:?}",
+                                payment_hash
+                            );
+                            return Err(ReplayEvent());
+                        }
                     };
-                    unlocked_state.channel_manager.claim_funds(stored_preimage);
+                    unlocked_state.channel_manager.claim_funds(async_preimage);
                 }
                 InvoiceType::Hodl {
                     async_payment_recipient: false,
@@ -4690,6 +4781,8 @@ pub(crate) async fn start_ldk(
         async_payments_preimage_root: Arc::clone(&async_payments_preimage_root),
         kv_store: Arc::clone(&kv_store),
         next_payment_idx: Arc::clone(&next_payment_idx),
+        external_signer_mode,
+        external_signer: external_signer.clone(),
     }));
 
     let unlocked_state = Arc::new(UnlockedAppState {

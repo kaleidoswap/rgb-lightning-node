@@ -362,6 +362,32 @@ pub(crate) fn wait_for_asset_balance(
     }
 }
 
+pub(crate) fn wait_for_synced_to_tip(node: &SdkNode, node_name: &str) {
+    let tip = get_block_count();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last_sync_err = None;
+    loop {
+        if let Err(err) = node.sync() {
+            last_sync_err = Some(format!("{err:?}"));
+        }
+        let height = node
+            .network_info()
+            .unwrap_or_else(|err| {
+                panic!("{node_name}: network_info while waiting for tip: {err:?}")
+            })
+            .height;
+        if height >= tip {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{node_name}: chain height {height} did not reach tip {tip} within 30s \
+             (last sync error: {last_sync_err:?})"
+        );
+        sleep(Duration::from_secs(1));
+    }
+}
+
 pub(crate) fn wait_for_channel_funding_tx(
     node_a: &SdkNode,
     node_b: &SdkNode,
