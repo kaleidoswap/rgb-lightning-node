@@ -1510,6 +1510,10 @@ impl From<UnlockRequest> for CoreUnlockRequest {
 pub(crate) struct Unspent {
     pub(crate) utxo: Utxo,
     pub(crate) rgb_allocations: Vec<RgbAllocation>,
+    /// Number of pending blind receive operations reserving this UTXO. A
+    /// colorable UTXO with empty `rgb_allocations` but `pending_blinded > 0` is
+    /// already reserved and is not allocatable.
+    pub(crate) pending_blinded: u32,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -3429,6 +3433,7 @@ pub(crate) async fn list_unspents(
                     settled: a.settled,
                 })
                 .collect(),
+            pending_blinded: unspent.pending_blinded,
         })
     }
 
