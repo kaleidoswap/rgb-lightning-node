@@ -104,7 +104,7 @@ use crate::bitcoind::BitcoindClient;
 use crate::chain_backend::ChainBackend;
 use crate::core_types::{
     HTLCStatus, NodeKeySource, SwapStatus, UnlockRequest, DUST_LIMIT_MSAT, FEE_RATE, HTLC_MIN_MSAT,
-    MIN_CHANNEL_CONFIRMATIONS,
+    MIN_CHANNEL_CONFIRMATIONS, VIRTUAL_HTLC_MIN_MSAT,
 };
 use crate::database::RlnDatabase;
 use crate::disk::{self, FilesystemLogger};
@@ -1162,9 +1162,16 @@ impl AsyncOrderInvoiceProvider for AsyncOrderRecipientInvoiceProvider {
     ) -> Result<AsyncOrderOutboundInvoiceResultWire, JsonRpcErrorWire> {
         let hash_index = Self::parse_u64_field(&params.hash_index, "hash_index")?;
         let amount_msat = params.amount_msat;
-        if amount_msat < HTLC_MIN_MSAT {
+        let htlc_min_msat = if self.channel_manager.list_channels().iter().any(|channel| {
+            channel.counterparty.node_id == sender_node_id && channel.trusted_no_broadcast
+        }) {
+            VIRTUAL_HTLC_MIN_MSAT
+        } else {
+            HTLC_MIN_MSAT
+        };
+        if amount_msat < htlc_min_msat {
             return Err(JsonRpcErrorWire::invalid_params(format!(
-                "amt_msat cannot be less than {HTLC_MIN_MSAT}"
+                "amt_msat cannot be less than {htlc_min_msat}"
             )));
         }
         if matches!(params.asset_amount, Some(0)) {

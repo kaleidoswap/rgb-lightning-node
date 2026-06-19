@@ -37,7 +37,7 @@ use tokio::sync::{Mutex as TokioMutex, MutexGuard as TokioMutexGuard};
 use tokio_util::sync::CancellationToken;
 
 use crate::async_order::{AsyncOrderMessageHandler, AsyncPaymentsPreimageRoot};
-use crate::core_types::{DEFAULT_FINAL_CLTV_EXPIRY_DELTA, HTLC_MIN_MSAT};
+use crate::core_types::{DEFAULT_FINAL_CLTV_EXPIRY_DELTA, HTLC_MIN_MSAT, VIRTUAL_HTLC_MIN_MSAT};
 use crate::ldk::{ChannelIdsMap, Router, VirtualChannelDraftStore, VirtualChannelSessionStore};
 use crate::rgb::{get_rgb_channel_info_optional, RgbLibWalletWrapper};
 use crate::signer::{
@@ -260,6 +260,31 @@ impl UnlockedAppState {
         &self,
     ) -> MutexGuard<'_, VirtualChannelSessionStore> {
         self.virtual_channel_session_store.lock().unwrap()
+    }
+
+    pub(crate) fn htlc_min_msat_for_asset(&self, contract_id: &ContractId) -> u64 {
+        self.channel_manager
+            .list_channels()
+            .iter()
+            .filter(|chan_info| {
+                get_rgb_channel_info_optional(&chan_info.channel_id, false, self.kv_store.as_ref())
+                    .is_some_and(|rgb_info| rgb_info.contract_id == *contract_id)
+            })
+            .filter_map(|chan_info| chan_info.inbound_htlc_minimum_msat)
+            .min()
+            .unwrap_or(HTLC_MIN_MSAT)
+    }
+
+    pub(crate) fn htlc_min_msat_for_peer(&self, peer: PublicKey) -> u64 {
+        let has_virtual =
+            self.channel_manager.list_channels().iter().any(|channel| {
+                channel.trusted_no_broadcast && channel.counterparty.node_id == peer
+            });
+        if has_virtual {
+            VIRTUAL_HTLC_MIN_MSAT
+        } else {
+            HTLC_MIN_MSAT
+        }
     }
 
     pub(crate) fn prepare_apay_order_params(

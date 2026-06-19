@@ -9,7 +9,7 @@ use crate::core_types::async_order::{
     AsyncOrderNewRequest, AsyncOrderNewResponse, AsyncOrderOutboundInvoiceRequest,
     AsyncOrderOutboundInvoiceResponse,
 };
-use crate::core_types::{FEE_RATE, MIN_CHANNEL_CONFIRMATIONS};
+use crate::core_types::{FEE_RATE, MIN_CHANNEL_CONFIRMATIONS, VIRTUAL_HTLC_MIN_MSAT};
 use crate::error::APIError;
 use crate::ldk::{
     clear_rgb_payment_pending, start_ldk, write_rgb_payment_info_file, InvoiceType, PaymentInfo,
@@ -100,7 +100,6 @@ const SDK_OPENRGBCHANNEL_MIN_SAT: u64 = SDK_HTLC_MIN_MSAT / 1000 * 10 + 10;
 const SDK_OPENCHANNEL_MIN_SAT: u64 = 5506;
 const SDK_OPENCHANNEL_MAX_SAT: u64 = 16_777_215;
 const SDK_OPENCHANNEL_MIN_RGB_AMT: u64 = 1;
-const SDK_INVOICE_MIN_MSAT: u64 = SDK_HTLC_MIN_MSAT;
 const SDK_UTXO_NUM: u8 = 4;
 const SDK_UTXO_SIZE_SAT: u32 = 32_000;
 const SDK_DUST_LIMIT_MSAT: u64 = 546_000;
@@ -2480,9 +2479,10 @@ pub(crate) async fn keysend(
     };
 
     let amt_msat = request.amt_msat;
-    if amt_msat < SDK_HTLC_MIN_MSAT {
+    let htlc_min_msat = unlocked_state.htlc_min_msat_for_peer(dest_pubkey);
+    if amt_msat < htlc_min_msat {
         return Err(APIError::InvalidAmount(format!(
-            "amt_msat cannot be less than {SDK_HTLC_MIN_MSAT}"
+            "amt_msat cannot be less than {htlc_min_msat}"
         )));
     }
 
@@ -2836,7 +2836,11 @@ pub(crate) async fn open_channel(
             } else {
                 request.public
             },
-            our_htlc_minimum_msat: SDK_HTLC_MIN_MSAT,
+            our_htlc_minimum_msat: if is_virtual_open {
+                VIRTUAL_HTLC_MIN_MSAT
+            } else {
+                SDK_HTLC_MIN_MSAT
+            },
             minimum_depth: if is_virtual_open {
                 0
             } else {
@@ -2958,6 +2962,7 @@ pub(crate) async fn open_channel(
             Some(config),
             consignment_endpoint,
             request.push_asset_amount,
+            is_virtual_open,
         )
         .map_err(|e| {
             if let Some(temp_id_str) = rgb_metadata_temp_id_str.as_deref() {
@@ -3095,19 +3100,21 @@ pub(crate) async fn send_payment(
             invoice.amount_milli_satoshis().unwrap_or(0)
         };
 
+        // A trusted never-broadcast (virtual) channel to the payee allows a sub-dust asset HTLC.
+        let send_min_msat = unlocked_state.htlc_min_msat_for_peer(invoice.recover_payee_pub_key());
         let rgb_payment = match (invoice.rgb_contract_id(), invoice.rgb_amount()) {
             (Some(rgb_contract_id), Some(rgb_amount)) => {
-                if amt_msat < SDK_INVOICE_MIN_MSAT {
+                if amt_msat < send_min_msat {
                     return Err(APIError::InvalidAmount(format!(
-                            "amt_msat in invoice sending an RGB asset cannot be less than {SDK_INVOICE_MIN_MSAT}"
+                            "amt_msat in invoice sending an RGB asset cannot be less than {send_min_msat}"
                         )));
                 }
                 Some((rgb_contract_id, rgb_amount))
             }
             (Some(rgb_contract_id), None) => {
-                if amt_msat < SDK_INVOICE_MIN_MSAT {
+                if amt_msat < send_min_msat {
                     return Err(APIError::InvalidAmount(format!(
-                            "amt_msat in invoice sending an RGB asset cannot be less than {SDK_INVOICE_MIN_MSAT}"
+                            "amt_msat in invoice sending an RGB asset cannot be less than {send_min_msat}"
                         )));
                 }
                 if let Some(asset_id) = request.asset_id.as_ref() {
@@ -3683,11 +3690,16 @@ pub(crate) async fn create_ln_invoice(
         None
     };
 
-    if contract_id.is_some() && amt_msat.unwrap_or(0) < SDK_INVOICE_MIN_MSAT {
-        return Err(APIError::InvalidAmount(format!(
-            "amt_msat cannot be less than {} when transferring an RGB asset",
-            SDK_INVOICE_MIN_MSAT
-        )));
+    if let Some(contract_id) = &contract_id {
+        // Only lower the floor when the asset is held in a virtual channel; a regular channel
+        // carrying this asset keeps the standard floor.
+        let invoice_min_msat = unlocked_state.htlc_min_msat_for_asset(contract_id);
+        if amt_msat.unwrap_or(0) < invoice_min_msat {
+            return Err(APIError::InvalidAmount(format!(
+                "amt_msat cannot be less than {} when transferring an RGB asset",
+                invoice_min_msat
+            )));
+        }
     }
 
     let created_at = get_current_timestamp();

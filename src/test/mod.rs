@@ -33,7 +33,7 @@ use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tracing_test::traced_test;
 
-use crate::core_types::{HTLCStatus, SwapStatus, FEE_RATE, HTLC_MIN_MSAT};
+use crate::core_types::{HTLCStatus, SwapStatus, FEE_RATE, HTLC_MIN_MSAT, VIRTUAL_HTLC_MIN_MSAT};
 use crate::disk::LDK_LOGS_FILE;
 use crate::error::{APIError, APIErrorResponse};
 use crate::kv_store::SeaOrmKvStore;
