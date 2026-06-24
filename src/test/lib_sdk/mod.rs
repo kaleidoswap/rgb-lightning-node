@@ -2,6 +2,7 @@
 
 pub(crate) mod helpers;
 
+mod apay;
 mod close_coop_other_side;
 mod close_coop_standard;
 mod close_coop_vanilla;

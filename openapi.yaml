@@ -50,7 +50,7 @@ paths:
       tags:
         - Async Payments
       summary: Send a new order with async-payment hashes
-      description: Derive deterministic payment hashes for async payments from the unlocked wallet. Send an async_order.new JSON-RPC request to the connected invoice-host peer so it can track those hashes and process asynchronous payments.
+      description: Derive deterministic payment hashes for async payments from the unlocked wallet. Send an async_order.new JSON-RPC request to the connected invoice-host peer so it can track those hashes and process asynchronous payments. A peer connection alone is not sufficient; the recipient-client must already have a live channel with the invoice-host peer. 
       requestBody:
         content:
           application/json:
@@ -68,7 +68,7 @@ paths:
       tags:
         - Async Payments
       summary: Request an outbound LN invoice
-      description: Request an outbound invoice from the connected recipient peer for an async payment claim session.
+      description: Request an outbound invoice from the connected recipient-client peer for an async payment claim session. A peer connection alone is not enough; the invoice-host must already have a live channel with the recipient-client peer.
       requestBody:
         content:
           application/json:

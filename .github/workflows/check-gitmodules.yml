@@ -1,0 +1,76 @@
+name: Check gitmodules
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  check-gitmodules:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Enforce rust-lightning submodule source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SUBMODULE="rust-lightning"
+          EXPECTED_PATH="rust-lightning"
+          EXPECTED_URL="https://github.com/UTEXO-Protocol/rust-lightning.git"
+          EXPECTED_BRANCH="dev"
+
+          actual_path="$(git config -f .gitmodules --get "submodule.${SUBMODULE}.path" || true)"
+          actual_url="$(git config -f .gitmodules --get "submodule.${SUBMODULE}.url" || true)"
+          actual_branch="$(git config -f .gitmodules --get "submodule.${SUBMODULE}.branch" || true)"
+
+          if [[ "$actual_path" != "$EXPECTED_PATH" ]]; then
+            echo "::error file=.gitmodules::Invalid ${SUBMODULE} path: '${actual_path}'. Expected '${EXPECTED_PATH}'"
+            exit 1
+          fi
+
+          if [[ "$actual_url" != "$EXPECTED_URL" ]]; then
+            echo "::error file=.gitmodules::Invalid ${SUBMODULE} url: '${actual_url}'. Expected '${EXPECTED_URL}'"
+            exit 1
+          fi
+
+          if [[ "$actual_branch" != "$EXPECTED_BRANCH" ]]; then
+            echo "::error file=.gitmodules::Invalid ${SUBMODULE} branch: '${actual_branch}'. Expected '${EXPECTED_BRANCH}'"
+            exit 1
+          fi
+
+          echo ".gitmodules check passed"
+
+      - name: Verify pinned submodule commit is on dev
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SUBMODULE="rust-lightning"
+          EXPECTED_URL="https://github.com/UTEXO-Protocol/rust-lightning.git"
+          EXPECTED_BRANCH="dev"
+
+          ls_tree="$(git ls-tree HEAD "$SUBMODULE" || true)"
+          read -r mode type commit path <<<"$ls_tree"
+
+          if [[ "$mode" != "160000" || "$type" != "commit" || "$path" != "$SUBMODULE" || -z "$commit" ]]; then
+            echo "::error::${SUBMODULE} is not a pinned git submodule commit"
+            exit 1
+          fi
+
+          tmpdir="$(mktemp -d)"
+          trap 'rm -rf "$tmpdir"' EXIT
+
+          git init "$tmpdir"
+          git -C "$tmpdir" remote add utexo "$EXPECTED_URL"
+          git -C "$tmpdir" fetch --no-tags --filter=blob:none utexo \
+            "+refs/heads/${EXPECTED_BRANCH}:refs/remotes/utexo/${EXPECTED_BRANCH}"
+
+          if ! git -C "$tmpdir" merge-base --is-ancestor "$commit" "refs/remotes/utexo/${EXPECTED_BRANCH}"; then
+            echo "::error::Submodule commit ${commit} is not reachable from ${EXPECTED_BRANCH}"
+            exit 1
+          fi
+
+          echo "Submodule commit is reachable from ${EXPECTED_BRANCH}"

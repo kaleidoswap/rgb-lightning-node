@@ -2619,25 +2619,27 @@ mod tests {
     fn async_order_rejects_untrusted_peers_without_response() {
         let handler = AsyncOrderMessageHandler::new(Arc::new(DenyAllAccess));
         let test_peer = test_peer_pubkey(9);
-        let request_id = new_jsonrpc_request_id();
-        let request_payload = new_order_request_payload(
-            &request_id,
-            &[(
-                1,
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            )],
-        );
+        let cases = [
+            new_order_request_payload(
+                &new_jsonrpc_request_id(),
+                &[(
+                    1,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )],
+            ),
+            request_invoice_payload(
+                &new_jsonrpc_request_id(),
+                ASYNC_ORDER_REQUEST_INVOICE_METHOD,
+                &test_request_invoice_params(),
+            ),
+        ];
 
-        handler
-            .handle_custom_message(
-                AsyncOrderMessage {
-                    payload: request_payload,
-                },
-                test_peer,
-            )
-            .unwrap();
-
-        assert!(handler.get_and_clear_pending_msg().is_empty());
+        for payload in cases {
+            handler
+                .handle_custom_message(AsyncOrderMessage { payload }, test_peer)
+                .unwrap();
+            assert!(handler.get_and_clear_pending_msg().is_empty());
+        }
     }
 
     #[tokio::test]

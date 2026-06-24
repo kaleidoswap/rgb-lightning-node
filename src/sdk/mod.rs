@@ -12,8 +12,8 @@ use crate::core_types::async_order::{
 use crate::core_types::{FEE_RATE, MIN_CHANNEL_CONFIRMATIONS, VIRTUAL_HTLC_MIN_MSAT};
 use crate::error::APIError;
 use crate::ldk::{
-    clear_rgb_payment_pending, start_ldk, write_rgb_payment_info_file, InvoiceType, PaymentInfo,
-    VirtualChannelSessionStatus,
+    clear_rgb_payment_pending, peer_has_live_channel, start_ldk, write_rgb_payment_info_file,
+    InvoiceType, PaymentInfo, VirtualChannelSessionStatus,
 };
 #[cfg(feature = "vss")]
 use crate::ldk::{derive_vss_identity, derive_vss_identity_from_key_source};
@@ -1166,7 +1166,12 @@ pub(crate) async fn async_order_new(
         .is_none()
     {
         return Err(APIError::InvalidPeerInfo(s!(
-            "/apay/new requires a connected host peer"
+            "/apay/new requires a connected invoice-host peer"
+        )));
+    }
+    if !peer_has_live_channel(&unlocked_state.channel_manager, &host_node_id) {
+        return Err(APIError::InvalidPeerInfo(s!(
+            "/apay/new requires a live channel with the invoice-host peer"
         )));
     }
 
@@ -1267,7 +1272,12 @@ pub(crate) async fn async_order_outbound_invoice(
         .is_none()
     {
         return Err(APIError::InvalidPeerInfo(s!(
-            "/apay/outboundinvoice requires a connected recipient peer"
+            "/apay/outboundinvoice requires a connected recipient-client peer"
+        )));
+    }
+    if !peer_has_live_channel(&unlocked_state.channel_manager, &peer_node_id) {
+        return Err(APIError::InvalidPeerInfo(s!(
+            "/apay/outboundinvoice requires a live channel with the recipient-client peer"
         )));
     }
 

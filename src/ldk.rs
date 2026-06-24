@@ -1098,37 +1098,47 @@ pub(crate) type OutputSweeper = ldk_sweep::OutputSweeper<
     Arc<RgbOutputSpender>,
 >;
 
-struct VirtualChannelAccess {
-    trusted_no_broadcast: bool,
-    virtual_peer_pubkeys: Vec<PublicKey>,
+trait LiveChannelLookup: Send + Sync {
+    fn peer_has_live_channel(&self, peer: &PublicKey) -> bool;
+}
+
+pub(crate) fn peer_has_live_channel(channel_manager: &ChannelManager, peer: &PublicKey) -> bool {
+    channel_manager
+        .list_usable_channels()
+        .iter()
+        .any(|channel| channel.counterparty.node_id == *peer)
+}
+
+struct UsablePeerChannelLookup {
     channel_manager: Arc<ChannelManager>,
 }
 
-impl VirtualChannelAccess {
-    fn new(static_state: &StaticState, channel_manager: Arc<ChannelManager>) -> Self {
-        Self {
-            trusted_no_broadcast: static_state.enable_virtual_channels_v0,
-            virtual_peer_pubkeys: static_state.virtual_peer_pubkeys.clone(),
-            channel_manager,
-        }
-    }
-
-    fn is_virtual_peer(&self, peer: &PublicKey) -> bool {
-        self.virtual_peer_pubkeys.is_empty()
-            || self
-                .virtual_peer_pubkeys
-                .iter()
-                .any(|virtual_peer| virtual_peer == peer)
+impl LiveChannelLookup for UsablePeerChannelLookup {
+    fn peer_has_live_channel(&self, peer: &PublicKey) -> bool {
+        peer_has_live_channel(&self.channel_manager, peer)
     }
 }
 
-impl AsyncOrderAccessControl for VirtualChannelAccess {
+struct LiveChannelAccess {
+    lookup: Arc<dyn LiveChannelLookup>,
+}
+
+impl LiveChannelAccess {
+    fn new(channel_manager: Arc<ChannelManager>) -> Self {
+        Self {
+            lookup: Arc::new(UsablePeerChannelLookup { channel_manager }),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_lookup(lookup: Arc<dyn LiveChannelLookup>) -> Self {
+        Self { lookup }
+    }
+}
+
+impl AsyncOrderAccessControl for LiveChannelAccess {
     fn allows_peer(&self, peer: &PublicKey) -> bool {
-        self.trusted_no_broadcast
-            && self.is_virtual_peer(peer)
-            && self.channel_manager.list_channels().iter().any(|channel| {
-                channel.counterparty.node_id == *peer && channel.trusted_no_broadcast
-            })
+        self.lookup.peer_has_live_channel(peer)
     }
 }
 
@@ -4436,18 +4446,15 @@ pub(crate) async fn start_ldk(
         .as_secs();
     rand::thread_rng().fill_bytes(&mut ephemeral_bytes);
 
-    let virtual_channel_access = Arc::new(VirtualChannelAccess::new(
-        static_state,
-        channel_manager.clone(),
-    ));
+    let live_channel_access = Arc::new(LiveChannelAccess::new(channel_manager.clone()));
     let async_order_handler = match static_state.lsp_base_url.as_ref() {
         Some(lsp_base_url) => Arc::new(AsyncOrderMessageHandler::new_with_lsp_client(
-            virtual_channel_access,
+            live_channel_access,
             lsp_base_url.clone(),
             static_state.lsp_bearer_token.clone(),
             Handle::current(),
         )),
-        None => Arc::new(AsyncOrderMessageHandler::new(virtual_channel_access)),
+        None => Arc::new(AsyncOrderMessageHandler::new(live_channel_access)),
     };
     let async_payments_preimage_root = Arc::new(
         match internal_mnemonic.as_ref() {
@@ -5148,11 +5155,59 @@ mod tests {
     use lightning::rgb_utils::RgbInfo;
     use rln_migration::{Migrator, MigratorTrait};
     use sea_orm::{ConnectOptions, Database};
-    use std::str::FromStr;
+    use std::{collections::HashSet, str::FromStr, sync::Mutex};
 
     fn test_contract_id() -> rgb_lib::ContractId {
         rgb_lib::ContractId::from_str("rgb:EIkAVQvq-WbAb5JG-CYxbUER-oqDNwne-ZNxBDID-p0cpf9U")
             .unwrap()
+    }
+
+    fn test_peer_pubkey(tag: u8) -> PublicKey {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let mut key_bytes = [0u8; 32];
+        key_bytes[31] = tag.max(1);
+        let secret_key = bitcoin::secp256k1::SecretKey::from_slice(&key_bytes).unwrap();
+        PublicKey::from_secret_key(&secp, &secret_key)
+    }
+
+    struct MockPeerChannelLookup {
+        live_peers: Mutex<HashSet<PublicKey>>,
+    }
+
+    impl MockPeerChannelLookup {
+        fn new(peers: impl IntoIterator<Item = PublicKey>) -> Self {
+            Self {
+                live_peers: Mutex::new(peers.into_iter().collect()),
+            }
+        }
+    }
+
+    impl LiveChannelLookup for MockPeerChannelLookup {
+        fn peer_has_live_channel(&self, peer: &PublicKey) -> bool {
+            self.live_peers.lock().unwrap().contains(peer)
+        }
+    }
+
+    #[test]
+    fn live_channel_access_follows_peer_lookup() {
+        let allowed_peer = test_peer_pubkey(1);
+        let denied_peer = test_peer_pubkey(2);
+        let lookup = Arc::new(MockPeerChannelLookup::new([allowed_peer]));
+        let access = LiveChannelAccess::new_with_lookup(lookup);
+
+        assert!(access.allows_peer(&allowed_peer));
+        assert!(!access.allows_peer(&denied_peer));
+    }
+
+    #[test]
+    fn live_channel_access_loses_access_when_last_channel_is_removed() {
+        let peer = test_peer_pubkey(3);
+        let lookup = Arc::new(MockPeerChannelLookup::new([peer]));
+        let access = LiveChannelAccess::new_with_lookup(lookup.clone());
+
+        assert!(access.allows_peer(&peer));
+        lookup.live_peers.lock().unwrap().clear();
+        assert!(!access.allows_peer(&peer));
     }
 
     fn build_kv_store() -> Arc<dyn KVStoreSync + Send + Sync> {

@@ -80,7 +80,7 @@ use crate::core_types::async_order::{
     AsyncOrderOutboundInvoiceResponse,
 };
 use crate::ldk::{
-    clear_rgb_payment_pending, start_ldk, stop_ldk, LdkBackgroundServices,
+    clear_rgb_payment_pending, peer_has_live_channel, start_ldk, stop_ldk, LdkBackgroundServices,
     VirtualChannelSessionStatus,
 };
 #[cfg(feature = "vss")]
@@ -1613,7 +1613,12 @@ pub(crate) async fn async_order_new(
         .is_none()
     {
         return Err(APIError::InvalidPeerInfo(s!(
-            "/apay/new requires a connected host peer"
+            "/apay/new requires a connected invoice-host peer"
+        )));
+    }
+    if !peer_has_live_channel(&unlocked_state.channel_manager, &host_node_id) {
+        return Err(APIError::InvalidPeerInfo(s!(
+            "/apay/new requires a live channel with the invoice-host peer"
         )));
     }
 
@@ -1717,7 +1722,12 @@ pub(crate) async fn async_order_outbound_invoice(
         .is_none()
     {
         return Err(APIError::InvalidPeerInfo(s!(
-            "/apay/outboundinvoice requires a connected recipient peer"
+            "/apay/outboundinvoice requires a connected recipient-client peer"
+        )));
+    }
+    if !peer_has_live_channel(&unlocked_state.channel_manager, &peer_node_id) {
+        return Err(APIError::InvalidPeerInfo(s!(
+            "/apay/outboundinvoice requires a live channel with the recipient-client peer"
         )));
     }
 
