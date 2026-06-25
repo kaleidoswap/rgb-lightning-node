@@ -8,6 +8,22 @@ rust-version = "1.88.0"
 name = "rgb_lightning_node"
 crate-type = ["lib", "staticlib", "cdylib"]
 
+# Minimal workspace so the (self-contained) wasm-proxy-gateway builds into ./target via
+# `cargo build -p wasm-proxy-gateway` (used by the wasm e2e script). The wasm SDK and bindings are
+# their own crates/workspaces and stay excluded.
+[workspace]
+members = [".", "tools/wasm-proxy-gateway"]
+exclude = [
+    "bindings/wasm-sdk",
+    "bindings/uniffi-bindgen",
+    "bindings/c-ffi",
+    "src/sdk/contracts",
+    "rust-lightning",
+]
+
+[workspace.lints.rust]
+unexpected_cfgs = "allow"
+
 [features]
 default = []
 test-utils = []
