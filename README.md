@@ -43,10 +43,13 @@ The docker image can be built with:
 docker build -t rgb-lightning-node .
 ```
 
+See [Sync modes](#sync-modes) for installing the binary with only one
+chain backend.
+
 ## Run
 
 In order to operate, the node will need:
-- a bitcoind node
+- a bitcoind node (only for the `block_sync` [sync mode](#sync-modes))
 - an indexer instance (electrum or esplora)
 - an [RGB proxy server] instance
 
@@ -128,7 +131,9 @@ For more info about regtest utility commands, run:
 ./regtest.sh -h
 ```
 
-When unlocking regtest nodes use the following local services:
+See [Sync modes](#sync-modes) for how the `/unlock` payload selects the chain
+backend. When unlocking regtest nodes with `block_sync` use the following local
+services:
 - bitcoind_rpc_username: user
 - bitcoind_rpc_password: password
 - bitcoind_rpc_host: localhost
@@ -143,6 +148,9 @@ To unlock a regtest nodes running in docker use the following local services:
 - bitcoind_rpc_port: 18443
 - indexer_url: electrs:50001
 - proxy_endpoint: rpc://proxy:3000/json-rpc
+
+To sync through the indexer instead, set `sync_mode: transaction_sync` and omit
+the `bitcoind_rpc_*` parameters.
 
 ### Testnet
 
@@ -364,6 +372,28 @@ token.
 The node exposes a `/revoketoken` endpoint for this purpose.
 Internally, the node extracts the token’s revocation identifiers and adds them
 to its revocation list. Every request checks this list before authenticating.
+
+## Sync modes
+
+The node keeps LDK in sync with the chain in one of two ways, selected at unlock
+time via the `ldk_chain_sync` field of the `/unlock` payload (see the
+`UnlockRequest` schema in `openapi.yaml` for the exact shape):
+
+- `BlockSync`: consume full blocks from a trusted/local `bitcoind` over JSON-RPC.
+  The `bitcoind_rpc_*` parameters are provided under this mode's `config`. This
+  is the more trust-minimized option, since the node does not rely on an indexer
+  to tell it which transactions are relevant.
+- `TransactionSync`: sync through an electrum/esplora indexer, so no `bitcoind`
+  is needed. By default this reuses the wallet's `indexer_url`; a dedicated
+  indexer for LDK can be set under this mode's `config` via `indexer_url`.
+
+Each sync mode is gated behind a Cargo feature (`block-sync` and
+`transaction-sync`), both enabled by default, so a stock build supports either
+mode at unlock time. To install with a single backend (and pull in only its
+dependencies), disable the defaults and enable the one you need, e.g.:
+```sh
+cargo install --locked --path . --no-default-features --features transaction-sync
+```
 
 ## Test
 

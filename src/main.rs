@@ -1,10 +1,13 @@
+#[cfg(not(any(feature = "block-sync", feature = "transaction-sync")))]
+compile_error!("at least one of the `block-sync` or `transaction-sync` features must be enabled");
+
 mod args;
 mod auth;
 mod backup;
-mod bitcoind;
 mod disk;
 mod error;
 mod ldk;
+mod ldk_chain_backend;
 mod rgb;
 mod routes;
 mod swap;

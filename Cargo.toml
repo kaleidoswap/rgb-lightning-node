@@ -7,6 +7,24 @@ rust-version = "1.88.0"
 [[bin]]
 name = "rgb-lightning-node"
 
+[features]
+default = [
+    "block-sync",
+    "transaction-sync",
+]
+# Sync LDK by pulling full blocks from a trusted/local bitcoind over JSON-RPC
+# (lightning-block-sync). Stronger trust model, requires bitcoind RPC access.
+block-sync = [
+    "dep:lightning-block-sync",
+]
+# Sync LDK through the configured electrum/esplora indexer
+# (lightning-transaction-sync). Lighter deployment, no bitcoind required.
+transaction-sync = [
+    "dep:lightning-transaction-sync",
+    "dep:electrum-client",
+    "dep:esplora-client",
+]
+
 [dependencies]
 amplify = { version = "=4.8.1", default-features = false }
 anyhow = "1.0.93"
@@ -22,17 +40,20 @@ chacha20poly1305 = { version = "0.10.1", features = ["stream"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = "4.5.20"
 dirs = "5.0.1"
+electrum-client = { version = "0.24.0", default-features = false, features = ["use-rustls"], optional = true }
+esplora-client = { version = "0.12", default-features = false, features = ["blocking-https-rustls"], optional = true }
 futures = "0.3"
 hex = { package = "hex-conservative", version = "0.3.0", default-features = false }
 lightning = { version = "0.2.0", path = "./rust-lightning/lightning", features = ["dnssec"] }
 lightning-background-processor = { version = "0.2.0", path = "./rust-lightning/lightning-background-processor" }
-lightning-block-sync = { version = "0.2.0", features = ["rpc-client", "tokio"] }
+lightning-block-sync = { version = "0.2.0", features = ["rpc-client", "tokio"], optional = true }
 lightning-dns-resolver = { version = "0.3.0", path = "./rust-lightning/lightning-dns-resolver" }
 lightning-invoice = { version = "0.34.0", features = ["std"], path = "./rust-lightning/lightning-invoice" }
 lightning-macros = { version = "0.2.0" }
 lightning-net-tokio = { version = "0.2.0" }
 lightning-persister = { version = "0.2.0", path = "./rust-lightning/lightning-persister", features = ["tokio"] }
 lightning-rapid-gossip-sync = { version = "0.2.0", path = "./rust-lightning/lightning-rapid-gossip-sync" }
+lightning-transaction-sync = { version = "0.2.0", path = "./rust-lightning/lightning-transaction-sync", features = ["electrum", "esplora-blocking"], optional = true }
 magic-crypt = "4.0.1"
 rand = "0.8.5"
 regex = { version = "1.11", default-features = false }
@@ -59,7 +80,7 @@ zip = { version = "2.2.0", default-features = false, features = ["time", "zstd"]
 
 [dev-dependencies]
 dircmp = "0.2.0"
-electrum-client = "0.20.0"
+electrum-client = "0.24.0"
 http = "1.4.0"
 lazy_static = { version = "1.5.0", default-features = false }
 lightning = { version = "0.2.0", path = "./rust-lightning/lightning", features = ["_rln_test_hooks"] }
