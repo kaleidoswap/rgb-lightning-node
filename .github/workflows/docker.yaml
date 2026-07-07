@@ -8,7 +8,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/rgb-lightning-node
+  # Hardcoded target repo so it never depends on the value of the login
+  # username secret; DOCKERHUB_* creds just need push rights to this namespace.
+  IMAGE_NAME: kaleidoswap/rgb-lightning-node
   IMAGE_TAG: mutinynet2
 
 concurrency:
