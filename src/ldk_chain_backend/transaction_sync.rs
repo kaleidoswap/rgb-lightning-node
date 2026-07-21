@@ -553,7 +553,7 @@ fn poll_electrum_fee_estimates(
                         normal_estimate,
                         high_prio_estimate,
                         very_high_prio_estimate,
-                        MIN_FEERATE,
+                        background_estimate,
                     );
                 }
                 Ok(Err(e)) => {
@@ -598,7 +598,7 @@ fn poll_esplora_fee_estimates(
                         normal_estimate,
                         high_prio_estimate,
                         very_high_prio_estimate,
-                        MIN_FEERATE,
+                        background_estimate,
                     );
                 }
                 Ok(Err(e)) => {

@@ -166,3 +166,51 @@ fn store_fee_estimates(
     set(ConfirmationTarget::ChannelCloseMinimum, background);
     set(ConfirmationTarget::OutputSpendingFee, background);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{default_fee_buckets, fee_from_bucket, store_fee_estimates};
+    use lightning::chain::chaininterface::ConfirmationTarget;
+
+    #[test]
+    fn stores_each_fee_horizon_in_the_expected_ldk_bucket() {
+        let fees = default_fee_buckets();
+        store_fee_estimates(&fees, 1_000, 2_000, 3_000, 4_000, 900);
+
+        assert_eq!(
+            fee_from_bucket(&fees, ConfirmationTarget::MaximumFeeEstimate),
+            4_000
+        );
+        assert_eq!(
+            fee_from_bucket(&fees, ConfirmationTarget::UrgentOnChainSweep),
+            3_000
+        );
+        assert_eq!(
+            fee_from_bucket(&fees, ConfirmationTarget::MinAllowedAnchorChannelRemoteFee),
+            900
+        );
+        assert_eq!(
+            fee_from_bucket(
+                &fees,
+                ConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee
+            ),
+            750
+        );
+        assert_eq!(
+            fee_from_bucket(&fees, ConfirmationTarget::AnchorChannelFee),
+            1_000
+        );
+        assert_eq!(
+            fee_from_bucket(&fees, ConfirmationTarget::NonAnchorChannelFee),
+            2_000
+        );
+        assert_eq!(
+            fee_from_bucket(&fees, ConfirmationTarget::ChannelCloseMinimum),
+            1_000
+        );
+        assert_eq!(
+            fee_from_bucket(&fees, ConfirmationTarget::OutputSpendingFee),
+            1_000
+        );
+    }
+}
