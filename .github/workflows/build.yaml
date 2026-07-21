@@ -36,3 +36,26 @@ jobs:
           rustflags: ""
       - name: Build
         run: cargo build --release
+
+  build-features:
+    # Each sync backend is gated behind a Cargo feature; make sure the crate
+    # still builds with only one of them enabled.
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [ block-sync, transaction-sync ]
+    steps:
+      - uses: ilammy/setup-nasm@v1
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.88.0
+          rustflags: ""
+      - name: Build (single feature)
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: cargo build --release --no-default-features --features "$FEATURES"

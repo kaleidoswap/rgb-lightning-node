@@ -22,6 +22,30 @@ services:
       - bitcoind
     ports:
       - 50001:50001
+  # esplora (blockstream/esplora electrs) serving the esplora REST API, used to
+  # exercise the transaction-sync backend against an esplora indexer. Its own
+  # electrum RPC is bound inside the container only, so it doesn't clash with the
+  # `electrs` service above.
+  esplora:
+    image: blockstream/esplora:latest
+    entrypoint: []
+    command: >
+      /srv/explorer/electrs_bitcoin/bin/electrs
+      --timestamp
+      --network regtest
+      --jsonrpc-import
+      --cookie user:password
+      --daemon-rpc-addr bitcoind:18443
+      --http-addr 0.0.0.0:3002
+      --electrum-rpc-addr 0.0.0.0:60401
+      --db-dir /data/db
+      --cors '*'
+    volumes:
+      - ./dataesplora:/data
+    depends_on:
+      - bitcoind
+    ports:
+      - 3002:3002
   proxy:
     image: ghcr.io/rgb-tools/rgb-proxy-server:0.3.0
     ports:

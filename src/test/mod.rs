@@ -29,6 +29,7 @@ use tracing_test::traced_test;
 use crate::disk::LDK_LOGS_FILE;
 use crate::error::APIErrorResponse;
 use crate::ldk::{FEE_RATE, IGNORE_INBOUND_CHANNELS_ON_NODE};
+use crate::routes::LdkChainSync;
 use crate::routes::{
     AddressResponse, AssetBalanceRequest, AssetBalanceResponse, AssetCFA, AssetIFA, AssetNIA,
     AssetUDA, Assignment, BackupRequest, BtcBalanceRequest, BtcBalanceResponse,
@@ -52,7 +53,10 @@ use crate::routes::{
     SendPaymentResponse, SendRgbRequest, SendRgbResponse, Swap, SwapStatus, TakerRequest,
     Transaction, Transfer, UnlockRequest, Unspent, WitnessData,
 };
-use crate::utils::{hex_str, hex_str_to_vec, ELECTRUM_URL_REGTEST, LDK_DIR, PROXY_ENDPOINT_LOCAL};
+use crate::utils::{
+    hex_str, hex_str_to_vec, ELECTRUM_URL_REGTEST, ESPLORA_URL_REGTEST, LDK_DIR,
+    PROXY_ENDPOINT_LOCAL,
+};
 
 use super::*;
 
@@ -271,6 +275,21 @@ async fn start_node(
     node_peer_port: u16,
     keep_node_dir: bool,
 ) -> (SocketAddr, String) {
+    start_node_with(
+        node_test_dir,
+        node_peer_port,
+        keep_node_dir,
+        block_sync_source(),
+    )
+    .await
+}
+
+async fn start_node_with(
+    node_test_dir: &str,
+    node_peer_port: u16,
+    keep_node_dir: bool,
+    ldk_chain_sync: LdkChainSync,
+) -> (SocketAddr, String) {
     println!("starting node with peer port {node_peer_port}");
     let node_address = start_daemon(node_test_dir, node_peer_port, None, keep_node_dir).await;
 
@@ -280,7 +299,7 @@ async fn start_node(
         init(node_address, &password, None).await;
     }
 
-    unlock(node_address, &password).await;
+    unlock_with(node_address, &password, ldk_chain_sync).await;
 
     println!("node on peer port {node_peer_port} started with address {node_address:?}");
     (node_address, password)
@@ -1753,13 +1772,23 @@ async fn taker(node_address: SocketAddr, swapstring: String) -> EmptyResponse {
         .unwrap()
 }
 
-fn unlock_req(password: &str) -> UnlockRequest {
-    UnlockRequest {
-        password: password.to_string(),
+fn block_sync_source() -> LdkChainSync {
+    LdkChainSync::BlockSync {
         bitcoind_rpc_username: s!("user"),
         bitcoind_rpc_password: s!("password"),
         bitcoind_rpc_host: s!("localhost"),
         bitcoind_rpc_port: 18443,
+    }
+}
+
+fn unlock_req(password: &str) -> UnlockRequest {
+    unlock_req_with(password, block_sync_source())
+}
+
+fn unlock_req_with(password: &str, ldk_chain_sync: LdkChainSync) -> UnlockRequest {
+    UnlockRequest {
+        password: password.to_string(),
+        ldk_chain_sync,
         indexer_url: Some(ELECTRUM_URL_REGTEST.to_string()),
         proxy_endpoint: Some(PROXY_ENDPOINT_LOCAL.to_string()),
         announce_addresses: vec![],
@@ -1768,8 +1797,16 @@ fn unlock_req(password: &str) -> UnlockRequest {
 }
 
 async fn unlock_res(node_address: SocketAddr, password: &str) -> Response {
+    unlock_res_with(node_address, password, block_sync_source()).await
+}
+
+async fn unlock_res_with(
+    node_address: SocketAddr,
+    password: &str,
+    ldk_chain_sync: LdkChainSync,
+) -> Response {
     println!("unlocking node {node_address}");
-    let payload = unlock_req(password);
+    let payload = unlock_req_with(password, ldk_chain_sync);
     reqwest::Client::new()
         .post(format!("http://{node_address}/unlock"))
         .json(&payload)
@@ -1779,8 +1816,12 @@ async fn unlock_res(node_address: SocketAddr, password: &str) -> Response {
 }
 
 async fn unlock(node_address: SocketAddr, password: &str) {
+    unlock_with(node_address, password, block_sync_source()).await
+}
+
+async fn unlock_with(node_address: SocketAddr, password: &str, ldk_chain_sync: LdkChainSync) {
     println!("unlocking node {node_address}");
-    let res = unlock_res(node_address, password).await;
+    let res = unlock_res_with(node_address, password, ldk_chain_sync).await;
     check_response_is_ok(res)
         .await
         .json::<EmptyResponse>()
@@ -2092,5 +2133,7 @@ mod swap_roundtrip_multihop_asset_asset;
 mod swap_roundtrip_multihop_buy;
 mod swap_roundtrip_multihop_sell;
 mod swap_roundtrip_sell;
+#[cfg(feature = "transaction-sync")]
+mod transaction_sync;
 mod upload_asset_media;
 mod vanilla_payment_on_rgb_channel;
