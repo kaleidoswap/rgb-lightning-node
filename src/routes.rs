@@ -52,19 +52,21 @@ use rgb_lib::{
         },
         AssetCFA as RgbLibAssetCFA, AssetIFA as RgbLibAssetIFA, AssetNIA as RgbLibAssetNIA,
         AssetUDA as RgbLibAssetUDA, Balance as RgbLibBalance, EmbeddedMedia as RgbLibEmbeddedMedia,
-        Invoice as RgbLibInvoice, Media as RgbLibMedia, ProofOfReserves as RgbLibProofOfReserves,
-        Recipient as RgbLibRecipient, RecipientInfo, RecipientType as RgbLibRecipientType,
-        RefreshFilter as RgbLibRefreshFilter, RefreshTransferStatus as RgbLibRefreshTransferStatus,
-        SyncKeychain as RgbLibSyncKeychain, SyncOptions as RgbLibSyncOptions,
-        SyncStrategy as RgbLibSyncStrategy, Token as RgbLibToken, TokenLight as RgbLibTokenLight,
-        WitnessData as RgbLibWitnessData,
+        Invoice as RgbLibInvoice, Media as RgbLibMedia, OperationResult as RgbLibOperationResult,
+        ProofOfReserves as RgbLibProofOfReserves, Recipient as RgbLibRecipient, RecipientInfo,
+        RecipientType as RgbLibRecipientType, RefreshFilter as RgbLibRefreshFilter,
+        RefreshTransferStatus as RgbLibRefreshTransferStatus,
+        RefreshedTransfer as RgbLibRefreshedTransfer, SyncKeychain as RgbLibSyncKeychain,
+        SyncOptions as RgbLibSyncOptions, SyncStrategy as RgbLibSyncStrategy, Token as RgbLibToken,
+        TokenLight as RgbLibTokenLight, WitnessData as RgbLibWitnessData,
     },
     AssetSchema as RgbLibAssetSchema, Assignment as RgbLibAssignment,
-    BitcoinNetwork as RgbLibNetwork, ContractId, RgbTransport,
+    BitcoinNetwork as RgbLibNetwork, ContractId, Error as RgbLibError,
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    io::Write,
     net::ToSocketAddrs,
     path::{Path, PathBuf},
     str::FromStr,
@@ -77,7 +79,6 @@ use tokio::{
     sync::MutexGuard as TokioMutexGuard,
 };
 
-use crate::ldk::{start_ldk, stop_ldk, LdkBackgroundServices, MIN_CHANNEL_CONFIRMATIONS};
 use crate::swap::{SwapData, SwapInfo, SwapString};
 use crate::utils::{
     check_already_initialized, check_channel_id, check_password_strength, check_password_validity,
@@ -95,6 +96,10 @@ use crate::{
     utils::{
         connect_peer_if_necessary, get_current_timestamp, no_cancel, parse_peer_info, AppState,
     },
+};
+use crate::{
+    error::error_name,
+    ldk::{start_ldk, stop_ldk, LdkBackgroundServices, MIN_CHANNEL_CONFIRMATIONS},
 };
 
 const UTXO_NUM: u8 = 4;
@@ -520,6 +525,7 @@ pub(crate) struct DecodeRGBInvoiceResponse {
     pub(crate) network: BitcoinNetwork,
     pub(crate) expiration_timestamp: Option<u64>,
     pub(crate) transport_endpoints: Vec<String>,
+    pub(crate) unknown_query_params: HashMap<String, String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -600,6 +606,17 @@ pub(crate) struct GetChannelIdRequest {
 #[derive(Deserialize, Serialize)]
 pub(crate) struct GetChannelIdResponse {
     pub(crate) channel_id: String,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct GetConsignmentRequest {
+    pub(crate) asset_id: String,
+    pub(crate) txid: String,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct GetConsignmentResponse {
+    pub(crate) bytes_hex: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -936,6 +953,23 @@ pub(crate) struct OpenChannelResponse {
     pub(crate) temporary_channel_id: String,
 }
 
+#[derive(Deserialize, Serialize)]
+pub(crate) struct OperationResult {
+    pub(crate) txid: String,
+    pub(crate) batch_transfer_idx: i32,
+    pub(crate) entropy: u64,
+}
+
+impl From<RgbLibOperationResult> for OperationResult {
+    fn from(value: RgbLibOperationResult) -> Self {
+        Self {
+            txid: value.txid,
+            batch_transfer_idx: value.batch_transfer_idx,
+            entropy: value.entropy,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct Payment {
     pub(crate) amt_msat: Option<u64>,
@@ -976,6 +1010,21 @@ impl From<RgbLibProofOfReserves> for ProofOfReserves {
 }
 
 #[derive(Deserialize, Serialize)]
+pub(crate) struct ProvideOutOfBandAckRequest {
+    pub(crate) recipient_id: String,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct ProvideOutOfBandAckResponse {
+    pub(crate) operation: Option<OperationResult>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct ProvideOutOfBandConsignmentResponse {
+    pub(crate) transfers: HashMap<i32, RefreshedTransfer>,
+}
+
+#[derive(Deserialize, Serialize)]
 pub(crate) struct Recipient {
     pub(crate) recipient_id: String,
     pub(crate) witness_data: Option<WitnessData>,
@@ -1009,6 +1058,36 @@ impl From<RgbLibRecipientType> for RecipientType {
     }
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct RefreshedTransfer {
+    pub(crate) updated_status: Option<TransferStatus>,
+    pub(crate) failure: Option<RefreshFailure>,
+}
+
+impl From<RgbLibRefreshedTransfer> for RefreshedTransfer {
+    fn from(value: RgbLibRefreshedTransfer) -> Self {
+        Self {
+            updated_status: value.updated_status.map(|s| s.into()),
+            failure: value.failure.map(Into::into),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct RefreshFailure {
+    pub(crate) name: String,
+    pub(crate) message: String,
+}
+
+impl From<RgbLibError> for RefreshFailure {
+    fn from(error: RgbLibError) -> Self {
+        Self {
+            name: error_name(&error),
+            message: error.to_string(),
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 pub(crate) struct RefreshFilter {
     pub(crate) status: RefreshTransferStatus,
@@ -1025,6 +1104,18 @@ impl From<RefreshFilter> for RgbLibRefreshFilter {
 }
 
 #[derive(Deserialize, Serialize)]
+pub(crate) struct RefreshRequest {
+    pub(crate) asset_id: Option<String>,
+    pub(crate) filter: Vec<RefreshFilter>,
+    pub(crate) skip_sync: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct RefreshResponse {
+    pub(crate) transfers: HashMap<i32, RefreshedTransfer>,
+}
+
+#[derive(Deserialize, Serialize)]
 pub(crate) enum RefreshTransferStatus {
     WaitingCounterparty,
     WaitingConfirmations,
@@ -1037,13 +1128,6 @@ impl From<RefreshTransferStatus> for RgbLibRefreshTransferStatus {
             RefreshTransferStatus::WaitingConfirmations => Self::WaitingConfirmations,
         }
     }
-}
-
-#[derive(Deserialize, Serialize)]
-pub(crate) struct RefreshRequest {
-    pub(crate) asset_id: Option<String>,
-    pub(crate) filter: Vec<RefreshFilter>,
-    pub(crate) skip_sync: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1068,16 +1152,17 @@ pub(crate) struct RgbAllocation {
 pub(crate) struct RgbInvoiceRequest {
     pub(crate) asset_id: Option<String>,
     pub(crate) assignment: Option<Assignment>,
-    pub(crate) expiration_timestamp: Option<u64>,
+    pub(crate) expiration_timestamp: u64,
     pub(crate) min_confirmations: u8,
     pub(crate) witness: bool,
+    pub(crate) transport_endpoints: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize)]
 pub(crate) struct RgbInvoiceResponse {
     pub(crate) recipient_id: String,
     pub(crate) invoice: String,
-    pub(crate) expiration_timestamp: Option<u64>,
+    pub(crate) expiration_timestamp: u64,
     pub(crate) batch_transfer_idx: i32,
 }
 
@@ -1122,7 +1207,7 @@ pub(crate) struct SendRgbRequest {
     pub(crate) donation: bool,
     pub(crate) fee_rate: u64,
     pub(crate) min_confirmations: u8,
-    pub(crate) expiration_timestamp: Option<u64>,
+    pub(crate) expiration_timestamp: u64,
     pub(crate) recipient_map: HashMap<String, Vec<Recipient>>,
 }
 
@@ -1343,8 +1428,23 @@ pub(crate) enum TransferStatus {
     WaitingCounterparty,
     WaitingSafeHeight,
     WaitingConfirmations,
+    WaitingBroadcast,
     Settled,
     Failed,
+}
+
+impl From<rgb_lib::TransferStatus> for TransferStatus {
+    fn from(value: rgb_lib::TransferStatus) -> Self {
+        match value {
+            rgb_lib::TransferStatus::Initiated => TransferStatus::Initiated,
+            rgb_lib::TransferStatus::WaitingCounterparty => TransferStatus::WaitingCounterparty,
+            rgb_lib::TransferStatus::WaitingSafeHeight => TransferStatus::WaitingSafeHeight,
+            rgb_lib::TransferStatus::WaitingConfirmations => TransferStatus::WaitingConfirmations,
+            rgb_lib::TransferStatus::WaitingBroadcast => TransferStatus::WaitingBroadcast,
+            rgb_lib::TransferStatus::Settled => TransferStatus::Settled,
+            rgb_lib::TransferStatus::Failed => TransferStatus::Failed,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1367,7 +1467,6 @@ pub(crate) struct UnlockRequest {
     pub(crate) bitcoind_rpc_host: String,
     pub(crate) bitcoind_rpc_port: u16,
     pub(crate) indexer_url: Option<String>,
-    pub(crate) proxy_endpoint: Option<String>,
     pub(crate) announce_addresses: Vec<String>,
     pub(crate) announce_alias: Option<String>,
 }
@@ -1376,6 +1475,7 @@ pub(crate) struct UnlockRequest {
 pub(crate) struct Unspent {
     pub(crate) utxo: Utxo,
     pub(crate) rgb_allocations: Vec<RgbAllocation>,
+    pub(crate) pending_blinded: u32,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1383,6 +1483,8 @@ pub(crate) struct Utxo {
     pub(crate) outpoint: String,
     pub(crate) btc_amount: u64,
     pub(crate) colorable: bool,
+    pub(crate) exists: bool,
+    pub(crate) derivation_index: Option<u32>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1782,6 +1884,7 @@ pub(crate) async fn decode_rgb_invoice(
         network: invoice_data.network.into(),
         expiration_timestamp: invoice_data.expiration_timestamp,
         transport_endpoints: invoice_data.transport_endpoints,
+        unknown_query_params: invoice_data.unknown_query_params,
     }))
 }
 
@@ -1923,6 +2026,28 @@ pub(crate) async fn get_channel_id(
     };
 
     Ok(Json(GetChannelIdResponse { channel_id }))
+}
+
+pub(crate) async fn get_consignment(
+    State(state): State<Arc<AppState>>,
+    WithRejection(Json(payload), _): WithRejection<Json<GetConsignmentRequest>, APIError>,
+) -> Result<Json<GetConsignmentResponse>, APIError> {
+    let file_path = state
+        .check_unlocked()
+        .await?
+        .clone()
+        .unwrap()
+        .rgb_get_send_consignment_path(&payload.asset_id, &payload.txid);
+    if !file_path.exists() {
+        return Err(APIError::ConsignmentNotFound);
+    }
+
+    let mut buf_reader = BufReader::new(File::open(file_path).await?);
+    let mut file_bytes = Vec::new();
+    buf_reader.read_to_end(&mut file_bytes).await?;
+    let bytes_hex = hex_str(&file_bytes);
+
+    Ok(Json(GetConsignmentResponse { bytes_hex }))
 }
 
 pub(crate) async fn get_payment(
@@ -2705,16 +2830,7 @@ pub(crate) async fn list_transfers(
             idx: transfer.idx,
             created_at: transfer.created_at,
             updated_at: transfer.updated_at,
-            status: match transfer.status {
-                rgb_lib::TransferStatus::Initiated => TransferStatus::Initiated,
-                rgb_lib::TransferStatus::WaitingCounterparty => TransferStatus::WaitingCounterparty,
-                rgb_lib::TransferStatus::WaitingSafeHeight => TransferStatus::WaitingSafeHeight,
-                rgb_lib::TransferStatus::WaitingConfirmations => {
-                    TransferStatus::WaitingConfirmations
-                }
-                rgb_lib::TransferStatus::Settled => TransferStatus::Settled,
-                rgb_lib::TransferStatus::Failed => TransferStatus::Failed,
-            },
+            status: transfer.status.into(),
             requested_assignment: transfer.requested_assignment.map(|a| a.into()),
             assignments: transfer.assignments.into_iter().map(|a| a.into()).collect(),
             kind: match transfer.kind {
@@ -2760,6 +2876,8 @@ pub(crate) async fn list_unspents(
                 outpoint: unspent.utxo.outpoint.to_string(),
                 btc_amount: unspent.utxo.btc_amount,
                 colorable: unspent.utxo.colorable,
+                exists: unspent.utxo.exists,
+                derivation_index: unspent.utxo.derivation_index,
             },
             rgb_allocations: unspent
                 .rgb_allocations
@@ -2770,6 +2888,7 @@ pub(crate) async fn list_unspents(
                     settled: a.settled,
                 })
                 .collect(),
+            pending_blinded: unspent.pending_blinded,
         })
     }
     Ok(Json(ListUnspentsResponse { unspents }))
@@ -3364,7 +3483,7 @@ pub(crate) async fn open_channel(
         };
 
         // checks on balances here are not precise since they do not take fees into account
-        let (consignment_endpoint, schema) = if let Some((contract_id, asset_amount)) = &colored_info {
+        let (rgb_asset, schema) = if let Some((contract_id, asset_amount)) = &colored_info {
             let balance = unlocked_state.rgb_get_btc_balance(true)?;
             if payload.capacity_sat > balance.colored.spendable {
                 return Err(APIError::InsufficientFunds(payload.capacity_sat - balance.colored.spendable));
@@ -3373,11 +3492,10 @@ pub(crate) async fn open_channel(
             if *asset_amount > balance.spendable {
                 return Err(APIError::InsufficientAssets);
             }
-            let consignment_endpoint = RgbTransport::from_str(&unlocked_state.proxy_endpoint).unwrap();
             let schema = unlocked_state
                 .rgb_get_asset_metadata(*contract_id)?
                 .asset_schema;
-            (Some(consignment_endpoint), Some(schema))
+            (Some((*contract_id, payload.push_asset_amount)), Some(schema))
         } else {
             let balance = unlocked_state.rgb_get_btc_balance(true)?;
             if payload.capacity_sat > balance.vanilla.spendable {
@@ -3395,8 +3513,7 @@ pub(crate) async fn open_channel(
                 0,
                 temporary_channel_id,
                 Some(config),
-                consignment_endpoint,
-                payload.push_asset_amount,
+                rgb_asset,
             )
             .map_err(|e| {
                 tracing::error!("Open channel failure: {e:?}");
@@ -3429,6 +3546,8 @@ pub(crate) async fn open_channel(
                 local_rgb_amount: *asset_amount - push_amount,
                 remote_rgb_amount: push_amount,
                 batch_transfer_idx: None,
+                // set when the acceptor's accept_channel says it already knows the asset
+                counterparty_knows_asset: false,
             };
             write_rgb_channel_info(
                 &get_rgb_channel_info_path(
@@ -3504,24 +3623,136 @@ pub(crate) async fn post_asset_media(
     .await
 }
 
+pub(crate) async fn provide_out_of_band_ack(
+    State(state): State<Arc<AppState>>,
+    WithRejection(Json(payload), _): WithRejection<Json<ProvideOutOfBandAckRequest>, APIError>,
+) -> Result<Json<ProvideOutOfBandAckResponse>, APIError> {
+    no_cancel(async move {
+        let guard = state.check_unlocked().await?;
+        let unlocked_state = guard.as_ref().unwrap();
+
+        let unlocked_state_copy = unlocked_state.clone();
+        let operation = tokio::task::spawn_blocking(move || {
+            unlocked_state_copy.rgb_provide_out_of_band_ack(payload.recipient_id)
+        })
+        .await
+        .unwrap()?;
+
+        Ok(Json(ProvideOutOfBandAckResponse {
+            operation: operation.map(|o| o.into()),
+        }))
+    })
+    .await
+}
+
+pub(crate) async fn provide_out_of_band_consignment(
+    State(state): State<Arc<AppState>>,
+    WithRejection(mut multipart, _): WithRejection<Multipart, APIError>,
+) -> Result<Json<ProvideOutOfBandConsignmentResponse>, APIError> {
+    no_cancel(async move {
+        let guard = state.check_unlocked().await?;
+        let unlocked_state = guard.as_ref().unwrap();
+
+        let mut consignment_bytes = None;
+        let mut media_files_bytes = Vec::new();
+        while let Some(field) = multipart
+            .next_field()
+            .await
+            .map_err(|_| APIError::ConsignmentFileNotProvided)?
+        {
+            let field_name = field.name().map(|n| n.to_string());
+            let field_bytes = field
+                .bytes()
+                .await
+                .map_err(|e| APIError::Unexpected(format!("Failed to read bytes: {e}")))?;
+            match field_name.as_deref() {
+                Some("media") => {
+                    if field_bytes.is_empty() {
+                        return Err(APIError::MediaFileEmpty);
+                    }
+                    media_files_bytes.push(field_bytes);
+                }
+                _ => {
+                    if field_bytes.is_empty() {
+                        return Err(APIError::ConsignmentFileEmpty);
+                    }
+                    consignment_bytes = Some(field_bytes);
+                }
+            }
+        }
+        let consignment_bytes = consignment_bytes.ok_or(APIError::ConsignmentFileNotProvided)?;
+
+        // persist the received consignment and media to temp files and hand their paths to rgb-lib
+        let unlocked_state_copy = unlocked_state.clone();
+        let ldk_data_dir = state.static_state.ldk_data_dir.clone();
+        let refresh_result = tokio::task::spawn_blocking(
+            move || -> Result<HashMap<i32, RgbLibRefreshedTransfer>, APIError> {
+                let write_temp = |prefix: &str, bytes: &[u8]| -> Result<_, APIError> {
+                    let mut file = tempfile::Builder::new()
+                        .prefix(prefix)
+                        .tempfile_in(&ldk_data_dir)?;
+                    file.write_all(bytes)?;
+                    file.flush()?;
+                    Ok(file)
+                };
+
+                let consignment_file = write_temp("consignment_oob_", &consignment_bytes)?;
+                let consignment_path = consignment_file.path().to_string_lossy().to_string();
+
+                // the temp files must stay alive until rgb-lib has read them: a NamedTempFile
+                // deletes its file on drop, so hold the handles and derive the paths from them
+                let media_files = media_files_bytes
+                    .iter()
+                    .map(|bytes| write_temp("media_oob_", bytes))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let media_file_paths = media_files
+                    .iter()
+                    .map(|f| f.path().to_string_lossy().to_string())
+                    .collect();
+
+                unlocked_state_copy
+                    .rgb_provide_out_of_band_consignment(consignment_path, media_file_paths)
+                    .map_err(|e| match e {
+                        RgbLibError::InvalidFilePath { .. } => APIError::InvalidConsignment,
+                        other => other.into(),
+                    })
+            },
+        )
+        .await
+        .unwrap()?;
+
+        let transfers = refresh_result
+            .into_iter()
+            .map(|(idx, t)| (idx, t.into()))
+            .collect();
+
+        Ok(Json(ProvideOutOfBandConsignmentResponse { transfers }))
+    })
+    .await
+}
+
 pub(crate) async fn refresh_transfers(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<RefreshRequest>, APIError>,
-) -> Result<Json<EmptyResponse>, APIError> {
+) -> Result<Json<RefreshResponse>, APIError> {
     no_cancel(async move {
         let guard = state.check_unlocked().await?;
         let unlocked_state = guard.as_ref().unwrap();
         let unlocked_state_copy = unlocked_state.clone();
 
         let filter = payload.filter.into_iter().map(|f| f.into()).collect();
-        tokio::task::spawn_blocking(move || {
+        let refresh_result = tokio::task::spawn_blocking(move || {
             unlocked_state_copy.rgb_refresh(payload.asset_id, filter, payload.skip_sync)
         })
         .await
         .unwrap()?;
 
         tracing::info!("Refresh complete");
-        Ok(Json(EmptyResponse {}))
+        let transfers = refresh_result
+            .into_iter()
+            .map(|(idx, t)| (idx, t.into()))
+            .collect();
+        Ok(Json(RefreshResponse { transfers }))
     })
     .await
 }
@@ -3580,7 +3811,7 @@ pub(crate) async fn rgb_invoice(
                 payload.asset_id,
                 assignment,
                 payload.expiration_timestamp,
-                vec![unlocked_state.proxy_endpoint.clone()],
+                payload.transport_endpoints,
                 payload.min_confirmations,
             )?
         } else {
@@ -3588,7 +3819,7 @@ pub(crate) async fn rgb_invoice(
                 payload.asset_id,
                 assignment,
                 payload.expiration_timestamp,
-                vec![unlocked_state.proxy_endpoint.clone()],
+                payload.transport_endpoints,
                 payload.min_confirmations,
             )?
         };
