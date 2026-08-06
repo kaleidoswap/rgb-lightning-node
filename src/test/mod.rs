@@ -2337,5 +2337,6 @@ mod swap_roundtrip_multihop_asset_asset;
 mod swap_roundtrip_multihop_buy;
 mod swap_roundtrip_multihop_sell;
 mod swap_roundtrip_sell;
+mod stock_ldk_interop;
 mod upload_asset_media;
 mod vanilla_payment_on_rgb_channel;

@@ -3,3 +3,6 @@
 	url = https://github.com/RGB-Tools/rust-lightning.git
 	branch = rgb
 	shallow = true
+[submodule "test/ldk-server"]
+	path = test/ldk-server
+	url = https://github.com/kaleidoswap/ldk-server.git
