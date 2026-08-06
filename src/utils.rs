@@ -14,7 +14,6 @@ use lightning::{
     util::ser::{Writeable, Writer},
 };
 use lightning_persister::fs_store::FilesystemStore;
-use magic_crypt::{new_magic_crypt, MagicCryptTrait};
 use rgb_lib::{bdk_wallet::keys::bip39::Mnemonic, BitcoinNetwork, ContractId};
 use std::{
     collections::HashSet,
@@ -30,6 +29,7 @@ use std::{
 use tokio::sync::{Mutex as TokioMutex, MutexGuard as TokioMutexGuard};
 use tokio_util::sync::CancellationToken;
 
+use crate::crypto::{decrypt_mnemonic, encrypt_mnemonic};
 use crate::ldk::{ChannelIdsMap, Router};
 use crate::rgb::{get_rgb_channel_info_optional, RgbLibWalletWrapper};
 use crate::rgb_file_transfer::RgbFileTransferHandler;
@@ -68,13 +68,17 @@ pub(crate) struct AppState {
 
 impl AppState {
     pub(crate) fn get_changing_state(&self) -> MutexGuard<'_, bool> {
-        self.changing_state.lock().unwrap()
+        self.changing_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) // propagate the poison
     }
 
     pub(crate) fn get_ldk_background_services(
         &self,
     ) -> MutexGuard<'_, Option<LdkBackgroundServices>> {
-        self.ldk_background_services.lock().unwrap()
+        self.ldk_background_services
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) // propagate the poison
     }
 
     pub(crate) async fn get_unlocked_app_state(
@@ -180,15 +184,14 @@ pub(crate) fn check_password_validity(
     storage_dir_path: &Path,
 ) -> Result<Mnemonic, APIError> {
     let mnemonic_path = get_mnemonic_path(storage_dir_path);
-    if let Ok(encrypted_mnemonic) = fs::read_to_string(mnemonic_path) {
-        let mcrypt = new_magic_crypt!(password, 256);
-        let mnemonic_str = mcrypt
-            .decrypt_base64_to_string(encrypted_mnemonic)
-            .map_err(|_| APIError::WrongPassword)?;
-        Ok(Mnemonic::from_str(&mnemonic_str).expect("valid mnemonic"))
-    } else {
-        Err(APIError::NotInitialized)
-    }
+    let encrypted_mnemonic = match fs::read_to_string(&mnemonic_path) {
+        Ok(encrypted_mnemonic) => encrypted_mnemonic,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(APIError::NotInitialized),
+        Err(e) => return Err(APIError::IO(e)),
+    };
+    let mnemonic_str = decrypt_mnemonic(password, encrypted_mnemonic.trim())?;
+    Mnemonic::from_str(&mnemonic_str)
+        .map_err(|e| APIError::CorruptedMnemonic(format!("invalid mnemonic: {e}")))
 }
 
 pub(crate) fn check_channel_id(channel_id_str: &str) -> Result<ChannelId, APIError> {
@@ -218,18 +221,10 @@ pub(crate) fn encrypt_and_save_mnemonic(
     mnemonic: String,
     mnemonic_path: &Path,
 ) -> Result<(), APIError> {
-    let mcrypt = new_magic_crypt!(password, 256);
-    let encrypted_mnemonic = mcrypt.encrypt_str_to_base64(mnemonic);
-    match fs::write(mnemonic_path, encrypted_mnemonic) {
-        Ok(()) => {
-            tracing::info!("Created a new wallet");
-            Ok(())
-        }
-        Err(e) => Err(APIError::FailedKeysCreation(
-            mnemonic_path.to_string_lossy().to_string(),
-            e.to_string(),
-        )),
-    }
+    let encrypted_mnemonic = encrypt_mnemonic(&password, &mnemonic)?;
+    fs::write(mnemonic_path, encrypted_mnemonic).map_err(|e| {
+        APIError::FailedKeysCreation(mnemonic_path.to_string_lossy().to_string(), e.to_string())
+    })
 }
 
 pub(crate) async fn connect_peer_if_necessary(
@@ -317,7 +312,10 @@ where
         let result = fut.await;
         let _ = tx.send(result);
     });
-    rx.await.unwrap()
+    // the sender is only dropped without sending if the spawned task panicked, in which case the
+    // panic hook has already logged the cause and started the shutdown
+    rx.await
+        .expect("request task panicked, see the preceding panic for the cause")
 }
 
 pub(crate) fn parse_peer_info(

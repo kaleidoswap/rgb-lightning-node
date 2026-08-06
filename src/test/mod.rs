@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
-use std::sync::{Mutex, Once, RwLock};
+use std::sync::{atomic::Ordering, Mutex, Once, RwLock};
 use time::OffsetDateTime;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
@@ -28,7 +28,11 @@ use tracing_test::traced_test;
 
 use crate::disk::LDK_LOGS_FILE;
 use crate::error::APIErrorResponse;
-use crate::ldk::{FEE_RATE, IGNORE_INBOUND_CHANNELS_ON_NODE};
+use crate::ldk::{
+    DEFER_PAYMENT_CLAIMABLE_ON_NODE, FEE_RATE, FORCE_PUSH_ASSET_AMOUNT_ON_NODE,
+    HELD_PAYMENT_CLAIMABLE_COUNT, HOLD_PAYMENT_CLAIMABLE_ON_NODE, IGNORE_INBOUND_CHANNELS_ON_NODE,
+    PAYMENT_CLAIMABLE_DEFERRED,
+};
 use crate::routes::{
     AddressResponse, AssetBalanceRequest, AssetBalanceResponse, AssetCFA, AssetIFA, AssetNIA,
     AssetUDA, Assignment, BackupRequest, BtcBalanceRequest, BtcBalanceResponse,
@@ -118,8 +122,51 @@ impl Drop for ElectrsRestartGuard {
             .arg("start")
             .arg("electrs")
             .status()
-            .expect("failed to stop electrs");
-        assert!(status.success(), "failed to stop electrs");
+            .expect("failed to start electrs");
+        assert!(status.success(), "failed to start electrs");
+        wait_electrs_sync();
+    }
+}
+
+// Sets a test-override static to a node's pubkey and clears it on drop, so a
+// panicking test cannot leak the override into the next one
+struct NodeOverrideGuard(&'static Mutex<Option<PublicKey>>);
+
+impl NodeOverrideGuard {
+    fn set(target: &'static Mutex<Option<PublicKey>>, node_pubkey: &str) -> Self {
+        *target.lock().unwrap() = Some(PublicKey::from_str(node_pubkey).unwrap());
+        Self(target)
+    }
+}
+
+impl Drop for NodeOverrideGuard {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+// Makes the payee defer claiming incoming payments, so the payer's HTLC (and any swap it is part
+// of) stays pending until the returned guard is dropped.
+//
+// Must be set before the payment is sent; call `wait_for_deferred_payment` afterwards to know the
+// HTLC has actually reached the payee.
+fn defer_payment_claimable(payee_pubkey: &str) -> NodeOverrideGuard {
+    PAYMENT_CLAIMABLE_DEFERRED.store(false, Ordering::SeqCst);
+    NodeOverrideGuard::set(&DEFER_PAYMENT_CLAIMABLE_ON_NODE, payee_pubkey)
+}
+
+// Waits for a payment deferred via `defer_payment_claimable` to have reached the payee.
+//
+// Note that only one payment at a time can be deferred on a node, as a node handles its events
+// sequentially. What the gate guarantees is that no payment to that node settles while it is held,
+// not that every in-flight payment has reached it.
+async fn wait_for_deferred_payment() {
+    let t_0 = OffsetDateTime::now_utc();
+    while !PAYMENT_CLAIMABLE_DEFERRED.load(Ordering::SeqCst) {
+        if (OffsetDateTime::now_utc() - t_0).as_seconds_f32() > 40.0 {
+            panic!("no payment has been deferred");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
@@ -442,6 +489,28 @@ async fn close_channel(node_address: SocketAddr, channel_id: &str, peer_pubkey: 
         if (OffsetDateTime::now_utc() - t_0).as_seconds_f32() > 30.0 {
             panic!("channel is taking too long to close")
         }
+    }
+}
+
+// Waits until the channel's funding output is spent by a confirmed tx
+// (commitment or cooperative close) and returns the spending txid
+async fn wait_for_funding_spend_txid(node_test_dir: &str, channel_id: &str) -> String {
+    let needle = format!("Channel {channel_id} closed by funding output spend in txid ");
+    let t_0 = OffsetDateTime::now_utc();
+    loop {
+        let txid = ldk_log_lines(node_test_dir)
+            .iter()
+            .find_map(|l| l.split_once(&needle).map(|(_, rest)| rest.to_string()));
+        // defensive: a partially-flushed line would be shorter than a txid; retry rather than panic
+        if let Some(txid) = txid {
+            if txid.len() >= 64 {
+                return txid[..64].to_string();
+            }
+        }
+        if (OffsetDateTime::now_utc() - t_0).as_seconds_f32() > 30.0 {
+            panic!("confirmed commitment for channel {channel_id} not seen in logs");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
 
@@ -809,6 +878,7 @@ async fn issue_asset_uda(node_address: SocketAddr, file_path: Option<&str>) -> A
         .asset
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn with_ln_balance_checks(
     node_address: SocketAddr,
     counterparty_node_address: SocketAddr,
@@ -817,10 +887,17 @@ async fn with_ln_balance_checks(
     initial_ln_balance_rgb: Option<u64>,
     counterparty_initial_ln_balance_rgb: Option<u64>,
     payment_hash: &str,
+    defer_guard: NodeOverrideGuard,
 ) {
+    // the payee is deferring the claim, so the payment is provably still pending here: without
+    // that gate it could have settled before we get to look at it, making this check racy
+    wait_for_deferred_payment().await;
     check_payment_status(node_address, payment_hash, HTLCStatus::Pending)
         .await
         .unwrap();
+
+    // let the payee claim, so the payment can settle
+    drop(defer_guard);
 
     if let Some(asset_id) = &asset_id {
         let final_ln_balance_rgb = initial_ln_balance_rgb.unwrap() - asset_amount.unwrap();
@@ -898,6 +975,7 @@ async fn keysend_with_ln_balance(
     initial_ln_balance_rgb: Option<u64>,
     counterparty_initial_ln_balance_rgb: Option<u64>,
 ) {
+    let defer_guard = defer_payment_claimable(dest_pubkey);
     let res = keysend_raw(node_address, dest_pubkey, amt_msat, asset_id, asset_amount).await;
 
     with_ln_balance_checks(
@@ -908,8 +986,21 @@ async fn keysend_with_ln_balance(
         initial_ln_balance_rgb,
         counterparty_initial_ln_balance_rgb,
         &res.payment_hash,
+        defer_guard,
     )
     .await;
+}
+
+// Lines of a node's LDK log file (empty if the log doesn't exist yet)
+fn ldk_log_lines(node_test_dir: &str) -> Vec<String> {
+    let log_path = PathBuf::from(node_test_dir)
+        .join(LDK_DIR)
+        .join(LOGS_DIR)
+        .join(LDK_LOGS_FILE);
+    let Ok(file) = File::open(log_path) else {
+        return vec![];
+    };
+    BufReader::new(file).lines().map_while(Result::ok).collect()
 }
 
 async fn list_assets(node_address: SocketAddr) -> ListAssetsResponse {
@@ -1560,24 +1651,32 @@ async fn provide_out_of_band_consignment(
         .unwrap()
 }
 
-async fn refresh_transfers(node_address: SocketAddr) -> RefreshResponse {
+async fn refresh_transfers_raw(node_address: SocketAddr) -> Result<Response, reqwest::Error> {
     println!("refreshing transfers for node {node_address}");
     let payload = RefreshRequest {
         asset_id: None,
         filter: vec![],
         skip_sync: false,
     };
-    let res = reqwest::Client::new()
+    reqwest::Client::new()
         .post(format!("http://{node_address}/refreshtransfers"))
         .json(&payload)
         .send()
         .await
-        .unwrap();
+}
+
+async fn refresh_transfers(node_address: SocketAddr) -> RefreshResponse {
+    let res = refresh_transfers_raw(node_address).await.unwrap();
     check_response_is_ok(res)
         .await
         .json::<RefreshResponse>()
         .await
         .unwrap()
+}
+
+// Best-effort refresh for nodes that may not be able to serve it yet
+async fn refresh_transfers_tolerant(node_address: SocketAddr) {
+    let _ = refresh_transfers_raw(node_address).await;
 }
 
 async fn restore(node_address: SocketAddr, backup_path: &str, password: &str) {
@@ -1789,6 +1888,7 @@ async fn send_payment_with_ln_balance(
 ) {
     let bolt11_invoice = Bolt11Invoice::from_str(&invoice).unwrap();
 
+    let defer_guard = defer_payment_claimable(&bolt11_invoice.recover_payee_pub_key().to_string());
     let res = send_payment_raw(node_address, invoice).await;
 
     with_ln_balance_checks(
@@ -1800,6 +1900,7 @@ async fn send_payment_with_ln_balance(
         counterparty_initial_ln_balance_rgb,
         // TODO: remove unwrap once RGB offers are enabled
         &res.payment_hash.unwrap(),
+        defer_guard,
     )
     .await;
 }
@@ -1851,6 +1952,12 @@ async fn shutdown(node_sockets: &[SocketAddr]) {
     }
 }
 
+// Total spendable BTC across the vanilla and colored wallets
+async fn spendable_sats(node_address: SocketAddr) -> u64 {
+    let balance = btc_balance(node_address).await;
+    balance.vanilla.spendable + balance.colored.spendable
+}
+
 async fn taker(node_address: SocketAddr, swapstring: String) -> EmptyResponse {
     println!("taking swap {swapstring} on node {node_address}");
     let payload = TakerRequest { swapstring };
@@ -1889,6 +1996,31 @@ async fn unlock_res(node_address: SocketAddr, password: &str) -> Response {
         .send()
         .await
         .unwrap()
+}
+
+// Output values (in sats) of an on-chain transaction
+fn tx_output_sats(txid: &str) -> Vec<u64> {
+    let output = Command::new("docker")
+        .stdin(Stdio::null())
+        .arg("compose")
+        .args(bitcoin_cli())
+        .arg("getrawtransaction")
+        .arg(txid)
+        .arg("true")
+        .output()
+        .expect("able to call getrawtransaction");
+    assert!(output.status.success());
+    let tx: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid tx JSON");
+    tx["vout"]
+        .as_array()
+        .expect("vout array")
+        .iter()
+        .map(|v| {
+            Amount::from_btc(v["value"].as_f64().expect("output value"))
+                .expect("valid amount")
+                .to_sat()
+        })
+        .collect()
 }
 
 async fn unlock(node_address: SocketAddr, password: &str) {
@@ -2108,16 +2240,12 @@ fn wait_electrs_sync() {
     let blockcount = get_block_count();
     loop {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let mut all_synced = true;
-        let electrum =
-            electrum_client::Client::new(ELECTRUM_URL).expect("cannot get electrum client");
-        if electrum.block_header(blockcount as usize).is_err() {
-            all_synced = false;
-        }
-        if all_synced {
+        let synced = electrum_client::Client::new(ELECTRUM_URL)
+            .is_ok_and(|electrum| electrum.block_header(blockcount as usize).is_ok());
+        if synced {
             break;
         };
-        if (OffsetDateTime::now_utc() - t_0).as_seconds_f32() > 10.0 {
+        if (OffsetDateTime::now_utc() - t_0).as_seconds_f32() > 30.0 {
             panic!("electrs not syncing with bitcoind");
         }
     }
@@ -2164,6 +2292,7 @@ mod close_coop_vanilla;
 mod close_coop_zero_balance;
 mod close_force_nobtc_acceptor;
 mod close_force_other_side;
+mod close_force_pending_htlc;
 mod close_force_standard;
 mod concurrent_btc_payments;
 mod concurrent_openchannel;
@@ -2187,6 +2316,7 @@ mod openchannel_optional_addr;
 mod openchannel_push_asset_amount;
 mod out_of_band;
 mod payment;
+mod push_asset_amount_above_chan_amt;
 mod refuse_high_fees;
 mod restart;
 mod send_receive;
