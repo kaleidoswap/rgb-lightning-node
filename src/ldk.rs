@@ -84,8 +84,12 @@ use std::net::ToSocketAddrs;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+#[cfg(test)]
+use std::time::Instant;
 use std::time::{Duration, SystemTime};
 use time::OffsetDateTime;
 use tokio::runtime::Handle;
@@ -109,6 +113,7 @@ use crate::utils::{
     hex_str, AppState, StaticState, UnlockedAppState, ELECTRUM_URL_MAINNET, ELECTRUM_URL_REGTEST,
     ELECTRUM_URL_SIGNET, ELECTRUM_URL_TESTNET, ELECTRUM_URL_TESTNET4,
 };
+use crate::FATAL_ERROR;
 
 pub(crate) const FEE_RATE: u64 = 7;
 pub(crate) const UTXO_SIZE_SAT: u32 = 32000;
@@ -116,8 +121,53 @@ pub(crate) const MIN_CHANNEL_CONFIRMATIONS: u8 = 6;
 const RGB_TRANSFER_CHAN_EXPIRATION_SECS: u64 = 86400;
 const VANILLA_SYNC_LOOKBACK: u32 = 20;
 
+// Test-only: while set, the node with this pubkey defers claiming incoming payments; handling of
+// the PaymentClaimable event is suspended until the gate is cleared
+#[cfg(test)]
+pub(crate) static DEFER_PAYMENT_CLAIMABLE_ON_NODE: Mutex<Option<PublicKey>> = Mutex::new(None);
+
+// Test-only: whether a payment has been deferred via DEFER_PAYMENT_CLAIMABLE_ON_NODE since the
+// gate was set. This is a flag rather than a count because a node handles its events sequentially:
+// while a PaymentClaimable is being deferred no further event is handled, so at most one payment
+// can be deferred at a time
+#[cfg(test)]
+pub(crate) static PAYMENT_CLAIMABLE_DEFERRED: AtomicBool = AtomicBool::new(false);
+
+// Test-only: a payment is never deferred for longer than this, so that a test failing to release
+// the gate fails on its own assertions instead of hanging the node's event handling
+#[cfg(test)]
+const MAX_PAYMENT_DEFERRAL: Duration = Duration::from_secs(60);
+
 #[cfg(test)]
 pub(crate) static IGNORE_INBOUND_CHANNELS_ON_NODE: Mutex<Option<PublicKey>> = Mutex::new(None);
+
+// Test-only: the node with this pubkey holds incoming payments instead of claiming them, keeping
+// their HTLCs pending
+#[cfg(test)]
+pub(crate) static HOLD_PAYMENT_CLAIMABLE_ON_NODE: Mutex<Option<PublicKey>> = Mutex::new(None);
+
+// Test-only: number of payments held via HOLD_PAYMENT_CLAIMABLE_ON_NODE
+#[cfg(test)]
+pub(crate) static HELD_PAYMENT_CLAIMABLE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+// Test-only: the node with this pubkey emits a `push_asset_amount` greater than the channel asset
+// amount on the wire in `open_channel`, regardless of the value validated by its REST layer. Used
+// to model a channel counterparty whose wire client is not bound by the sender-side clamp.
+#[cfg(test)]
+pub(crate) static FORCE_PUSH_ASSET_AMOUNT_ON_NODE: Mutex<Option<PublicKey>> = Mutex::new(None);
+
+// Test-only: whether the given override targets the node we are running as
+#[cfg(test)]
+pub(crate) fn node_override_matches(
+    target: &Mutex<Option<PublicKey>>,
+    our_node_id: PublicKey,
+) -> bool {
+    target
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|id| *id == our_node_id)
+}
 
 pub(crate) struct LdkBackgroundServices {
     stop_processing: Arc<AtomicBool>,
@@ -978,6 +1028,33 @@ async fn handle_ldk_events(
                 payment_hash,
                 amount_msat,
             );
+            #[cfg(test)]
+            if node_override_matches(
+                &HOLD_PAYMENT_CLAIMABLE_ON_NODE,
+                unlocked_state.channel_manager.get_our_node_id(),
+            ) {
+                tracing::info!("TEST: holding PaymentClaimable for {}", payment_hash);
+                HELD_PAYMENT_CLAIMABLE_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Ok(());
+            }
+            #[cfg(test)]
+            {
+                let our_node_id = unlocked_state.channel_manager.get_our_node_id();
+                if node_override_matches(&DEFER_PAYMENT_CLAIMABLE_ON_NODE, our_node_id) {
+                    tracing::info!("TEST: deferring PaymentClaimable for {}", payment_hash);
+                    PAYMENT_CLAIMABLE_DEFERRED.store(true, Ordering::SeqCst);
+                    let deferred_at = Instant::now();
+                    while node_override_matches(&DEFER_PAYMENT_CLAIMABLE_ON_NODE, our_node_id) {
+                        if deferred_at.elapsed() > MAX_PAYMENT_DEFERRAL {
+                            panic!(
+                                "TEST: PaymentClaimable for {payment_hash} deferred for too long"
+                            )
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    tracing::info!("TEST: resuming PaymentClaimable for {}", payment_hash);
+                }
+            }
             let payment_preimage = match purpose {
                 PaymentPurpose::Bolt11InvoicePayment {
                     payment_preimage, ..
@@ -1104,12 +1181,10 @@ async fn handle_ldk_events(
             ..
         } => {
             #[cfg(test)]
-            if IGNORE_INBOUND_CHANNELS_ON_NODE
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|id| *id == unlocked_state.channel_manager.get_our_node_id())
-            {
+            if node_override_matches(
+                &IGNORE_INBOUND_CHANNELS_ON_NODE,
+                unlocked_state.channel_manager.get_our_node_id(),
+            ) {
                 tracing::info!(
                     "TEST: ignoring inbound channel {} from {}",
                     temporary_channel_id,
@@ -1632,8 +1707,8 @@ async fn handle_ldk_events(
     Ok(())
 }
 
-impl OutputSpender for RgbOutputSpender {
-    fn spend_spendable_outputs(
+impl RgbOutputSpender {
+    fn try_spend_spendable_outputs(
         &self,
         descriptors: &[&SpendableOutputDescriptor],
         outputs: Vec<TxOut>,
@@ -1641,7 +1716,7 @@ impl OutputSpender for RgbOutputSpender {
         feerate_sat_per_1000_weight: u32,
         locktime: Option<LockTime>,
         secp_ctx: &Secp256k1<All>,
-    ) -> Result<bitcoin::Transaction, ()> {
+    ) -> Result<bitcoin::Transaction, String> {
         let mut hasher = DefaultHasher::new();
         descriptors.hash(&mut hasher);
         let descriptors_hash = hasher.finish();
@@ -1674,7 +1749,12 @@ impl OutputSpender for RgbOutputSpender {
                 continue;
             };
             let transfer_info = read_rgb_transfer_info(&transfer_info_path);
-            if transfer_info.rgb_amount == 0 {
+            let amt_rgb = transfer_info
+                .output_map
+                .get(&outpoint.index.into())
+                .copied()
+                .expect("transfer info covers every spendable output of the transaction");
+            if amt_rgb == 0 {
                 continue;
             }
 
@@ -1683,16 +1763,16 @@ impl OutputSpender for RgbOutputSpender {
             let closing_height = self
                 .rgb_wallet_wrapper
                 .get_tx_height(txid_str.clone())
-                .map_err(|_| ())?;
+                .map_err(|e| format!("cannot get height of {txid_str}: {e}"))?
+                .ok_or_else(|| format!("transaction {txid_str} is not confirmed yet"))?;
             let update_res = self
                 .rgb_wallet_wrapper
-                .update_witnesses(
-                    closing_height.unwrap(),
-                    vec![RgbTxid::from_str(&txid_str).unwrap()],
-                )
-                .unwrap();
+                .update_witnesses(closing_height, vec![RgbTxid::from_str(&txid_str).unwrap()])
+                .map_err(|e| format!("error while updating witnesses for {txid_str}: {e}"))?;
             if !update_res.failed.is_empty() {
-                return Err(());
+                return Err(format!(
+                    "failed to update witnesses for {txid_str}: {update_res:?}"
+                ));
             }
 
             let contract_id = transfer_info.contract_id;
@@ -1711,7 +1791,7 @@ impl OutputSpender for RgbOutputSpender {
                         vec![],
                         0,
                     )
-                    .unwrap();
+                    .map_err(|e| format!("cannot get a witness receive script: {e}"))?;
                 let script_pubkey = script_buf_from_recipient_id(receive_data.recipient_id.clone())
                     .unwrap()
                     .unwrap();
@@ -1721,8 +1801,6 @@ impl OutputSpender for RgbOutputSpender {
                 });
                 receive_data.recipient_id
             };
-
-            let amt_rgb = transfer_info.rgb_amount;
 
             asset_info
                 .entry(contract_id)
@@ -1737,14 +1815,17 @@ impl OutputSpender for RgbOutputSpender {
         }
 
         if vanilla_descriptor {
-            return self.keys_manager.spend_spendable_outputs(
-                descriptors.as_ref(),
-                txouts,
-                change_destination_script,
-                feerate_sat_per_1000_weight,
-                locktime,
-                secp_ctx,
-            );
+            return self
+                .keys_manager
+                .spend_spendable_outputs(
+                    descriptors.as_ref(),
+                    txouts,
+                    change_destination_script,
+                    feerate_sat_per_1000_weight,
+                    locktime,
+                    secp_ctx,
+                )
+                .map_err(|()| s!("cannot spend vanilla spendable outputs"));
         }
 
         let feerate_sat_per_1000_weight = FEE_RATE as u32 * 250; // 1 sat/vB = 250 sat/kw
@@ -1757,7 +1838,7 @@ impl OutputSpender for RgbOutputSpender {
                 feerate_sat_per_1000_weight,
                 locktime,
             )
-            .unwrap();
+            .map_err(|()| s!("cannot create the spendable outputs PSBT"))?;
 
         let mut asset_info_map = map![];
         for (contract_id, (vout, amt_rgb, _)) in asset_info.clone() {
@@ -1776,11 +1857,11 @@ impl OutputSpender for RgbOutputSpender {
             nonce: None,
         };
 
-        let mut psbt = RgbLibPsbt::from_str(&psbt.to_string()).unwrap();
+        let mut psbt = RgbLibPsbt::from_str(&psbt.to_string()).expect("valid PSBT");
         let consignments = self
             .rgb_wallet_wrapper
             .color_psbt_and_consume(&mut psbt, coloring_info)
-            .unwrap();
+            .expect("coloring matches the amounts assigned to the spent outputs");
 
         let mut psbt = Psbt::from_str(&psbt.to_string()).expect("valid transaction");
 
@@ -1810,26 +1891,48 @@ impl OutputSpender for RgbOutputSpender {
                 .join(format!("consignment_{closing_txid}_{contract_id}"));
             consignment
                 .save_file(&consignment_path)
-                .expect("successful save");
+                .map_err(|e| format!("cannot save consignment: {e}"))?;
             let consignment_path_str = consignment_path.to_string_lossy().to_string();
             let rgb_wallet_wrapper_copy = self.rgb_wallet_wrapper.clone();
-            let res = futures::executor::block_on(tokio::task::spawn_blocking(move || {
+            futures::executor::block_on(tokio::task::spawn_blocking(move || {
                 rgb_wallet_wrapper_copy
                     .provide_out_of_band_consignment(consignment_path_str, vec![])
-            }));
-            if let Err(e) = res {
-                tracing::error!("cannot provide consignment: {e}");
-                return Err(());
-            }
+            }))
+            .unwrap()
+            .map_err(|e| format!("cannot provide consignment: {e}"))?;
             fs::remove_file(&consignment_path).unwrap();
         }
 
         txes.insert(descriptors_hash, spending_tx.clone());
         self.fs_store
             .write("", "", OUTPUT_SPENDER_TXES, txes.encode())
-            .unwrap();
+            .map_err(|e| format!("cannot persist output spender txes: {e}"))?;
 
         Ok(spending_tx)
+    }
+}
+
+impl OutputSpender for RgbOutputSpender {
+    fn spend_spendable_outputs(
+        &self,
+        descriptors: &[&SpendableOutputDescriptor],
+        outputs: Vec<TxOut>,
+        change_destination_script: ScriptBuf,
+        feerate_sat_per_1000_weight: u32,
+        locktime: Option<LockTime>,
+        secp_ctx: &Secp256k1<All>,
+    ) -> Result<bitcoin::Transaction, ()> {
+        self.try_spend_spendable_outputs(
+            descriptors,
+            outputs,
+            change_destination_script,
+            feerate_sat_per_1000_weight,
+            locktime,
+            secp_ctx,
+        )
+        .map_err(|e| {
+            tracing::error!("cannot spend spendable outputs, will retry: {e}");
+        })
     }
 }
 
@@ -2431,7 +2534,7 @@ pub(crate) async fn start_ldk(
 
     // Background Processing
     let (bp_exit, bp_exit_check) = tokio::sync::watch::channel(());
-    let background_processor = tokio::spawn(process_events_async(
+    let bp_fut = process_events_async(
         persister,
         event_handler,
         chain_monitor.clone(),
@@ -2460,7 +2563,21 @@ pub(crate) async fn start_ldk(
                     .unwrap(),
             )
         },
-    ));
+    );
+    let background_processor = tokio::spawn({
+        let stop = Arc::clone(&stop_processing);
+        let cancel = app_state.cancel_token.clone();
+        async move {
+            let res = bp_fut.await;
+            if !stop.load(Ordering::Acquire) {
+                let msg = format!("background processor exited: {res:?}");
+                tracing::error!("{msg}");
+                let _ = FATAL_ERROR.set(msg);
+                cancel.cancel();
+            }
+            res
+        }
+    });
 
     // Regularly reconnect to channel peers.
     let connect_cm = Arc::clone(&channel_manager);
@@ -2604,9 +2721,11 @@ impl AppState {
             .store(true, Ordering::Release);
         ldk_background_services.peer_manager.disconnect_all_peers();
 
-        // Stop the background processor.
+        // Stop the background processor. Its `bp_exit` receiver lives inside the
+        // `process_events_async` future, so nothing to signal if the background processor is
+        // already gone. Also, send can find no receiver during a panic (racy).
         if !ldk_background_services.bp_exit.is_closed() {
-            ldk_background_services.bp_exit.send(()).unwrap();
+            let _ = ldk_background_services.bp_exit.send(());
             ldk_background_services.background_processor.take()
         } else {
             None
@@ -2618,7 +2737,13 @@ pub(crate) async fn stop_ldk(app_state: Arc<AppState>) {
     tracing::info!("Stopping LDK");
 
     if let Some(join_handle) = app_state.stop_ldk() {
-        join_handle.await.unwrap().unwrap();
+        // this runs while shutting down, possibly because the background processor itself died,
+        // so its outcome is reported instead of unwrapped
+        match join_handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!("Background processor returned an error: {e}"),
+            Err(e) => tracing::error!("Background processor task did not complete: {e}"),
+        }
     }
 
     // connect to the peer port so it can be released
@@ -2633,7 +2758,8 @@ pub(crate) async fn stop_ldk(app_state: Arc<AppState>) {
             break;
         }
         if (OffsetDateTime::now_utc() - t_0).as_seconds_f32() > 10.0 {
-            panic!("LDK peer port not being released")
+            tracing::error!("LDK peer port {peer_port} was not released within 10s");
+            break;
         }
     }
 

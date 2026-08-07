@@ -2,6 +2,7 @@ mod args;
 mod auth;
 mod backup;
 mod bitcoind;
+mod crypto;
 mod disk;
 mod error;
 mod ldk;
@@ -23,7 +24,11 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
 use tokio::signal;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -58,6 +63,11 @@ use crate::routes::{
 };
 use crate::utils::{start_daemon, AppState, LOGS_DIR};
 
+pub(crate) static FATAL_ERROR: OnceLock<String> = OnceLock::new();
+
+// how long a fatal shutdown waits for an in-progress state change (unlock or lock)
+const STATE_CHANGE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() -> Result<()> {
     let args = args::parse_startup_args()?;
@@ -86,12 +96,29 @@ async fn main() -> Result<()> {
 
     let (router, app_state) = app(args).await?;
 
+    let default_panic_hook = std::panic::take_hook();
+    let cancel_token = app_state.cancel_token.clone();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        tracing::error!("{panic_info}");
+        let _ = FATAL_ERROR.set(panic_info.to_string());
+        cancel_token.cancel();
+        default_panic_hook(panic_info);
+    }));
+
     tracing::info!("Listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal(app_state))
         .await
         .unwrap();
+
+    if let Some(fatal_error) = FATAL_ERROR.get() {
+        tracing::error!("Shutting down due to fatal error: {fatal_error}");
+        // `process::exit` runs no destructors, so the file logger has to be flushed by hand:
+        // dropping the guard waits for the appender to write out what is still buffered
+        drop(_guard);
+        std::process::exit(70); // sysexits EX_SOFTWARE
+    }
 
     Ok(())
 }
@@ -244,11 +271,23 @@ async fn shutdown_signal(app_state: Arc<AppState>) {
     tracing::info!("Received a shutdown signal");
 
     let app_state_copy = app_state.clone();
+    // only a fatal shutdown gives up on an in-progress state change: nobody is waiting for the
+    // node and the exit code still has to be reported, so it cannot wait forever
+    let deadline = FATAL_ERROR
+        .get()
+        .map(|_| Instant::now() + STATE_CHANGE_SHUTDOWN_TIMEOUT);
     loop {
         {
             if app_state_copy.wait_state_change() {
                 break;
             }
+        }
+        if deadline.is_some_and(|deadline| Instant::now() > deadline) {
+            tracing::warn!(
+                "State change did not complete within {}s, shutting down anyway",
+                STATE_CHANGE_SHUTDOWN_TIMEOUT.as_secs()
+            );
+            break;
         }
         tracing::info!("Will shutdown after change state is complete");
         tokio::time::sleep(Duration::from_millis(300)).await;
