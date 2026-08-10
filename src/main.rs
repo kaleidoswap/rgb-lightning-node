@@ -1,18 +1,28 @@
+#[cfg(not(any(feature = "electrum", feature = "esplora")))]
+compile_error!("at least one of the `electrum` and `esplora` features needs to be enabled");
+
+#[cfg(not(any(feature = "block-sync", feature = "transaction-sync")))]
+compile_error!(
+    "at least one of the `block-sync` and `transaction-sync` features needs to be enabled"
+);
+
 mod args;
 mod auth;
 mod backup;
-mod bitcoind;
 mod crypto;
 mod disk;
 mod error;
 mod ldk;
+mod ldk_chain_backend;
 mod rgb;
 mod rgb_file_transfer;
 mod routes;
 mod swap;
 mod utils;
 
-#[cfg(test)]
+// the test suite calls into `electrum_client` to wait for electrs to catch up with bitcoind, and
+// that crate is only pulled in by the `electrum` feature
+#[cfg(all(test, feature = "electrum"))]
 mod test;
 
 use anyhow::Result;

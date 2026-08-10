@@ -1,15 +1,27 @@
 use amplify::s;
 use biscuit_auth::{builder::date, macros::*, KeyPair};
+#[cfg(all(feature = "transaction-sync", feature = "electrum"))]
+use bitcoin::block::Header;
+#[cfg(all(feature = "transaction-sync", feature = "electrum"))]
+use bitcoin::consensus::encode;
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Amount, Denomination};
+#[cfg(all(feature = "transaction-sync", feature = "electrum"))]
+use bitcoin::{BlockHash, ScriptBuf, Transaction as BitcoinTransaction, Txid};
 use chrono::{DateTime, Local, Utc};
 use electrum_client::ElectrumApi;
 use http::response::Builder;
 use lazy_static::lazy_static;
+#[cfg(all(feature = "transaction-sync", feature = "electrum"))]
+use lightning::chain::transaction::TransactionData;
+#[cfg(all(feature = "transaction-sync", feature = "electrum"))]
+use lightning::chain::{Confirm, Filter};
 use lightning::ln::channelmanager::DROP_FUNDING_SIGNED_ON_NODE;
 use lightning_invoice::Bolt11Invoice;
+#[cfg(all(feature = "transaction-sync", feature = "electrum"))]
+use lightning_transaction_sync::ElectrumSyncClient;
 use once_cell::sync::Lazy;
 use reqwest::Response;
 use rgb_lib::BitcoinNetwork;
@@ -20,12 +32,16 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
+#[cfg(all(feature = "esplora", feature = "transaction-sync"))]
+use std::sync::atomic::AtomicBool;
 use std::sync::{atomic::Ordering, Mutex, Once, RwLock};
 use time::OffsetDateTime;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tracing_test::traced_test;
 
+#[cfg(all(feature = "transaction-sync", feature = "electrum"))]
+use crate::disk::FilesystemLogger;
 use crate::disk::LDK_LOGS_FILE;
 use crate::error::APIErrorResponse;
 use crate::ldk::{
@@ -46,11 +62,11 @@ use crate::routes::{
     InitResponse, InvoiceStatus, InvoiceStatusRequest, InvoiceStatusResponse, IssueAssetCFARequest,
     IssueAssetCFAResponse, IssueAssetIFARequest, IssueAssetIFAResponse, IssueAssetNIARequest,
     IssueAssetNIAResponse, IssueAssetUDARequest, IssueAssetUDAResponse, KeysendRequest,
-    KeysendResponse, LNInvoiceRequest, LNInvoiceResponse, ListAssetsRequest, ListAssetsResponse,
-    ListChannelsResponse, ListPaymentsResponse, ListPeersResponse, ListSwapsResponse,
-    ListTransactionsRequest, ListTransactionsResponse, ListTransfersRequest, ListTransfersResponse,
-    ListUnspentsRequest, ListUnspentsResponse, MakerExecuteRequest, MakerInitRequest,
-    MakerInitResponse, NetworkInfoResponse, NodeInfoResponse, OpenChannelRequest,
+    KeysendResponse, LNInvoiceRequest, LNInvoiceResponse, LdkChainSync, ListAssetsRequest,
+    ListAssetsResponse, ListChannelsResponse, ListPaymentsResponse, ListPeersResponse,
+    ListSwapsResponse, ListTransactionsRequest, ListTransactionsResponse, ListTransfersRequest,
+    ListTransfersResponse, ListUnspentsRequest, ListUnspentsResponse, MakerExecuteRequest,
+    MakerInitRequest, MakerInitResponse, NetworkInfoResponse, NodeInfoResponse, OpenChannelRequest,
     OpenChannelResponse, Payment, Peer, PostAssetMediaResponse, ProvideOutOfBandAckRequest,
     ProvideOutOfBandAckResponse, ProvideOutOfBandConsignmentResponse, Recipient, RefreshRequest,
     RefreshResponse, RestoreRequest, RevokeTokenRequest, RgbInvoiceRequest, RgbInvoiceResponse,
@@ -62,7 +78,9 @@ use crate::utils::{hex_str, hex_str_to_vec, ELECTRUM_URL_REGTEST, LDK_DIR, PROXY
 
 use super::*;
 
-const ELECTRUM_URL: &str = "127.0.0.1:50001";
+// only the transaction-sync tests point a node at esplora
+#[cfg(all(feature = "esplora", feature = "transaction-sync"))]
+const ESPLORA_URL_REGTEST: &str = "http://127.0.0.1:3002";
 const NODE1_PEER_PORT: u16 = 9801;
 const NODE2_PEER_PORT: u16 = 9802;
 const NODE3_PEER_PORT: u16 = 9803;
@@ -128,6 +146,30 @@ impl Drop for ElectrsRestartGuard {
     }
 }
 
+// Makes `mine` also wait for esplora to catch up with bitcoind, for the duration of a test that
+// syncs a node through it. Scoped to a guard so the rest of the suite, which only queries electrs,
+// doesn't pay for an indexer it never reads, and so a panicking test cannot leak the setting.
+#[cfg(all(feature = "esplora", feature = "transaction-sync"))]
+static WAIT_ESPLORA_SYNC: AtomicBool = AtomicBool::new(false);
+
+#[cfg(all(feature = "esplora", feature = "transaction-sync"))]
+struct EsploraSyncGuard;
+
+#[cfg(all(feature = "esplora", feature = "transaction-sync"))]
+impl EsploraSyncGuard {
+    fn set() -> Self {
+        WAIT_ESPLORA_SYNC.store(true, Ordering::SeqCst);
+        Self
+    }
+}
+
+#[cfg(all(feature = "esplora", feature = "transaction-sync"))]
+impl Drop for EsploraSyncGuard {
+    fn drop(&mut self) {
+        WAIT_ESPLORA_SYNC.store(false, Ordering::SeqCst);
+    }
+}
+
 // Sets a test-override static to a node's pubkey and clears it on drop, so a
 // panicking test cannot leak the override into the next one
 struct NodeOverrideGuard(&'static Mutex<Option<PublicKey>>);
@@ -182,6 +224,27 @@ fn bitcoin_cli() -> [String; 7] {
     ]
 }
 
+// runs a bitcoin-cli command against the regtest bitcoind, returning its trimmed stdout. wallet
+// commands need an explicit `-rpcwallet=<name>` as their first argument
+fn bitcoind(args: &[&str]) -> String {
+    let output = Command::new("docker")
+        .stdin(Stdio::null())
+        .arg("compose")
+        .args(bitcoin_cli())
+        .args(args)
+        .output()
+        .expect("failed to call bitcoin-cli");
+    assert!(
+        output.status.success(),
+        "bitcoin-cli {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("bitcoin-cli output is not valid UTF-8")
+        .trim()
+        .to_string()
+}
+
 fn check_preimage_matches_hash(payment: &Payment, expected_payment_hash: &str) {
     let payment_preimage = payment.preimage.as_ref().unwrap();
     let payment_preimage_hash =
@@ -212,36 +275,11 @@ async fn check_response_is_nok(
 fn fund_wallet(address: String, sats: u64) {
     let amt = Amount::from_sat(sats);
     let btc_str = amt.to_string_in(Denomination::Bitcoin);
-    let status = Command::new("docker")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .arg("compose")
-        .args(bitcoin_cli())
-        .arg("-rpcwallet=miner")
-        .arg("sendtoaddress")
-        .arg(address)
-        .arg(btc_str)
-        .status()
-        .expect("failed to fund wallet");
-    assert!(status.success());
+    bitcoind(&["-rpcwallet=miner", "sendtoaddress", &address, &btc_str]);
 }
 
 fn get_txout(txid: &str) -> String {
-    String::from_utf8(
-        Command::new("docker")
-            .stdin(Stdio::null())
-            .arg("compose")
-            .args(bitcoin_cli())
-            .arg("-rpcwallet=miner")
-            .arg("gettxout")
-            .arg(txid)
-            .arg("0")
-            .output()
-            .expect("failed get txout")
-            .stdout,
-    )
-    .unwrap()
+    bitcoind(&["-rpcwallet=miner", "gettxout", txid, "0"])
 }
 
 async fn start_daemon(
@@ -323,6 +361,21 @@ async fn start_node(
     node_peer_port: u16,
     keep_node_dir: bool,
 ) -> (SocketAddr, String) {
+    start_node_with(
+        node_test_dir,
+        node_peer_port,
+        keep_node_dir,
+        default_ldk_chain_sync(),
+    )
+    .await
+}
+
+async fn start_node_with(
+    node_test_dir: &str,
+    node_peer_port: u16,
+    keep_node_dir: bool,
+    ldk_chain_sync: LdkChainSync,
+) -> (SocketAddr, String) {
     println!("starting node with peer port {node_peer_port}");
     let node_address = start_daemon(node_test_dir, node_peer_port, None, keep_node_dir).await;
 
@@ -332,7 +385,7 @@ async fn start_node(
         init(node_address, &password, None).await;
     }
 
-    unlock(node_address, &password).await;
+    unlock_with(node_address, &password, ldk_chain_sync).await;
 
     println!("node on peer port {node_peer_port} started with address {node_address:?}");
     (node_address, password)
@@ -1974,22 +2027,47 @@ async fn taker(node_address: SocketAddr, swapstring: String) -> EmptyResponse {
         .unwrap()
 }
 
-fn unlock_req(password: &str) -> UnlockRequest {
-    UnlockRequest {
-        password: password.to_string(),
+// the sync mode the suite unlocks its nodes with: block-sync against the local bitcoind when that
+// backend is available, falling back to transaction-sync against the local electrs otherwise
+fn default_ldk_chain_sync() -> LdkChainSync {
+    #[cfg(feature = "block-sync")]
+    return LdkChainSync::BlockSync {
         bitcoind_rpc_username: s!("user"),
         bitcoind_rpc_password: s!("password"),
         bitcoind_rpc_host: s!("localhost"),
         bitcoind_rpc_port: 18443,
-        indexer_url: Some(ELECTRUM_URL_REGTEST.to_string()),
+    };
+    #[cfg(not(feature = "block-sync"))]
+    return LdkChainSync::TransactionSync {
+        indexer_url: ELECTRUM_URL_REGTEST.to_string(),
+    };
+}
+
+fn unlock_req(password: &str) -> UnlockRequest {
+    unlock_req_with(password, default_ldk_chain_sync())
+}
+
+fn unlock_req_with(password: &str, ldk_chain_sync: LdkChainSync) -> UnlockRequest {
+    UnlockRequest {
+        password: password.to_string(),
+        ldk_chain_sync,
+        indexer_url: ELECTRUM_URL_REGTEST.to_string(),
         announce_addresses: vec![],
         announce_alias: Some(s!("RLN_alias")),
     }
 }
 
 async fn unlock_res(node_address: SocketAddr, password: &str) -> Response {
+    unlock_res_with(node_address, password, default_ldk_chain_sync()).await
+}
+
+async fn unlock_res_with(
+    node_address: SocketAddr,
+    password: &str,
+    ldk_chain_sync: LdkChainSync,
+) -> Response {
     println!("unlocking node {node_address}");
-    let payload = unlock_req(password);
+    let payload = unlock_req_with(password, ldk_chain_sync);
     reqwest::Client::new()
         .post(format!("http://{node_address}/unlock"))
         .json(&payload)
@@ -2000,17 +2078,8 @@ async fn unlock_res(node_address: SocketAddr, password: &str) -> Response {
 
 // Output values (in sats) of an on-chain transaction
 fn tx_output_sats(txid: &str) -> Vec<u64> {
-    let output = Command::new("docker")
-        .stdin(Stdio::null())
-        .arg("compose")
-        .args(bitcoin_cli())
-        .arg("getrawtransaction")
-        .arg(txid)
-        .arg("true")
-        .output()
-        .expect("able to call getrawtransaction");
-    assert!(output.status.success());
-    let tx: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid tx JSON");
+    let raw_tx = bitcoind(&["getrawtransaction", txid, "true"]);
+    let tx: serde_json::Value = serde_json::from_str(&raw_tx).expect("valid tx JSON");
     tx["vout"]
         .as_array()
         .expect("vout array")
@@ -2024,8 +2093,12 @@ fn tx_output_sats(txid: &str) -> Vec<u64> {
 }
 
 async fn unlock(node_address: SocketAddr, password: &str) {
+    unlock_with(node_address, password, default_ldk_chain_sync()).await
+}
+
+async fn unlock_with(node_address: SocketAddr, password: &str, ldk_chain_sync: LdkChainSync) {
     println!("unlocking node {node_address}");
-    let res = unlock_res(node_address, password).await;
+    let res = unlock_res_with(node_address, password, ldk_chain_sync).await;
     check_response_is_ok(res)
         .await
         .json::<EmptyResponse>()
@@ -2149,18 +2222,7 @@ impl Miner {
         if self.no_mine_count > 0 {
             return false;
         }
-        let status = Command::new("docker")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .arg("compose")
-            .args(bitcoin_cli())
-            .arg("-rpcwallet=miner")
-            .arg("-generate")
-            .arg(num_blocks.to_string())
-            .status()
-            .expect("failed to mine");
-        assert!(status.success());
+        bitcoind(&["-rpcwallet=miner", "-generate", &num_blocks.to_string()]);
         true
     }
 
@@ -2201,6 +2263,10 @@ fn mine_n_blocks(resume: bool, num_blocks: u16) {
         }
     }
     wait_electrs_sync();
+    #[cfg(all(feature = "esplora", feature = "transaction-sync"))]
+    if WAIT_ESPLORA_SYNC.load(Ordering::SeqCst) {
+        wait_esplora_sync();
+    }
 }
 
 fn stop_mining() {
@@ -2218,21 +2284,27 @@ fn resume_mining() {
 }
 
 fn get_block_count() -> u32 {
-    let output = Command::new("docker")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .arg("compose")
-        .args(bitcoin_cli())
-        .arg("getblockcount")
-        .output()
-        .expect("failed to call getblockcount");
-    assert!(output.status.success());
-    let blockcount_str =
-        std::str::from_utf8(&output.stdout).expect("could not parse blockcount output");
-    blockcount_str
-        .trim()
+    bitcoind(&["getblockcount"])
         .parse::<u32>()
         .expect("could not parse blockcount")
+}
+
+// the esplora indexer catches up with bitcoind independently of electrs, so a node syncing
+// through it needs its own wait after mining
+#[cfg(all(feature = "esplora", feature = "transaction-sync"))]
+fn wait_esplora_sync() {
+    let t_0 = OffsetDateTime::now_utc();
+    let blockcount = get_block_count();
+    let client = esplora_client::Builder::new(ESPLORA_URL_REGTEST).build_blocking();
+    loop {
+        if client.get_height().is_ok_and(|height| height >= blockcount) {
+            break;
+        };
+        if (OffsetDateTime::now_utc() - t_0).as_seconds_f32() > 30.0 {
+            panic!("esplora not syncing with bitcoind");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 fn wait_electrs_sync() {
@@ -2240,7 +2312,7 @@ fn wait_electrs_sync() {
     let blockcount = get_block_count();
     loop {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let synced = electrum_client::Client::new(ELECTRUM_URL)
+        let synced = electrum_client::Client::new(ELECTRUM_URL_REGTEST)
             .is_ok_and(|electrum| electrum.block_header(blockcount as usize).is_ok());
         if synced {
             break;
@@ -2297,6 +2369,8 @@ mod close_force_standard;
 mod concurrent_btc_payments;
 mod concurrent_openchannel;
 mod drop_funding_signed;
+#[cfg(all(feature = "transaction-sync", feature = "electrum"))]
+mod electrum_opret_confirm;
 mod fail_transfers;
 mod getchannelid;
 mod htlc_amount_checks;
@@ -2338,5 +2412,7 @@ mod swap_roundtrip_multihop_buy;
 mod swap_roundtrip_multihop_sell;
 mod swap_roundtrip_sell;
 mod stock_ldk_interop;
+#[cfg(feature = "transaction-sync")]
+mod transaction_sync;
 mod upload_asset_media;
 mod vanilla_payment_on_rgb_channel;
