@@ -56,7 +56,7 @@ electrum-client = { version = "0.24.0", default-features = false, features = ["u
 esplora-client = { version = "0.12", default-features = false, features = ["blocking-https-rustls"], optional = true }
 futures = "0.3"
 hex = { package = "hex-conservative", version = "0.3.0", default-features = false }
-lightning = { version = "0.2.0", path = "./rust-lightning/lightning", features = ["dnssec"] }
+lightning = { version = "0.2.0", path = "./rust-lightning/lightning", features = ["dnssec", "electrum", "esplora"] }
 lightning-background-processor = { version = "0.2.0", path = "./rust-lightning/lightning-background-processor" }
 lightning-block-sync = { version = "0.2.0", features = ["rpc-client", "tokio"], optional = true }
 lightning-dns-resolver = { version = "0.3.0", path = "./rust-lightning/lightning-dns-resolver" }
@@ -90,6 +90,7 @@ dircmp = "0.2.0"
 electrum-client = "0.24.0"
 http = "1.4.0"
 lazy_static = { version = "1.5.0", default-features = false }
+ldk-server-client = { path = "./test/ldk-server/ldk-server-client" }
 lightning = { version = "0.2.0", path = "./rust-lightning/lightning", features = ["_rln_test_hooks"] }
 once_cell = "1.20.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "native-tls", "stream"] }

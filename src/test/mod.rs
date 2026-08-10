@@ -2411,6 +2411,7 @@ mod swap_roundtrip_multihop_asset_asset;
 mod swap_roundtrip_multihop_buy;
 mod swap_roundtrip_multihop_sell;
 mod swap_roundtrip_sell;
+mod stock_ldk_interop;
 #[cfg(feature = "transaction-sync")]
 mod transaction_sync;
 mod upload_asset_media;
