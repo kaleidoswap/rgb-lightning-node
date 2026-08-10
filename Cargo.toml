@@ -24,7 +24,7 @@ clap = "4.5.20"
 dirs = "5.0.1"
 futures = "0.3"
 hex = { package = "hex-conservative", version = "0.3.0", default-features = false }
-lightning = { version = "0.2.0", path = "./rust-lightning/lightning", features = ["dnssec"] }
+lightning = { version = "0.2.0", path = "./rust-lightning/lightning", features = ["dnssec", "electrum", "esplora"] }
 lightning-background-processor = { version = "0.2.0", path = "./rust-lightning/lightning-background-processor" }
 lightning-block-sync = { version = "0.2.0", features = ["rpc-client", "tokio"] }
 lightning-dns-resolver = { version = "0.3.0", path = "./rust-lightning/lightning-dns-resolver" }
