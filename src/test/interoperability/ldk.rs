@@ -1,5 +1,6 @@
 use super::super::*;
 use super::*;
+use lightning_invoice::Bolt11Invoice;
 
 const TEST_DIR_BASE: &str = "tmp/interoperability_ldk/";
 const CHANNEL_CAPACITY_SAT: u64 = 600_000;
@@ -8,6 +9,14 @@ const RETURN_PAYMENT_MSAT: u64 = 10_000_000;
 // the two payments settle on-chain balances only at close, so channel balances are compared with a
 // tolerance covering the commitment transaction fees
 const FEE_TOLERANCE_SAT: u64 = 2_000;
+
+fn assert_stock_ldk_route_hint(invoice: &str, stock_node_id: &str) {
+    let invoice: Bolt11Invoice = invoice.parse().unwrap();
+    let hints = invoice.route_hints();
+    assert_eq!(hints.len(), 1);
+    assert_eq!(hints[0].0.len(), 1);
+    assert_eq!(hints[0].0[0].src_node_id.to_string(), stock_node_id);
+}
 
 /// Pay in both directions over a ready channel, then close it cooperatively
 async fn exercise_channel(rln_addr: SocketAddr, stock: &mut StockLdkNode, rln_funded: bool) {
@@ -26,11 +35,13 @@ async fn exercise_channel(rln_addr: SocketAddr, stock: &mut StockLdkNode, rln_fu
         let invoice = ln_invoice(rln_addr, Some(RETURN_PAYMENT_MSAT), None, None, 900)
             .await
             .invoice;
+        assert_stock_ldk_route_hint(&invoice, &stock.node_id);
         stock.pay(&invoice);
     } else {
         let invoice = ln_invoice(rln_addr, Some(FORWARD_PAYMENT_MSAT), None, None, 900)
             .await
             .invoice;
+        assert_stock_ldk_route_hint(&invoice, &stock.node_id);
         stock.pay(&invoice);
         let invoice = stock.invoice(RETURN_PAYMENT_MSAT);
         send_payment(rln_addr, invoice).await;
