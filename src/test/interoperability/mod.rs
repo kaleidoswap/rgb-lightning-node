@@ -88,6 +88,11 @@ impl StockLdkNode {
         assert_eq!(self.command(&command), "OPENING");
     }
 
+    fn open_announced_channel(&mut self, peer_pubkey: &str, peer_port: u16) {
+        let command = format!("open-announced {peer_pubkey} 127.0.0.1:{peer_port}");
+        assert_eq!(self.command(&command), "OPENING");
+    }
+
     /// Number of channels the stock node has, and how many of them are ready
     fn channels(&mut self) -> (usize, usize) {
         let response = self.command("channels");
