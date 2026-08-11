@@ -36,6 +36,9 @@ fn main() {
     builder
         .set_listening_addresses(vec![listening_address])
         .unwrap();
+    builder
+        .set_node_alias("stock-ldk-test".to_string())
+        .unwrap();
     let entropy = NodeEntropy::from_seed_path(format!("{storage_dir}/keys_seed")).unwrap();
     let node = builder.build(entropy).unwrap();
     node.start().unwrap();
@@ -55,6 +58,19 @@ fn main() {
                 let peer_address = SocketAddress::from_str(parts.next().unwrap()).unwrap();
                 node.open_channel(peer_id, peer_address, CHANNEL_CAPACITY_SAT, None, None)
                     .unwrap();
+                respond("OPENING");
+            }
+            "open-announced" => {
+                let peer_id = PublicKey::from_str(parts.next().unwrap()).unwrap();
+                let peer_address = SocketAddress::from_str(parts.next().unwrap()).unwrap();
+                node.open_announced_channel(
+                    peer_id,
+                    peer_address,
+                    CHANNEL_CAPACITY_SAT,
+                    None,
+                    None,
+                )
+                .unwrap();
                 respond("OPENING");
             }
             "channels" => {
