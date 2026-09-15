@@ -4277,7 +4277,7 @@ pub(crate) async fn sign_message(
 
     let message = payload.message.trim();
     let signed_message = lightning::util::message_signing::sign(
-        &message.as_bytes()[message.len()..],
+        message.as_bytes(),
         &unlocked_state.keys_manager.get_node_secret_key(),
     );
 
