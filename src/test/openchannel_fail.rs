@@ -39,7 +39,7 @@ async fn openchannel_fail() {
     )
     .await;
     check_response_is_nok(
-        res.unwrap_err(),
+        *res.unwrap_err(),
         reqwest::StatusCode::FORBIDDEN,
         "Not enough funds",
         "InsufficientFunds",
@@ -70,7 +70,7 @@ async fn openchannel_fail() {
     )
     .await;
     check_response_is_nok(
-        res.unwrap_err(),
+        *res.unwrap_err(),
         reqwest::StatusCode::FORBIDDEN,
         "Not enough funds",
         "InsufficientFunds",
@@ -101,7 +101,7 @@ async fn openchannel_fail() {
     )
     .await;
     check_response_is_nok(
-        res.unwrap_err(),
+        *res.unwrap_err(),
         reqwest::StatusCode::FORBIDDEN,
         "Not enough assets",
         "InsufficientAssets",

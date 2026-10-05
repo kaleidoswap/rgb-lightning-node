@@ -1,4 +1,3 @@
-use super::super::*;
 use super::*;
 
 const TEST_DIR_BASE: &str = "tmp/interoperability_ldk/";

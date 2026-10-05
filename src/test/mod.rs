@@ -50,8 +50,8 @@ use crate::ldk::{
     PAYMENT_CLAIMABLE_DEFERRED,
 };
 use crate::routes::{
-    AddressResponse, AssetBalanceRequest, AssetBalanceResponse, AssetCFA, AssetIFA, AssetNIA,
-    AssetUDA, Assignment, BackupRequest, BtcBalanceRequest, BtcBalanceResponse,
+    AddressResponse, AssetBalanceRequest, AssetBalanceResponse, AssetCFA, AssetFilter, AssetIFA,
+    AssetNIA, AssetUDA, Assignment, BackupRequest, BtcBalanceRequest, BtcBalanceResponse,
     ChangePasswordRequest, Channel, CloseChannelRequest, ConnectPeerRequest, CreateUtxosRequest,
     DecodeLNInvoiceRequest, DecodeLNInvoiceResponse, DecodeRGBInvoiceRequest,
     DecodeRGBInvoiceResponse, DecodeSwapstringRequest, DecodeSwapstringResponse,
@@ -1187,7 +1187,8 @@ async fn list_transactions(node_address: SocketAddr) -> Vec<Transaction> {
 async fn list_transfers(node_address: SocketAddr, asset_id: &str) -> Vec<Transfer> {
     println!("listing transfers for asset {asset_id} on node {node_address}");
     let payload = ListTransfersRequest {
-        asset_id: asset_id.to_string(),
+        asset_filter: AssetFilter::Id(asset_id.to_string()),
+        txid: None,
     };
     let res = reqwest::Client::new()
         .post(format!("http://{node_address}/listtransfers"))
@@ -1238,6 +1239,8 @@ async fn ln_invoice(
         expiry_sec,
         asset_id: asset_id.map(|a| a.to_string()),
         asset_amount,
+        description: None,
+        description_hash: None,
     };
     let res = reqwest::Client::new()
         .post(format!("http://{node_address}/lninvoice"))
@@ -1452,7 +1455,7 @@ async fn open_channel_funded_raw(
     temporary_channel_id: Option<&str>,
     with_anchors: bool,
     public: bool,
-) -> Result<Channel, Response> {
+) -> Result<Channel, Box<Response>> {
     open_channel_raw(
         node_address,
         dest_peer_pubkey,
@@ -1505,12 +1508,12 @@ async fn open_channel_funded_raw(
             // (e.g. InsufficientAssignments in FundingGenerationReady).
             // return an error so the retry logic can try again.
             println!("cannot find funding TX for channel to {dest_peer_pubkey}");
-            return Err(Response::from(
+            return Err(Box::new(Response::from(
                 Builder::new()
                     .status(reqwest::StatusCode::FORBIDDEN)
                     .body("")
                     .unwrap(),
-            ));
+            )));
         }
     }
     let channel_id = channel_id.unwrap();
@@ -1547,7 +1550,7 @@ async fn open_channel_raw(
     temporary_channel_id: Option<&str>,
     with_anchors: bool,
     public: bool,
-) -> Result<OpenChannelResponse, Response> {
+) -> Result<OpenChannelResponse, Box<Response>> {
     println!(
         "opening channel with {asset_amount:?} of asset {asset_id:?} from node {node_address} \
               to {dest_peer_pubkey}"
@@ -1593,7 +1596,7 @@ async fn open_channel_raw(
 
     let status = res.status();
     if !status.is_success() {
-        return Err(res);
+        return Err(Box::new(res));
     }
 
     Ok(res.json::<OpenChannelResponse>().await.unwrap())
@@ -2372,7 +2375,9 @@ mod drop_funding_signed;
 #[cfg(all(feature = "transaction-sync", feature = "electrum"))]
 mod electrum_opret_confirm;
 mod fail_transfers;
+mod getassetmedia_path_traversal;
 mod getchannelid;
+mod getconsignment_path_traversal;
 mod htlc_amount_checks;
 mod inflate;
 mod init;

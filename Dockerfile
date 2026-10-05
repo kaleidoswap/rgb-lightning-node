@@ -33,4 +33,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /app/target/release/rgb-lightning-node /usr/bin/rgb-lightning-node
 
+RUN groupadd -g 1000 user \
+    && useradd -u 1000 -g user -M -s /usr/sbin/nologin user \
+    && mkdir -p /RLNdata && chown user:user /RLNdata
+
+USER user
+
 ENTRYPOINT ["/usr/bin/rgb-lightning-node"]

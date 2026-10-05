@@ -40,7 +40,7 @@ use lightning::{
     util::config::{ChannelHandshakeConfig, ChannelHandshakeLimits, UserConfig},
     util::{errors::APIError as LDKAPIError, IS_SWAP_SCID},
 };
-use lightning_invoice::{Bolt11Invoice, PaymentSecret};
+use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description, PaymentSecret};
 use regex::Regex;
 use rgb_lib::{
     bdk_wallet::keys::bip39::Mnemonic,
@@ -50,12 +50,12 @@ use rgb_lib::{
             check_indexer_url as rgb_lib_check_indexer_url,
             IndexerProtocol as RgbLibIndexerProtocol,
         },
-        AssetCFA as RgbLibAssetCFA, AssetIFA as RgbLibAssetIFA, AssetNIA as RgbLibAssetNIA,
-        AssetUDA as RgbLibAssetUDA, Balance as RgbLibBalance, EmbeddedMedia as RgbLibEmbeddedMedia,
-        Invoice as RgbLibInvoice, Media as RgbLibMedia, OperationResult as RgbLibOperationResult,
-        ProofOfReserves as RgbLibProofOfReserves, Recipient as RgbLibRecipient, RecipientInfo,
-        RecipientType as RgbLibRecipientType, RefreshFilter as RgbLibRefreshFilter,
-        RefreshTransferStatus as RgbLibRefreshTransferStatus,
+        AssetCFA as RgbLibAssetCFA, AssetFilter as RgbLibAssetFilter, AssetIFA as RgbLibAssetIFA,
+        AssetNIA as RgbLibAssetNIA, AssetUDA as RgbLibAssetUDA, Balance as RgbLibBalance,
+        EmbeddedMedia as RgbLibEmbeddedMedia, Invoice as RgbLibInvoice, Media as RgbLibMedia,
+        OperationResult as RgbLibOperationResult, ProofOfReserves as RgbLibProofOfReserves,
+        Recipient as RgbLibRecipient, RecipientInfo, RecipientType as RgbLibRecipientType,
+        RefreshFilter as RgbLibRefreshFilter, RefreshTransferStatus as RgbLibRefreshTransferStatus,
         RefreshedTransfer as RgbLibRefreshedTransfer, SyncKeychain as RgbLibSyncKeychain,
         SyncOptions as RgbLibSyncOptions, SyncStrategy as RgbLibSyncStrategy, Token as RgbLibToken,
         TokenLight as RgbLibTokenLight, WitnessData as RgbLibWitnessData,
@@ -84,8 +84,9 @@ use crate::ldk::{node_override_matches, FORCE_PUSH_ASSET_AMOUNT_ON_NODE};
 use crate::swap::{SwapData, SwapInfo, SwapString};
 use crate::utils::{
     check_already_initialized, check_channel_id, check_password_strength, check_password_validity,
-    encrypt_and_save_mnemonic, get_max_local_rgb_amount, get_mnemonic_path, get_route, hex_str,
-    hex_str_to_compressed_pubkey, hex_str_to_vec, UnlockedAppState, UserOnionMessageContents,
+    description_fields, encrypt_and_save_mnemonic, get_max_local_rgb_amount, get_mnemonic_path,
+    get_route, hex_str, hex_str_to_compressed_pubkey, hex_str_to_vec, UnlockedAppState,
+    UserOnionMessageContents,
 };
 use crate::{
     backup::{do_backup, restore_backup},
@@ -176,6 +177,24 @@ impl From<RgbLibAssetCFA> for AssetCFA {
             added_at: value.added_at,
             balance: value.balance.into(),
             media: value.media.map(|m| m.into()),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "type", content = "value")]
+pub(crate) enum AssetFilter {
+    AnyOrNone,
+    None,
+    Id(String),
+}
+
+impl From<AssetFilter> for RgbLibAssetFilter {
+    fn from(x: AssetFilter) -> Self {
+        match x {
+            AssetFilter::AnyOrNone => Self::AnyOrNone,
+            AssetFilter::None => Self::None,
+            AssetFilter::Id(asset_id) => Self::Id(asset_id),
         }
     }
 }
@@ -506,6 +525,8 @@ pub(crate) struct DecodeLNInvoiceResponse {
     pub(crate) timestamp: u64,
     pub(crate) asset_id: Option<String>,
     pub(crate) asset_amount: Option<u64>,
+    pub(crate) description: Option<String>,
+    pub(crate) description_hash: Option<String>,
     pub(crate) payment_hash: String,
     pub(crate) payment_secret: String,
     pub(crate) payee_pubkey: Option<String>,
@@ -845,7 +866,8 @@ pub(crate) struct ListTransactionsResponse {
 
 #[derive(Deserialize, Serialize)]
 pub(crate) struct ListTransfersRequest {
-    pub(crate) asset_id: String,
+    pub(crate) asset_filter: AssetFilter,
+    pub(crate) txid: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -870,6 +892,8 @@ pub(crate) struct LNInvoiceRequest {
     pub(crate) expiry_sec: u32,
     pub(crate) asset_id: Option<String>,
     pub(crate) asset_amount: Option<u64>,
+    pub(crate) description: Option<String>,
+    pub(crate) description_hash: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -998,6 +1022,8 @@ pub(crate) struct Payment {
     pub(crate) updated_at: u64,
     pub(crate) payee_pubkey: String,
     pub(crate) preimage: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) description_hash: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -1886,12 +1912,16 @@ pub(crate) async fn decode_ln_invoice(
         Ok(v) => v,
     };
 
+    let (description, description_hash) = description_fields(&invoice);
+
     Ok(Json(DecodeLNInvoiceResponse {
         amt_msat: invoice.amount_milli_satoshis(),
         expiry_sec: invoice.expiry_time().as_secs(),
         timestamp: invoice.duration_since_epoch().as_secs(),
         asset_id: invoice.rgb_contract_id().map(|c| c.to_string()),
         asset_amount: invoice.rgb_amount(),
+        description,
+        description_hash: description_hash.map(|h| hex_str(&h)),
         payment_hash: hex_str(&invoice.payment_hash().to_byte_array()),
         payment_secret: hex_str(&invoice.payment_secret().0),
         payee_pubkey: invoice.payee_pub_key().map(|p| p.to_string()),
@@ -2023,6 +2053,28 @@ pub(crate) async fn fail_transfers(
     .await
 }
 
+/// Media files are named by their sha256 digest; anything else could escape the media dir.
+fn check_media_digest(digest: &str) -> Result<String, APIError> {
+    let digest = digest.to_lowercase();
+    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(APIError::InvalidMediaDigest);
+    }
+    Ok(digest)
+}
+
+/// Both identifiers become path components, so only accept their canonical forms.
+fn check_consignment_asset_id(asset_id: &str) -> Result<String, APIError> {
+    ContractId::from_str(asset_id)
+        .map(|id| id.to_string())
+        .map_err(|_| APIError::InvalidAssetID(asset_id.to_string()))
+}
+
+fn check_consignment_txid(txid: &str) -> Result<String, APIError> {
+    bitcoin::Txid::from_str(txid)
+        .map(|t| t.to_string())
+        .map_err(|_| APIError::ConsignmentNotFound)
+}
+
 pub(crate) async fn get_asset_media(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<GetAssetMediaRequest>, APIError>,
@@ -2033,7 +2085,7 @@ pub(crate) async fn get_asset_media(
         .clone()
         .unwrap()
         .rgb_get_media_dir()
-        .join(payload.digest.to_lowercase());
+        .join(check_media_digest(&payload.digest)?);
     if !file_path.exists() {
         return Err(APIError::InvalidMediaDigest);
     }
@@ -2070,7 +2122,10 @@ pub(crate) async fn get_consignment(
         .await?
         .clone()
         .unwrap()
-        .rgb_get_send_consignment_path(&payload.asset_id, &payload.txid);
+        .rgb_get_send_consignment_path(
+            &check_consignment_asset_id(&payload.asset_id)?,
+            &check_consignment_txid(&payload.txid)?,
+        );
     if !file_path.exists() {
         return Err(APIError::ConsignmentNotFound);
     }
@@ -2123,6 +2178,8 @@ pub(crate) async fn get_payment(
                     updated_at: payment_info.updated_at,
                     payee_pubkey: payment_info.payee_pubkey.to_string(),
                     preimage: payment_info.preimage.map(|p| hex_str(&p.0)),
+                    description: payment_info.description.clone(),
+                    description_hash: payment_info.description_hash.map(|h| hex_str(&h)),
                 },
             }));
         }
@@ -2153,6 +2210,8 @@ pub(crate) async fn get_payment(
                     updated_at: payment_info.updated_at,
                     payee_pubkey: payment_info.payee_pubkey.to_string(),
                     preimage: payment_info.preimage.map(|p| hex_str(&p.0)),
+                    description: payment_info.description.clone(),
+                    description_hash: payment_info.description_hash.map(|h| hex_str(&h)),
                 },
             }));
         }
@@ -2473,6 +2532,8 @@ pub(crate) async fn keysend(
                 updated_at: created_at,
                 payee_pubkey: dest_pubkey,
                 expires_at: None,
+                description: None,
+                description_hash: None,
             },
         )?;
         if let Some((contract_id, rgb_amount)) = rgb_payment {
@@ -2720,6 +2781,8 @@ pub(crate) async fn list_payments(
             updated_at: payment_info.updated_at,
             payee_pubkey: payment_info.payee_pubkey.to_string(),
             preimage: payment_info.preimage.map(|p| hex_str(&p.0)),
+            description: payment_info.description.clone(),
+            description_hash: payment_info.description_hash.map(|h| hex_str(&h)),
         });
     }
 
@@ -2747,6 +2810,8 @@ pub(crate) async fn list_payments(
             updated_at: payment_info.updated_at,
             payee_pubkey: payment_info.payee_pubkey.to_string(),
             preimage: payment_info.preimage.map(|p| hex_str(&p.0)),
+            description: payment_info.description.clone(),
+            description_hash: payment_info.description_hash.map(|h| hex_str(&h)),
         });
     }
 
@@ -2859,7 +2924,7 @@ pub(crate) async fn list_transfers(
     let unlocked_state = guard.as_ref().unwrap();
 
     let mut transfers = vec![];
-    for transfer in unlocked_state.rgb_list_transfers(payload.asset_id)? {
+    for transfer in unlocked_state.rgb_list_transfers(payload.asset_filter.into(), payload.txid)? {
         transfers.push(Transfer {
             idx: transfer.idx,
             created_at: transfer.created_at,
@@ -2948,8 +3013,31 @@ pub(crate) async fn ln_invoice(
             )));
         }
 
+        let description =
+            match (
+                payload.description.as_deref().filter(|d| !d.is_empty()),
+                payload.description_hash.as_deref(),
+            ) {
+                (Some(_), Some(_)) => {
+                    return Err(APIError::InvalidRequest(s!(
+                        "cannot provide both description and description_hash"
+                    )))
+                }
+                (Some(description), None) => Bolt11InvoiceDescription::Direct(
+                    Description::new(description.to_string())
+                        .map_err(|e| APIError::InvalidDescription(e.to_string()))?,
+                ),
+                (None, Some(description_hash)) => Bolt11InvoiceDescription::Hash(
+                    lightning_invoice::Sha256(Sha256::from_str(description_hash).map_err(
+                        |_| APIError::InvalidDescriptionHash(description_hash.to_string()),
+                    )?),
+                ),
+                (None, None) => Bolt11InvoiceDescription::Direct(Description::empty()),
+            };
+
         let invoice_params = Bolt11InvoiceParameters {
             amount_msats: payload.amt_msat,
+            description,
             invoice_expiry_delta_secs: Some(payload.expiry_sec),
             contract_id,
             asset_amount: payload.asset_amount,
@@ -2966,6 +3054,7 @@ pub(crate) async fn ln_invoice(
 
         let payment_hash = PaymentHash((*invoice.payment_hash()).to_byte_array());
         let created_at = get_current_timestamp();
+        let (description, description_hash) = description_fields(&invoice);
         unlocked_state.add_inbound_payment(
             payment_hash,
             PaymentInfo {
@@ -2977,6 +3066,8 @@ pub(crate) async fn ln_invoice(
                 updated_at: created_at,
                 payee_pubkey: unlocked_state.channel_manager.get_our_node_id(),
                 expires_at: Some(created_at + payload.expiry_sec as u64),
+                description,
+                description_hash,
             },
         );
 
@@ -4007,6 +4098,8 @@ pub(crate) async fn send_payment(
                     updated_at: created_at,
                     payee_pubkey: offer.issuer_signing_pubkey().ok_or(APIError::InvalidInvoice(s!("missing signing pubkey")))?,
                     expires_at: None,
+                    description: None,
+                    description_hash: None,
                 },
             )?;
 
@@ -4088,6 +4181,7 @@ pub(crate) async fn send_payment(
             };
 
             let secret = payment_secret;
+            let (description, description_hash) = description_fields(&invoice);
             unlocked_state.add_outbound_payment(
                 payment_id,
                 PaymentInfo {
@@ -4099,6 +4193,8 @@ pub(crate) async fn send_payment(
                     updated_at: created_at,
                     payee_pubkey: invoice.get_payee_pub_key(),
                     expires_at: None,
+                    description,
+                    description_hash,
                 },
             )?;
             let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
@@ -4197,6 +4293,12 @@ pub(crate) async fn shutdown(
     .await
 }
 
+/// Signs `message` (after trimming) with `secret_key`, LN-message style. Split out of
+/// [`sign_message`] so the signing logic can be unit-tested without a running node.
+fn sign_message_with_key(message: &str, secret_key: &bitcoin::secp256k1::SecretKey) -> String {
+    lightning::util::message_signing::sign(message.trim().as_bytes(), secret_key)
+}
+
 pub(crate) async fn sign_message(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<SignMessageRequest>, APIError>,
@@ -4204,9 +4306,8 @@ pub(crate) async fn sign_message(
     let guard = state.check_unlocked().await?;
     let unlocked_state = guard.as_ref().unwrap();
 
-    let message = payload.message.trim();
-    let signed_message = lightning::util::message_signing::sign(
-        &message.as_bytes()[message.len()..],
+    let signed_message = sign_message_with_key(
+        &payload.message,
         &unlocked_state.keys_manager.get_node_secret_key(),
     );
 
@@ -4300,4 +4401,48 @@ pub(crate) async fn unlock(
         Ok(Json(EmptyResponse {}))
     })
     .await
+}
+
+#[cfg(test)]
+mod sign_message_tests {
+    use super::sign_message_with_key;
+    use bitcoin::secp256k1::constants::ONE;
+    use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+
+    /// Regression test for a bug where `/signmessage` signed
+    /// `message.as_bytes()[message.len()..]` (always an empty slice) instead of the
+    /// requested message, so every signature was over the empty string: identical
+    /// regardless of the message, and "verifying" against any message whatsoever.
+    #[test]
+    fn sign_message_signs_the_actual_message() {
+        let secret_key = SecretKey::from_slice(&ONE).unwrap();
+        let public_key = PublicKey::from_secret_key(&Secp256k1::new(), &secret_key);
+
+        let message_a = "authorize withdrawal of 0 sats";
+        let message_b = "authorize withdrawal of 1000000 sats";
+
+        let sig_a = sign_message_with_key(message_a, &secret_key);
+        let sig_b = sign_message_with_key(message_b, &secret_key);
+
+        assert!(
+            lightning::util::message_signing::verify(message_a.as_bytes(), &sig_a, &public_key),
+            "signature must verify against the exact message that was signed"
+        );
+        assert!(
+            lightning::util::message_signing::verify(message_b.as_bytes(), &sig_b, &public_key),
+            "signature must verify against the exact message that was signed"
+        );
+        assert!(
+            !lightning::util::message_signing::verify(message_b.as_bytes(), &sig_a, &public_key),
+            "a message's signature must not verify against a different message"
+        );
+        assert!(
+            !lightning::util::message_signing::verify("".as_bytes(), &sig_a, &public_key),
+            "a non-empty message's signature must not verify against the empty message"
+        );
+        assert_ne!(
+            sig_a, sig_b,
+            "signing two different messages must not produce the same signature"
+        );
+    }
 }
