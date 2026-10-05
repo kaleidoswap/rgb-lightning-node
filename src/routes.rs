@@ -2053,6 +2053,28 @@ pub(crate) async fn fail_transfers(
     .await
 }
 
+/// Media files are named by their sha256 digest; anything else could escape the media dir.
+fn check_media_digest(digest: &str) -> Result<String, APIError> {
+    let digest = digest.to_lowercase();
+    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(APIError::InvalidMediaDigest);
+    }
+    Ok(digest)
+}
+
+/// Both identifiers become path components, so only accept their canonical forms.
+fn check_consignment_asset_id(asset_id: &str) -> Result<String, APIError> {
+    ContractId::from_str(asset_id)
+        .map(|id| id.to_string())
+        .map_err(|_| APIError::InvalidAssetID(asset_id.to_string()))
+}
+
+fn check_consignment_txid(txid: &str) -> Result<String, APIError> {
+    bitcoin::Txid::from_str(txid)
+        .map(|t| t.to_string())
+        .map_err(|_| APIError::ConsignmentNotFound)
+}
+
 pub(crate) async fn get_asset_media(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<GetAssetMediaRequest>, APIError>,
@@ -2063,7 +2085,7 @@ pub(crate) async fn get_asset_media(
         .clone()
         .unwrap()
         .rgb_get_media_dir()
-        .join(payload.digest.to_lowercase());
+        .join(check_media_digest(&payload.digest)?);
     if !file_path.exists() {
         return Err(APIError::InvalidMediaDigest);
     }
@@ -2100,7 +2122,10 @@ pub(crate) async fn get_consignment(
         .await?
         .clone()
         .unwrap()
-        .rgb_get_send_consignment_path(&payload.asset_id, &payload.txid);
+        .rgb_get_send_consignment_path(
+            &check_consignment_asset_id(&payload.asset_id)?,
+            &check_consignment_txid(&payload.txid)?,
+        );
     if !file_path.exists() {
         return Err(APIError::ConsignmentNotFound);
     }
