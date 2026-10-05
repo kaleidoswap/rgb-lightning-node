@@ -13,6 +13,9 @@ jobs:
   test_and_coverage:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      # Forks without a Codecov token skip the upload instead of failing a green run.
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -31,9 +34,10 @@ jobs:
       - name: Tests and coverage report
         run: ./coverage.sh --ci
       - name: Upload coverage report
+        if: env.CODECOV_TOKEN != ''
         uses: codecov/codecov-action@v6
         with:
           fail_ci_if_error: true
           file: coverage.lcov
           flags: rust
-          token: ${{ secrets.CODECOV_TOKEN }}
+          token: ${{ env.CODECOV_TOKEN }}
