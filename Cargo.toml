@@ -66,6 +66,8 @@ lightning-net-tokio = { version = "0.2.0" }
 lightning-persister = { version = "0.2.0", path = "./rust-lightning/lightning-persister", features = ["tokio"] }
 lightning-rapid-gossip-sync = { version = "0.2.0", path = "./rust-lightning/lightning-rapid-gossip-sync" }
 lightning-transaction-sync = { version = "0.2.0", path = "./rust-lightning/lightning-transaction-sync", optional = true }
+# Only to read mnemonic files written before the switch to scrypt + XChaCha20Poly1305.
+magic-crypt = "4.0.1"
 rand = "0.8.5"
 regex = { version = "1.11", default-features = false }
 rgb-lib = { version = "=0.3.0-beta.7", default-features = false }

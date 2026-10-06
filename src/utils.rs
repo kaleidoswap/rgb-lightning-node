@@ -31,7 +31,7 @@ use std::{
 use tokio::sync::{Mutex as TokioMutex, MutexGuard as TokioMutexGuard};
 use tokio_util::sync::CancellationToken;
 
-use crate::crypto::{decrypt_mnemonic, encrypt_mnemonic};
+use crate::crypto::{decrypt_legacy_mnemonic, decrypt_mnemonic, encrypt_mnemonic};
 use crate::ldk::{ChannelIdsMap, Router};
 use crate::rgb::{get_rgb_channel_info_optional, RgbLibWalletWrapper};
 use crate::rgb_file_transfer::RgbFileTransferHandler;
@@ -189,9 +189,36 @@ pub(crate) fn check_password_validity(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(APIError::NotInitialized),
         Err(e) => return Err(APIError::IO(e)),
     };
-    let mnemonic_str = decrypt_mnemonic(password, encrypted_mnemonic.trim())?;
+    let encrypted_mnemonic = encrypted_mnemonic.trim();
+    let mnemonic_str = match decrypt_mnemonic(password, encrypted_mnemonic) {
+        Ok(mnemonic_str) => mnemonic_str,
+        Err(APIError::CorruptedMnemonic(_)) => {
+            let mnemonic_str = decrypt_legacy_mnemonic(password, encrypted_mnemonic)?;
+            migrate_legacy_mnemonic(password, &mnemonic_str, &mnemonic_path);
+            mnemonic_str
+        }
+        Err(e) => return Err(e),
+    };
     Mnemonic::from_str(&mnemonic_str)
         .map_err(|e| APIError::CorruptedMnemonic(format!("invalid mnemonic: {e}")))
+}
+
+// Rewrite a legacy mnemonic file in the current format.
+//
+// The new file is written next to the old one and renamed over it, so an interruption leaves
+// either file intact. A failure is only logged: the legacy file stays readable and the migration
+// is retried on the next unlock.
+fn migrate_legacy_mnemonic(password: &str, mnemonic: &str, mnemonic_path: &Path) {
+    let result = encrypt_mnemonic(password, mnemonic).and_then(|encrypted| {
+        let tmp_path = mnemonic_path.with_extension("migrating");
+        fs::write(&tmp_path, encrypted)?;
+        fs::rename(&tmp_path, mnemonic_path)?;
+        Ok(())
+    });
+    match result {
+        Ok(()) => tracing::info!("Migrated the mnemonic file to the current encryption format"),
+        Err(e) => tracing::warn!("Failed to migrate the legacy mnemonic file: {e}"),
+    }
 }
 
 pub(crate) fn check_channel_id(channel_id_str: &str) -> Result<ChannelId, APIError> {

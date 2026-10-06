@@ -7,8 +7,12 @@ use amplify::s;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
+use magic_crypt::{new_magic_crypt, MagicCryptTrait};
 use rand::RngCore;
 use scrypt::{scrypt, Params as ScryptParams};
+
+use rgb_lib::bdk_wallet::keys::bip39::Mnemonic;
+use std::str::FromStr;
 
 use crate::error::APIError;
 
@@ -231,12 +235,89 @@ pub(crate) fn decrypt_mnemonic(password: &str, encrypted: &str) -> Result<String
     String::from_utf8(plaintext).map_err(|_| APIError::CorruptedMnemonic(s!("invalid UTF-8")))
 }
 
+// Decrypt a mnemonic file written before the switch to scrypt and XChaCha20Poly1305, which
+// encrypted it with magic-crypt (AES-256-CBC, key = SHA-256 of the password).
+//
+// Data that is not a whole number of AES blocks cannot be in that format and is reported as
+// [`APIError::CorruptedMnemonic`]. Otherwise anything but a valid BIP39 mnemonic is reported as
+// [`APIError::WrongPassword`], since without the right password a legacy file cannot be told
+// apart from garbage.
+pub(crate) fn decrypt_legacy_mnemonic(password: &str, encrypted: &str) -> Result<String, APIError> {
+    let is_legacy_shaped = BASE64
+        .decode(encrypted)
+        .is_ok_and(|data| !data.is_empty() && data.len() % 16 == 0);
+    if !is_legacy_shaped {
+        return Err(APIError::CorruptedMnemonic(s!("not a legacy mnemonic")));
+    }
+    let mnemonic = new_magic_crypt!(password, 256)
+        .decrypt_base64_to_string(encrypted)
+        .map_err(|_| APIError::WrongPassword)?;
+    Mnemonic::from_str(&mnemonic).map_err(|_| APIError::WrongPassword)?;
+    Ok(mnemonic)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const PASSWORD: &str = "password123";
     const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    // Written by rgb-lightning-node 0.7.1 for an unfunded wallet initialized with `PASSWORD`.
+    const LEGACY_MNEMONIC_FILE: &str = "kPHqNiyep+LC56OIqcrWooj/j2g2wx6NHaG8n7HpgA7dCmIX3R/dI6OeKZ8TAJgF4NYbfFN158Z0iXc9Dh4NpI0GhBUGbhZ9hlJtUX9VkLI=";
+    const LEGACY_MNEMONIC: &str =
+        "amount ethics stem woman pyramid release seat business rare cheap blush disease";
+
+    #[test]
+    fn legacy_mnemonic_is_decrypted() {
+        assert_eq!(
+            decrypt_legacy_mnemonic(PASSWORD, LEGACY_MNEMONIC_FILE).unwrap(),
+            LEGACY_MNEMONIC
+        );
+        assert!(matches!(
+            decrypt_mnemonic(PASSWORD, LEGACY_MNEMONIC_FILE),
+            Err(APIError::CorruptedMnemonic(_))
+        ));
+    }
+
+    #[test]
+    fn legacy_mnemonic_wrong_password() {
+        assert!(matches!(
+            decrypt_legacy_mnemonic("wrong-password", LEGACY_MNEMONIC_FILE),
+            Err(APIError::WrongPassword)
+        ));
+    }
+
+    #[test]
+    fn legacy_mnemonic_file_is_migrated_on_unlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::utils::get_mnemonic_path(dir.path());
+        std::fs::write(&path, LEGACY_MNEMONIC_FILE).unwrap();
+
+        assert!(matches!(
+            crate::utils::check_password_validity("wrong-password", dir.path()),
+            Err(APIError::WrongPassword)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            LEGACY_MNEMONIC_FILE
+        );
+
+        let mnemonic = crate::utils::check_password_validity(PASSWORD, dir.path()).unwrap();
+        assert_eq!(mnemonic.to_string(), LEGACY_MNEMONIC);
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            decrypt_mnemonic(PASSWORD, &migrated).unwrap(),
+            LEGACY_MNEMONIC
+        );
+        assert!(!path.with_extension("migrating").exists());
+    }
+
+    #[test]
+    fn current_format_is_not_legacy() {
+        let encrypted = encrypt_mnemonic(PASSWORD, MNEMONIC).unwrap();
+        assert!(decrypt_legacy_mnemonic(PASSWORD, &encrypted).is_err());
+    }
     // Work factors differing from the ones used for new data, so that data encrypted with them can
     // only be decrypted if the work factors stored along with it are honored.
     const OTHER_PARAMS: KdfParams = KdfParams {
