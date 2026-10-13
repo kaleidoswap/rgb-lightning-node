@@ -4,7 +4,9 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use rgb_lib::{BitcoinNetwork, Error as RgbLibError};
+#[cfg(feature = "block-sync")]
+use rgb_lib::BitcoinNetwork;
+use rgb_lib::Error as RgbLibError;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -25,9 +27,6 @@ pub enum APIError {
 
     #[error("Node has already been initialized")]
     AlreadyInitialized,
-
-    #[error("Provide either bitcoind RPC credentials (all four fields) or an esplora indexer_url, not both")]
-    AmbiguousChainBackend,
 
     #[error("Anchor outputs are required for RGB channels")]
     AnchorsRequired,
@@ -50,8 +49,26 @@ pub enum APIError {
     #[error("Batch transfer cannot be set to failed status")]
     CannotFailBatchTransfer,
 
+    #[error("Cannot provide out-of-band ACK: {0}")]
+    CannotProvideOutOfBandAck(String),
+
+    #[error("Cannot provide out-of-band consignment: {0}")]
+    CannotProvideOutOfBandConsignment(String),
+
     #[error("Cannot call other APIs while node is changing state")]
     ChangingState,
+
+    #[error("Consignment file is empty")]
+    ConsignmentFileEmpty,
+
+    #[error("Consignment file has not been provided")]
+    ConsignmentFileNotProvided,
+
+    #[error("Consignment not found")]
+    ConsignmentNotFound,
+
+    #[error("The stored mnemonic is corrupted: {0}")]
+    CorruptedMnemonic(String),
 
     #[error("External signer is required for this operation")]
     ExternalSignerRequired,
@@ -62,6 +79,9 @@ pub enum APIError {
 
     #[error("External signer identity does not match persisted node identity")]
     ExternalSignerMismatch,
+
+    #[error("External-signer mode requires authentication; refusing to run with --disable-authentication, since /unlock has no other credential when there is no mnemonic password")]
+    ExternalSignerRequiresAuthentication,
 
     #[error("Unsupported in external signer mode: {0}")]
     UnsupportedInExternalSignerMode(String),
@@ -78,6 +98,7 @@ pub enum APIError {
     #[error("Failed to sync BDK: {0}")]
     FailedBdkSync(String),
 
+    #[cfg(feature = "block-sync")]
     #[error("Failed to connect to bitcoind client: {0}")]
     FailedBitcoindConnection(String),
 
@@ -93,6 +114,9 @@ pub enum APIError {
     #[error("Failed to issue asset: {0}")]
     FailedIssuingAsset(String),
 
+    #[error("Failed to load channel state: {0}")]
+    FailedLoadingChannelState(String),
+
     #[error("Failed to open channel: {0}")]
     FailedOpenChannel(String),
 
@@ -105,6 +129,10 @@ pub enum APIError {
     #[cfg(feature = "vss")]
     #[error("Failed to initialize VSS: {0}")]
     FailedVssInit(String),
+
+    #[cfg(feature = "vss")]
+    #[error("VSS server is unreachable")]
+    VssUnreachable,
 
     #[error("Failed to disconnect to peer: {0}")]
     FailedPeerDisconnection(String),
@@ -145,6 +173,9 @@ pub enum APIError {
     #[error("Invalid asset ID: {0}")]
     InvalidAssetID(String),
 
+    #[error("Invalid burn recipient: {0}")]
+    InvalidBurnRecipient(String),
+
     #[error("Invalid assignment")]
     InvalidAssignment,
 
@@ -160,6 +191,18 @@ pub enum APIError {
     #[error("Invalid channel ID")]
     InvalidChannelID,
 
+    #[error("Invalid consignment")]
+    InvalidConsignment,
+
+    #[error("Invalid contract link: {0}")]
+    InvalidContractLink(String),
+
+    #[error("Invalid right outpoint: {0}")]
+    InvalidRightOutpoint(String),
+
+    #[error("Invalid description: {0}")]
+    InvalidDescription(String),
+
     #[error("Invalid description hash: {0}")]
     InvalidDescriptionHash(String),
 
@@ -168,6 +211,9 @@ pub enum APIError {
 
     #[error("Trying to request fee estimation for an invalid block number")]
     InvalidEstimationBlocks,
+
+    #[error("Invalid Ethereum RPC URL: {0}")]
+    InvalidEthRpcUrl(String),
 
     #[error("Invalid expiration")]
     InvalidExpiration,
@@ -180,6 +226,12 @@ pub enum APIError {
 
     #[error("Invalid invoice: {0}")]
     InvalidInvoice(String),
+
+    #[error("Invalid RGB consignment: {0}")]
+    InvalidRgbConsignment(String),
+
+    #[error("Invalid RGB contract: {0}")]
+    InvalidRgbContract(String),
 
     #[error("Invalid media digest")]
     InvalidMediaDigest,
@@ -213,9 +265,6 @@ pub enum APIError {
 
     #[error("Invalid precision: {0}")]
     InvalidPrecision(String),
-
-    #[error("Invalid proxy endpoint")]
-    InvalidProxyEndpoint,
 
     #[error("Invalid proxy protocol version: {0}")]
     InvalidProxyProtocol(String),
@@ -277,6 +326,9 @@ pub enum APIError {
     #[error("IO error: {0}")]
     IO(#[from] std::io::Error),
 
+    #[error("RLN on mainnet currently supports only on-chain methods. Lightning APIs are not supported.")]
+    LightningUnsupportedOnMainnet,
+
     #[error("Node is locked (hint: call unlock)")]
     LockedNode,
 
@@ -292,8 +344,8 @@ pub enum APIError {
     #[error("Min fee not met for transfer with TXID: {0}")]
     MinFeeNotMet(String),
 
-    #[error("Provide either bitcoind RPC credentials (all four fields) or an esplora indexer_url; none were supplied")]
-    MissingChainBackend,
+    #[error("No indexer_url was supplied, in the unlock request or in the config file")]
+    MissingIndexerUrl,
 
     #[error("Unable to find payment preimage, be sure you've provided the correct swap info")]
     MissingSwapPaymentPreimage,
@@ -301,6 +353,7 @@ pub enum APIError {
     #[error("Network error: {0}")]
     Network(String),
 
+    #[cfg(feature = "block-sync")]
     #[error("The network of the given bitcoind ({0}) doesn't match the node's chain ({1})")]
     NetworkMismatch(String, BitcoinNetwork),
 
@@ -337,6 +390,9 @@ pub enum APIError {
     #[error("Unexpected error: {0}")]
     Unexpected(String),
 
+    #[error("Restored VSS backup is inconsistent: {0}")]
+    RestoredBackupInconsistent(String),
+
     #[error("Unknown channel ID")]
     UnknownChannelId,
 
@@ -355,6 +411,9 @@ pub enum APIError {
     #[error("The provided backup has an unsupported version: {version}")]
     UnsupportedBackupVersion { version: String },
 
+    #[error("Burn is not supported by schema {0}")]
+    UnsupportedBurn(String),
+
     #[error("Inflation is not supported by schema {0}")]
     UnsupportedInflation(String),
 
@@ -371,16 +430,16 @@ pub enum APIError {
     WrongPassword,
 }
 
+pub(crate) fn error_name(e: &impl std::error::Error) -> String {
+    format!("{e:?}")
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect()
+}
+
 impl APIError {
-    fn name(&self) -> String {
-        format!("{self:?}")
-            .split('(')
-            .next()
-            .unwrap()
-            .split(" {")
-            .next()
-            .unwrap()
-            .to_string()
+    pub(crate) fn name(&self) -> String {
+        error_name(self)
     }
 }
 
@@ -411,6 +470,12 @@ impl From<RgbLibError> for APIError {
             RgbLibError::BatchTransferNotFound { .. } => APIError::BatchTransferNotFound,
             RgbLibError::CannotEstimateFees => APIError::CannotEstimateFees,
             RgbLibError::CannotFailBatchTransfer => APIError::CannotFailBatchTransfer,
+            RgbLibError::CannotProvideOutOfBandAck { details } => {
+                APIError::CannotProvideOutOfBandAck(details)
+            }
+            RgbLibError::CannotProvideOutOfBandConsignment { details } => {
+                APIError::CannotProvideOutOfBandConsignment(details)
+            }
             RgbLibError::EmptyFile { .. } => APIError::MediaFileEmpty,
             RgbLibError::FailedBdkSync { details } => APIError::FailedBdkSync(details),
             RgbLibError::FailedBroadcast { details } => APIError::FailedBroadcast(details),
@@ -433,9 +498,23 @@ impl From<RgbLibError> for APIError {
             RgbLibError::InvalidAmountZero => APIError::InvalidAmount(s!("0")),
             RgbLibError::InvalidAssignment => APIError::InvalidAssignment,
             RgbLibError::InvalidAttachments { details } => APIError::InvalidAttachments(details),
+            RgbLibError::InvalidContractLink { details } => APIError::InvalidContractLink(details),
+            RgbLibError::InvalidRightOutpoint { details } => {
+                APIError::InvalidRightOutpoint(details)
+            }
             RgbLibError::InvalidDetails { details } => APIError::InvalidDetails(details),
             RgbLibError::InvalidElectrum { details } => APIError::InvalidIndexer(details),
             RgbLibError::InvalidEstimationBlocks => APIError::InvalidEstimationBlocks,
+            RgbLibError::InvalidEthRpcUrl { details } => APIError::InvalidEthRpcUrl(details),
+            RgbLibError::InvalidBurnRecipient { len } => {
+                APIError::InvalidBurnRecipient(format!("must be 32 bytes, got {len}"))
+            }
+            RgbLibError::MissingBurnRecipient => {
+                APIError::InvalidBurnRecipient(s!("required for a BFA burn"))
+            }
+            RgbLibError::NoBurnAmount => {
+                APIError::InvalidAmount(s!("burn request with zero amount"))
+            }
             RgbLibError::InvalidExpiration => APIError::InvalidExpiration,
             RgbLibError::InvalidFeeRate { details } => APIError::InvalidFeeRate(details),
             RgbLibError::InvalidFilePath { .. } => APIError::MediaFileNotProvided,
@@ -472,11 +551,17 @@ impl From<RgbLibError> for APIError {
             RgbLibError::OutputBelowDustLimit => APIError::OutputBelowDustLimit,
             RgbLibError::Proxy { details } => APIError::Network(format!("proxy err: {details}")),
             RgbLibError::RecipientIDAlreadyUsed => APIError::RecipientIDAlreadyUsed,
+            RgbLibError::RestoredBackupInconsistent { details } => {
+                APIError::RestoredBackupInconsistent(details)
+            }
             RgbLibError::TooHighInflationAmounts => {
                 APIError::InvalidAmount(s!("inflation amount exceeds the max possible supply"))
             }
             RgbLibError::TooHighIssuanceAmounts => {
                 APIError::InvalidAmount(s!("trying to issue too many assets"))
+            }
+            RgbLibError::UnsupportedBurn { asset_schema } => {
+                APIError::UnsupportedBurn(format!("{asset_schema}"))
             }
             RgbLibError::UnsupportedInflation { asset_schema } => {
                 APIError::UnsupportedInflation(format!("{asset_schema}"))
@@ -497,20 +582,28 @@ impl From<RgbLibError> for APIError {
 impl IntoResponse for APIError {
     fn into_response(self) -> Response {
         let (status, error, name) = match self {
-            APIError::FailedClosingChannel(_)
+            APIError::CorruptedMnemonic(_)
+            | APIError::FailedClosingChannel(_)
             | APIError::FailedInvoiceCreation(_)
             | APIError::FailedIssuingAsset(_)
+            | APIError::FailedLoadingChannelState(_)
             | APIError::FailedOpenChannel(_)
             | APIError::FailedPayment(_)
             | APIError::FailedPeerDisconnection(_)
             | APIError::FailedSendingOnionMessage(_)
             | APIError::IO(_)
+            | APIError::RestoredBackupInconsistent(_)
             | APIError::Unexpected(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 self.to_string(),
                 self.name(),
             ),
             APIError::AnchorsRequired
+            | APIError::CannotProvideOutOfBandAck(_)
+            | APIError::CannotProvideOutOfBandConsignment(_)
+            | APIError::ConsignmentFileEmpty
+            | APIError::ConsignmentFileNotProvided
+            | APIError::ConsignmentNotFound
             | APIError::ExpiredSwapOffer
             | APIError::IncompleteRGBInfo
             | APIError::InvalidAddress(_)
@@ -523,13 +616,21 @@ impl IntoResponse for APIError {
             | APIError::InvalidAttachments(_)
             | APIError::InvalidBackupPath
             | APIError::InvalidBiscuitToken
+            | APIError::InvalidBurnRecipient(_)
             | APIError::InvalidChannelID
+            | APIError::InvalidConsignment
+            | APIError::InvalidContractLink(_)
+            | APIError::InvalidRightOutpoint(_)
+            | APIError::InvalidDescription(_)
             | APIError::InvalidDescriptionHash(_)
             | APIError::InvalidDetails(_)
             | APIError::InvalidEstimationBlocks
+            | APIError::InvalidEthRpcUrl(_)
             | APIError::InvalidExpiration
             | APIError::InvalidFeeRate(_)
             | APIError::InvalidInvoice(_)
+            | APIError::InvalidRgbContract(_)
+            | APIError::InvalidRgbConsignment(_)
             | APIError::InvalidMediaDigest
             | APIError::InvalidMnemonic(_)
             | APIError::InvalidName(_)
@@ -567,7 +668,6 @@ impl IntoResponse for APIError {
             APIError::AllocationsAlreadyAvailable
             | APIError::AlreadyInitialized
             | APIError::AlreadyUnlocked
-            | APIError::AmbiguousChainBackend
             | APIError::AuthenticationDisabled
             | APIError::BatchTransferNotFound
             | APIError::CannotCloseChannel(_)
@@ -575,24 +675,23 @@ impl IntoResponse for APIError {
             | APIError::CannotFailBatchTransfer
             | APIError::ChangingState
             | APIError::ExternalSignerRequired
+            | APIError::ExternalSignerRequiresAuthentication
             | APIError::DuplicatePayment(_)
             | APIError::FailedBdkSync(_)
-            | APIError::FailedBitcoindConnection(_)
             | APIError::FailedBroadcast(_)
             | APIError::FailedPeerConnection
             | APIError::InsufficientAssets
             | APIError::InsufficientCapacity(_)
             | APIError::InsufficientFunds(_)
             | APIError::InvalidIndexer(_)
-            | APIError::InvalidProxyEndpoint
             | APIError::InvalidProxyProtocol(_)
             | APIError::InvoiceNotHodl
             | APIError::InvoiceSettlingInProgress
+            | APIError::LightningUnsupportedOnMainnet
             | APIError::LockedNode
             | APIError::MaxFeeExceeded(_)
             | APIError::MinFeeNotMet(_)
-            | APIError::MissingChainBackend
-            | APIError::NetworkMismatch(_, _)
+            | APIError::MissingIndexerUrl
             | APIError::NoAvailableUtxos
             | APIError::NoRoute
             | APIError::NotInitialized
@@ -605,11 +704,16 @@ impl IntoResponse for APIError {
             | APIError::UnknownLNInvoice
             | APIError::UnknownTemporaryChannelId
             | APIError::UnlockedNode
+            | APIError::UnsupportedBurn(_)
             | APIError::UnsupportedInflation(_)
             | APIError::UnsupportedLayer1(_)
             | APIError::UnsupportedSchema(_)
             | APIError::UnsupportedTransportType
             | APIError::UnsupportedInExternalSignerMode(_) => {
+                (StatusCode::FORBIDDEN, self.to_string(), self.name())
+            }
+            #[cfg(feature = "block-sync")]
+            APIError::FailedBitcoindConnection(_) | APIError::NetworkMismatch(_, _) => {
                 (StatusCode::FORBIDDEN, self.to_string(), self.name())
             }
             APIError::InvoiceAlreadyClaimed => {
@@ -630,7 +734,7 @@ impl IntoResponse for APIError {
                 self.name(),
             ),
             #[cfg(feature = "vss")]
-            APIError::FailedVssInit(_) => (
+            APIError::FailedVssInit(_) | APIError::VssUnreachable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 self.to_string(),
                 self.name(),
@@ -668,6 +772,9 @@ pub enum AppError {
 
     #[error("Invalid VSS configuration: {0}")]
     InvalidVssConfig(String),
+
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
 
     #[error("IO error: {0}")]
     IO(#[from] std::io::Error),
@@ -712,6 +819,24 @@ impl IntoResponse for AuthError {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn lightning_unsupported_on_mainnet_response_preserves_name_and_message() {
+        let response = APIError::LightningUnsupportedOnMainnet.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "code": 403,
+                "name": "LightningUnsupportedOnMainnet",
+                "error": "RLN on mainnet currently supports only on-chain methods. Lightning APIs are not supported."
+            })
+        );
+    }
+
     #[test]
     fn unsupported_schema_maps_to_dedicated_error() {
         let err = APIError::from(RgbLibError::UnsupportedSchema {
@@ -722,5 +847,33 @@ mod tests {
             err.to_string(),
             "Asset schema Ifa is not supported on this network"
         );
+    }
+
+    #[test]
+    fn burn_errors_map_to_client_errors() {
+        assert!(matches!(
+            APIError::from(RgbLibError::MissingBurnRecipient),
+            APIError::InvalidBurnRecipient(_)
+        ));
+        assert!(matches!(
+            APIError::from(RgbLibError::InvalidBurnRecipient { len: 20 }),
+            APIError::InvalidBurnRecipient(_)
+        ));
+        assert!(matches!(
+            APIError::from(RgbLibError::NoBurnAmount),
+            APIError::InvalidAmount(_)
+        ));
+        assert!(matches!(
+            APIError::from(RgbLibError::UnsupportedBurn {
+                asset_schema: rgb_lib::AssetSchema::Uda,
+            }),
+            APIError::UnsupportedBurn(_)
+        ));
+        assert!(matches!(
+            APIError::from(RgbLibError::InvalidEthRpcUrl {
+                details: s!("Ethereum RPC URL is required for BFA"),
+            }),
+            APIError::InvalidEthRpcUrl(_)
+        ));
     }
 }

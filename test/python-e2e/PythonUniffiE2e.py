@@ -65,10 +65,12 @@ def make_node(storage_dir: Path, daemon_port: int, peer_port: int) -> rln.SdkNod
 def unlock_request(password: str) -> rln.SdkUnlockRequest:
     return rln.SdkUnlockRequest(
         password=password,
-        bitcoind_rpc_username="user",
-        bitcoind_rpc_password="password",
-        bitcoind_rpc_host="localhost",
-        bitcoind_rpc_port=18443,
+        ldk_chain_sync=rln.SdkLdkChainSync.BLOCK_SYNC(
+            bitcoind_rpc_username="user",
+            bitcoind_rpc_password="password",
+            bitcoind_rpc_host="localhost",
+            bitcoind_rpc_port=18443,
+        ),
         indexer_url="127.0.0.1:50001",
         proxy_endpoint=PROXY_ENDPOINT_LOCAL,
         announce_addresses=[],
@@ -238,7 +240,7 @@ def mine_until_tx_confirmed(
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         node.sync()
-        transactions = node.list_transactions(False)
+        transactions = node.list_transactions(False, None)
         tx = next((t for t in transactions if str(t.txid) == str(txid)), None)
         if tx is not None and tx.confirmation_time is not None:
             print(f"funding tx confirmed in block: {txid}")
@@ -656,7 +658,7 @@ def openchannel_fail_no_utxos_scenario():
             raise RuntimeError("openchannel should fail when no uncolored UTXOs are available")
         except Exception as e:
             no_utxos_err = getattr(rln.RlnError, "NoAvailableUtxos", None)
-            if isinstance(e, rln.RlnError.Conflict) or (
+            if isinstance(e, (rln.RlnError.Conflict, rln.RlnError.InsufficientFunds)) or (
                 no_utxos_err is not None and isinstance(e, no_utxos_err)
             ):
                 pass

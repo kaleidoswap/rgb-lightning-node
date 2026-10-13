@@ -1,16 +1,18 @@
 services:
   bitcoind:
+    platform: linux/amd64
     image: registry.gitlab.com/hashbeam/docker/bitcoind:30.2
-    command: ["-fallbackfee=0.0002", "-rest"]
+    command: ["-fallbackfee=0.0002", "-rest", "-rpcallowip=0.0.0.0/0"]
     environment:
       MYUID: 1000
       MYGID: 1000
       RPCAUTH: "user:84c66d54d736d8b02aaa5b02e07e759b$$cc56c229b2a49ae2bfd5932cc8a6135d435bb9a7ac037ddd351d65936082c03d"
     ports:
-      - 18443:18443
+      - 127.0.0.1:18443:18443
     volumes:
       - ./datacore:/srv/app/.bitcoin
   electrs:
+    platform: linux/amd64
     image: registry.gitlab.com/hashbeam/docker/electrs:0.11.0
     environment:
       MYUID: 1000
@@ -39,6 +41,7 @@ services:
     ports:
       - 3002:3002
   proxy:
+    platform: linux/amd64
     image: ghcr.io/rgb-tools/rgb-proxy-server:0.3.0
     ports:
       - 3000:3000

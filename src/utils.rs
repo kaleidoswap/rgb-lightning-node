@@ -19,7 +19,7 @@ use lightning::{
     util::persist::KVStoreSync,
     util::ser::{Writeable, Writer},
 };
-use magic_crypt::{new_magic_crypt, MagicCryptTrait};
+use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use rgb_lib::{bdk_wallet::keys::bip39::Mnemonic, BitcoinNetwork, ContractId};
 use rln_migration::{Migrator, MigratorTrait};
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
@@ -30,16 +30,18 @@ use std::{
     path::Path,
     path::PathBuf,
     str::FromStr,
-    sync::{Arc, Mutex, MutexGuard, RwLock},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock},
     time::{Duration, SystemTime},
 };
 use tokio::sync::{Mutex as TokioMutex, MutexGuard as TokioMutexGuard};
 use tokio_util::sync::CancellationToken;
 
+use crate::asset_link::AssetLinkMessageHandler;
 use crate::async_order::{AsyncOrderMessageHandler, AsyncPaymentsPreimageRoot};
-use crate::core_types::{DEFAULT_FINAL_CLTV_EXPIRY_DELTA, HTLC_MIN_MSAT, VIRTUAL_HTLC_MIN_MSAT};
+use crate::crypto::{decrypt_mnemonic, encrypt_mnemonic};
 use crate::ldk::{ChannelIdsMap, Router, VirtualChannelDraftStore, VirtualChannelSessionStore};
 use crate::rgb::{get_rgb_channel_info_optional, RgbLibWalletWrapper};
+use crate::rgb_file_transfer::RgbFileTransferHandler;
 use crate::signer::{
     read_key_source_file, ActiveSignerRef, ExternalSigner, ExternalSignerAttachment,
     RlnEntropySource,
@@ -57,16 +59,28 @@ use crate::{
 
 pub(crate) const LDK_DIR: &str = ".ldk";
 pub(crate) const LOGS_DIR: &str = "logs";
+// the test suite drives local electrs/esplora instances
+#[cfg(test)]
 pub(crate) const ELECTRUM_URL_REGTEST: &str = "127.0.0.1:50001";
 #[cfg(test)]
 pub(crate) const ESPLORA_URL_REGTEST: &str = "http://127.0.0.1:3002";
-pub(crate) const ELECTRUM_URL_SIGNET: &str = "ssl://electrum.iriswallet.com:50033";
-pub(crate) const ELECTRUM_URL_TESTNET: &str = "ssl://electrum.iriswallet.com:50013";
-pub(crate) const ELECTRUM_URL_TESTNET4: &str = "ssl://electrum.iriswallet.com:50053";
-pub(crate) const ELECTRUM_URL_MAINNET: &str = "ssl://electrum.iriswallet.com:50003";
 pub(crate) const PROXY_ENDPOINT_LOCAL: &str = "rpc://127.0.0.1:3000/json-rpc";
 pub(crate) const PROXY_ENDPOINT_PUBLIC: &str = "rpcs://proxy.iriswallet.com/0.2/json-rpc";
-const PASSWORD_MIN_LENGTH: u8 = 8;
+
+/// Set by the panic hook and by the background-processor watchdog. Once set, the shutdown is
+/// fatal: it stops waiting for an in-progress state change and the process exits non-zero.
+pub(crate) static FATAL_ERROR: OnceLock<String> = OnceLock::new();
+
+/// Process exit code `main` returns once the server future is done: `70` (sysexits
+/// `EX_SOFTWARE`) when a fatal error was recorded, `0` otherwise. Single source of truth so the
+/// watchdog tests exercise the real decision rather than a copy.
+pub(crate) fn fatal_exit_code() -> i32 {
+    if FATAL_ERROR.get().is_some() {
+        70
+    } else {
+        0
+    }
+}
 
 pub(crate) struct AppState {
     pub(crate) static_state: Arc<StaticState>,
@@ -81,6 +95,16 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
+    /// Gate Lightning API calls using the configured node network, including while locked.
+    /// Kept separate from wallet/lifecycle checks so on-chain and administrative APIs retain
+    /// their existing requirements. REST and SDK entry points share this policy.
+    pub(crate) fn check_lightning_supported(&self) -> Result<(), APIError> {
+        if self.static_state.network == BitcoinNetwork::Mainnet {
+            return Err(APIError::LightningUnsupportedOnMainnet);
+        }
+        Ok(())
+    }
+
     pub(crate) fn db(&self) -> Arc<DatabaseConnection> {
         self.static_state.db()
     }
@@ -90,13 +114,17 @@ impl AppState {
     }
 
     pub(crate) fn get_changing_state(&self) -> MutexGuard<'_, bool> {
-        self.changing_state.lock().unwrap()
+        self.changing_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) // ignore the poison: a wedged flag must not block shutdown
     }
 
     pub(crate) fn get_ldk_background_services(
         &self,
     ) -> MutexGuard<'_, Option<LdkBackgroundServices>> {
-        self.ldk_background_services.lock().unwrap()
+        self.ldk_background_services
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) // ignore the poison: a wedged flag must not block shutdown
     }
 
     #[allow(dead_code)]
@@ -126,6 +154,7 @@ impl AppState {
 // `cfg_attr(dead_code)` annotations made the fields look optional; they
 // aren't, only their consumers are gated).
 pub(crate) struct StaticState {
+    pub(crate) config: Arc<crate::config::Config>,
     pub(crate) enable_virtual_channels_v0: bool,
     pub(crate) ldk_peer_listening_port: u16,
     pub(crate) network: BitcoinNetwork,
@@ -138,7 +167,7 @@ pub(crate) struct StaticState {
     pub(crate) lsp_base_url: Option<String>,
     pub(crate) lsp_bearer_token: Option<String>,
     /// VSS server URL (None = VSS disabled). Populated regardless of the
-    /// `vss` feature flag; only the consumer in `start_ldk` is feature-gated.
+    /// `vss` feature flag; only the consumer in `start_node` is feature-gated.
     #[cfg_attr(not(feature = "vss"), allow(dead_code))]
     pub(crate) vss_url: Option<String>,
     /// When true, a failed VSS restore on a fresh device logs a warning and
@@ -148,6 +177,16 @@ pub(crate) struct StaticState {
     /// When true, the RGB wallet returns a pinned address instead of a fresh
     /// one on each `/address` call. Set from the `--reuse-addresses` flag.
     pub(crate) reuse_addresses: bool,
+    /// Socket address of the remote external signer daemon the node connects to (Option A). The daemon
+    /// holds the seed and answers all signing; required to unlock in external-signer mode. Set from
+    /// `--remote-signer-addr`. Always present (`None` when `remote-signer` isn't compiled in) — see
+    /// `UserArgs::remote_signer_listen_addr` for why this field isn't cfg-gated. Only read by the
+    /// `remote-signer`-gated unlock path, so it is dead code when that feature is off.
+    #[cfg_attr(not(feature = "remote-signer"), allow(dead_code))]
+    pub(crate) remote_signer_listen_addr: Option<std::net::SocketAddr>,
+    pub(crate) max_aggregated_media_size_per_channel_mb: u16,
+    pub(crate) max_pending_consignments: usize,
+    pub(crate) max_media_files_per_channel: usize,
 }
 
 impl StaticState {
@@ -156,37 +195,90 @@ impl StaticState {
     }
 }
 
-pub(crate) struct UnlockedAppState {
+/// Wallet, signing and persistence state shared by every supported network.
+pub(crate) struct CommonState {
+    pub(crate) config: Arc<crate::config::Config>,
+    pub(crate) signer: ActiveSignerRef,
+    pub(crate) entropy_source: Arc<dyn RlnEntropySource>,
+    pub(crate) kv_store: Arc<SyncedKvStore>,
+    pub(crate) rgb_wallet_wrapper: Arc<RgbLibWalletWrapper>,
+    pub(crate) proxy_endpoint: String,
+    pub(crate) external_signer_mode: bool,
+    pub(crate) external_signer: Option<Arc<ExternalSigner>>,
+    pub(crate) external_node_id: Option<String>,
+    pub(crate) node_id: PublicKey,
+    pub(crate) indexer_url: String,
+    #[cfg(feature = "vss")]
+    pub(crate) persistence_shutdown: CancellationToken,
+    #[cfg(feature = "vss")]
+    pub(crate) persistence_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+/// A complete Lightning runtime, present only on supported non-mainnet networks.
+pub(crate) struct LightningState {
+    pub(crate) common: Arc<CommonState>,
     pub(crate) channel_manager: Arc<ChannelManager>,
     pub(crate) gossip_source: Arc<crate::gossip::GossipSource>,
     pub(crate) inbound_payments: Arc<Mutex<InboundPaymentInfoStorage>>,
-    pub(crate) signer: ActiveSignerRef,
-    pub(crate) entropy_source: Arc<dyn RlnEntropySource>,
     pub(crate) network_graph: Arc<NetworkGraph>,
     pub(crate) chain_monitor: Arc<ChainMonitor>,
     pub(crate) onion_messenger: Arc<OnionMessenger>,
     pub(crate) outbound_payments: Arc<Mutex<OutboundPaymentInfoStorage>>,
     pub(crate) peer_manager: Arc<PeerManager>,
+    pub(crate) asset_link_handler: Arc<AssetLinkMessageHandler>,
     pub(crate) async_order_handler: Arc<AsyncOrderMessageHandler>,
     pub(crate) async_payments_preimage_root: Arc<AsyncPaymentsPreimageRoot>,
-    pub(crate) kv_store: Arc<SyncedKvStore>,
+    #[cfg(feature = "vss")]
+    pub(crate) monitor_kv_store: Arc<crate::async_kv_store::RemoteFirstKvStore>,
+    pub(crate) rgb_file_transfer_handler: Arc<RgbFileTransferHandler>,
     pub(crate) bump_tx_event_handler: Arc<BumpTxEventHandler>,
     pub(crate) maker_swaps: Arc<Mutex<SwapMap>>,
     pub(crate) taker_swaps: Arc<Mutex<SwapMap>>,
-    pub(crate) rgb_wallet_wrapper: Arc<RgbLibWalletWrapper>,
     pub(crate) router: Arc<Router>,
     pub(crate) output_sweeper: Arc<OutputSweeper>,
     pub(crate) channel_ids_map: Arc<Mutex<ChannelIdsMap>>,
-    pub(crate) proxy_endpoint: String,
-    pub(crate) external_signer_mode: bool,
-    pub(crate) external_signer: Option<Arc<ExternalSigner>>,
-    pub(crate) external_node_id: Option<String>,
     pub(crate) virtual_channel_draft_store: Arc<Mutex<VirtualChannelDraftStore>>,
     pub(crate) virtual_channel_session_store: Arc<Mutex<VirtualChannelSessionStore>>,
     pub(crate) next_payment_idx: Arc<std::sync::atomic::AtomicU64>,
 }
 
+pub(crate) struct UnlockedAppState {
+    pub(crate) common: Arc<CommonState>,
+    pub(crate) lightning: Option<Arc<LightningState>>,
+}
+
+impl std::ops::Deref for UnlockedAppState {
+    type Target = CommonState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.common
+    }
+}
+
+impl std::ops::Deref for LightningState {
+    type Target = CommonState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.common
+    }
+}
+
 impl UnlockedAppState {
+    pub(crate) fn lightning(&self) -> Result<&Arc<LightningState>, APIError> {
+        self.lightning
+            .as_ref()
+            .ok_or_else(|| APIError::Unexpected("Lightning runtime is not available".to_string()))
+    }
+}
+
+#[cfg(feature = "vss")]
+impl Drop for CommonState {
+    fn drop(&mut self) {
+        self.persistence_shutdown.cancel();
+    }
+}
+
+impl LightningState {
     pub(crate) fn attach_apay_signatures(
         &self,
         mut params: crate::async_order::AsyncOrderNewParamsWire,
@@ -275,7 +367,7 @@ impl UnlockedAppState {
             })
             .filter_map(|chan_info| chan_info.inbound_htlc_minimum_msat)
             .min()
-            .unwrap_or(HTLC_MIN_MSAT)
+            .unwrap_or(self.config.channels.htlc_min_msat)
     }
 
     pub(crate) fn htlc_min_msat_for_peer(&self, peer: PublicKey) -> u64 {
@@ -284,9 +376,9 @@ impl UnlockedAppState {
                 channel.trusted_no_broadcast && channel.counterparty.node_id == peer
             });
         if has_virtual {
-            VIRTUAL_HTLC_MIN_MSAT
+            self.config.channels.virtual_htlc_min_msat
         } else {
-            HTLC_MIN_MSAT
+            self.config.channels.htlc_min_msat
         }
     }
 
@@ -332,7 +424,9 @@ impl UnlockedAppState {
                 .map_err(|err| APIError::InvalidRequest(err.message))
         }
     }
+}
 
+impl CommonState {
     pub(crate) fn sign_node_message(&self, message: &[u8]) -> Result<String, APIError> {
         self.signer
             .sign_message(message)
@@ -342,16 +436,11 @@ impl UnlockedAppState {
     pub(crate) fn runtime_node_pubkey(&self) -> String {
         self.external_node_id
             .clone()
-            .unwrap_or_else(|| self.channel_manager.get_our_node_id().to_string())
+            .unwrap_or_else(|| self.node_id.to_string())
     }
 
     pub(crate) fn runtime_node_id(&self) -> PublicKey {
-        if let Some(node_id) = &self.external_node_id {
-            if let Ok(pubkey) = PublicKey::from_str(node_id) {
-                return pubkey;
-            }
-        }
-        self.channel_manager.get_our_node_id()
+        self.node_id
     }
 }
 
@@ -376,6 +465,9 @@ impl Writeable for UserOnionMessageContents {
     }
 }
 
+/// Whether external-signer mode has been configured (a `key_source.json` exists in the storage
+/// dir). Presence-only by design: the parsed contents are validated where they are actually
+/// consumed, inside `start_node`.
 pub(crate) fn is_external_signer_mode_configured(state: &Arc<AppState>) -> Result<bool, APIError> {
     Ok(read_key_source_file(&state.static_state.storage_dir_path)
         .map_err(|e| APIError::ExternalSignerProtocolError(e.to_string()))?
@@ -390,10 +482,43 @@ pub(crate) fn check_already_initialized(database: &DatabaseConnection) -> Result
     Ok(())
 }
 
-pub(crate) fn check_password_strength(password: String) -> Result<(), APIError> {
-    if password.len() < PASSWORD_MIN_LENGTH as usize {
+/// Shared init-time checks for external-signer mode: validate `api_level`, then confirm the node
+/// isn't already initialized (internal mnemonic) or already configured for external-signer mode.
+/// Used by both `routes::init_external_signer` (HTTP) and `sdk::init_with_external_signer` (SDK), so
+/// the two entry points can't drift on check order or content. Callers must have already confirmed
+/// the node is locked (`AppState::check_locked` / the SDK's own `check_locked`) before calling this —
+/// that check is itself duplicated between the two for an unrelated reason (private `AppState`
+/// methods vs. a free function `sdk` needs) and is out of scope here.
+///
+/// Lives here rather than in `sdk` because `routes.rs` is compiled by both the `main` binary and the
+/// library crate-type targets, while `sdk` is compiled only by the library targets — `main.rs` has no
+/// `mod sdk`, so `routes.rs` cannot call into `sdk` directly.
+///
+/// In the `main` binary the only caller is the `remote-signer`-gated `routes::init_external_signer`
+/// (the binary has no `mod sdk`), so this is dead code in the binary when that feature is off; the
+/// library targets always reach it via `sdk::init_with_external_signer`.
+#[cfg_attr(not(feature = "remote-signer"), allow(dead_code))]
+pub(crate) fn validate_external_signer_init(
+    state: &Arc<AppState>,
+    api_level: u32,
+) -> Result<(), APIError> {
+    if api_level != crate::signer::SUPPORTED_SIGNER_API_LEVEL {
+        return Err(APIError::ExternalSignerProtocolError(format!(
+            "unsupported external signer api_level {api_level}, expected {}",
+            crate::signer::SUPPORTED_SIGNER_API_LEVEL
+        )));
+    }
+    check_already_initialized(&state.db())?;
+    if is_external_signer_mode_configured(state)? {
+        return Err(APIError::AlreadyInitialized);
+    }
+    Ok(())
+}
+
+pub(crate) fn check_password_strength(password: String, min_length: u8) -> Result<(), APIError> {
+    if password.len() < min_length as usize {
         return Err(APIError::InvalidPassword(format!(
-            "must have at least {PASSWORD_MIN_LENGTH} chars"
+            "must have at least {min_length} chars"
         )));
     }
     Ok(())
@@ -404,15 +529,12 @@ pub(crate) fn check_password_validity(
     database: &DatabaseConnection,
 ) -> Result<Mnemonic, APIError> {
     let db = crate::database::RlnDatabase::new(database.clone());
-    if let Some(mnemonic_record) = db.get_mnemonic()? {
-        let mcrypt = new_magic_crypt!(password, 256);
-        let mnemonic_str = mcrypt
-            .decrypt_base64_to_string(mnemonic_record.encrypted_mnemonic)
-            .map_err(|_| APIError::WrongPassword)?;
-        Ok(Mnemonic::from_str(&mnemonic_str).expect("valid mnemonic"))
-    } else {
-        Err(APIError::NotInitialized)
-    }
+    let Some(mnemonic_record) = db.get_mnemonic()? else {
+        return Err(APIError::NotInitialized);
+    };
+    let mnemonic_str = decrypt_mnemonic(password, &mnemonic_record.encrypted_mnemonic)?;
+    Mnemonic::from_str(&mnemonic_str)
+        .map_err(|e| APIError::CorruptedMnemonic(format!("invalid mnemonic: {e}")))
 }
 
 pub(crate) fn check_channel_id(channel_id_str: &str) -> Result<ChannelId, APIError> {
@@ -480,8 +602,7 @@ pub(crate) fn encrypt_and_save_mnemonic(
     mnemonic: String,
     database: &DatabaseConnection,
 ) -> Result<(), APIError> {
-    let mcrypt = new_magic_crypt!(password, 256);
-    let encrypted_mnemonic = mcrypt.encrypt_str_to_base64(mnemonic);
+    let encrypted_mnemonic = encrypt_mnemonic(&password, &mnemonic)?;
     let db = crate::database::RlnDatabase::new(database.clone());
     db.save_mnemonic(encrypted_mnemonic)?;
     tracing::info!("Saved wallet mnemonic");
@@ -501,6 +622,24 @@ pub(crate) async fn connect_peer_if_necessary(
     do_connect_peer(pubkey, address, peer_manager).await?;
     tracing::info!("connected to peer (pubkey: {pubkey}, addr: {address})");
     Ok(())
+}
+
+pub(crate) fn description_hash_from_invoice(invoice: &Bolt11Invoice) -> Option<[u8; 32]> {
+    match invoice.description() {
+        lightning_invoice::Bolt11InvoiceDescriptionRef::Hash(hash) => Some(hash.0.to_byte_array()),
+        _ => None,
+    }
+}
+
+// Empty direct descriptions surface as None.
+pub(crate) fn description_from_invoice(invoice: &Bolt11Invoice) -> Option<String> {
+    match invoice.description() {
+        lightning_invoice::Bolt11InvoiceDescriptionRef::Direct(description) => {
+            let description = description.to_string();
+            (!description.is_empty()).then_some(description)
+        }
+        _ => None,
+    }
 }
 
 pub(crate) async fn do_connect_peer(
@@ -567,25 +706,6 @@ pub(crate) fn hex_str_to_vec(hex: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Runs a closure on drop, including during panic unwinding, so cleanup (e.g.
-/// clearing the changing-state flag) still happens if the guarded work returns
-/// early or panics.
-pub(crate) struct CallOnDrop<F: FnMut()> {
-    action: F,
-}
-
-impl<F: FnMut()> CallOnDrop<F> {
-    pub(crate) fn new(action: F) -> Self {
-        Self { action }
-    }
-}
-
-impl<F: FnMut()> Drop for CallOnDrop<F> {
-    fn drop(&mut self) {
-        (self.action)();
-    }
-}
-
 pub(crate) async fn no_cancel<Fut>(fut: Fut) -> Fut::Output
 where
     Fut: 'static + Future + Send,
@@ -596,7 +716,10 @@ where
         let result = fut.await;
         let _ = tx.send(result);
     });
-    rx.await.unwrap()
+    // the sender is only dropped without sending if the spawned task panicked, which the default
+    // panic hook has already reported
+    rx.await
+        .expect("request task panicked, see the preceding panic for the cause")
 }
 
 pub(crate) fn parse_peer_info(
@@ -671,6 +794,7 @@ pub(crate) async fn start_daemon(args: &UserArgs) -> Result<Arc<AppState>, AppEr
     }
 
     let static_state = Arc::new(StaticState {
+        config: Arc::new(args.config.clone()),
         enable_virtual_channels_v0: args.enable_virtual_channels_v0,
         ldk_peer_listening_port: args.ldk_peer_listening_port,
         network: args.network,
@@ -685,6 +809,10 @@ pub(crate) async fn start_daemon(args: &UserArgs) -> Result<Arc<AppState>, AppEr
         vss_url: args.vss_url.clone(),
         vss_allow_empty_restore: args.vss_allow_empty_restore,
         reuse_addresses: args.reuse_addresses,
+        remote_signer_listen_addr: args.remote_signer_listen_addr,
+        max_aggregated_media_size_per_channel_mb: args.max_aggregated_media_size_per_channel_mb,
+        max_pending_consignments: args.max_pending_consignments,
+        max_media_files_per_channel: args.max_media_files_per_channel,
     });
 
     let app_state = Arc::new(AppState {
@@ -735,6 +863,7 @@ pub(crate) fn get_max_local_rgb_amount<'r>(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn get_route(
+    config: &crate::config::Config,
     channel_manager: &crate::ldk::ChannelManager,
     router: &crate::ldk::Router,
     kv_store: &dyn KVStoreSync,
@@ -771,7 +900,7 @@ pub(crate) fn get_route(
             node_id: dest,
             route_hints: hints,
             features: None,
-            final_cltv_expiry_delta: DEFAULT_FINAL_CLTV_EXPIRY_DELTA,
+            final_cltv_expiry_delta: config.payments.final_cltv_expiry_delta,
         },
         expiry_time: None,
         max_total_cltv_expiry_delta: DEFAULT_MAX_TOTAL_CLTV_EXPIRY_DELTA,
@@ -785,7 +914,7 @@ pub(crate) fn get_route(
         &start,
         &RouteParameters {
             payment_params,
-            final_value_msat: final_value_msat.unwrap_or(HTLC_MIN_MSAT),
+            final_value_msat: final_value_msat.unwrap_or(config.channels.htlc_min_msat),
             max_total_routing_fee_msat: None,
             rgb_payment,
         },
@@ -804,6 +933,41 @@ pub(crate) fn validate_and_parse_payment_hash(
         return Err(APIError::InvalidPaymentHash(payment_hash_str.to_string()));
     }
     Ok(PaymentHash(payment_hash_vec.unwrap().try_into().unwrap()))
+}
+
+pub(crate) fn validate_and_parse_description(
+    description_str: &str,
+) -> Result<lightning_invoice::Description, APIError> {
+    lightning_invoice::Description::new(description_str.to_string())
+        .map_err(|e| APIError::InvalidDescription(e.to_string()))
+}
+
+// Builds the invoice description from request fields, treating an explicit empty description as
+// "none": a caller may send an empty `description` alongside a `description_hash`, which must
+// mint an h-tag invoice rather than be rejected as "both provided".
+pub(crate) fn invoice_description_from_request(
+    description: Option<&str>,
+    description_hash: Option<&str>,
+) -> Result<Bolt11InvoiceDescription, APIError> {
+    parse_invoice_description(description.filter(|d| !d.is_empty()), description_hash)
+}
+
+pub(crate) fn parse_invoice_description(
+    description: Option<&str>,
+    description_hash: Option<&str>,
+) -> Result<Bolt11InvoiceDescription, APIError> {
+    match (description, description_hash) {
+        (Some(_), Some(_)) => Err(APIError::InvalidRequest(s!(
+            "cannot provide both description and description_hash"
+        ))),
+        (Some(description), None) => Ok(Bolt11InvoiceDescription::Direct(
+            validate_and_parse_description(description)?,
+        )),
+        (None, Some(description_hash)) => Ok(Bolt11InvoiceDescription::Hash(
+            validate_and_parse_description_hash(description_hash)?,
+        )),
+        (None, None) => Ok(Bolt11InvoiceDescription::Direct(Description::empty())),
+    }
 }
 
 pub(crate) fn validate_and_parse_description_hash(
@@ -831,8 +995,56 @@ pub(crate) fn validate_and_parse_payment_preimage(
     Ok(preimage)
 }
 
+/// Binds the first address that accepts a listener, so an IPv6 dual-stack
+/// bind can fall back to IPv4-only on hosts without IPv6.
+pub(crate) async fn bind_first_available(
+    addrs: &[String],
+) -> std::io::Result<tokio::net::TcpListener> {
+    let mut last_err = None;
+    for addr in addrs {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => return Ok(listener),
+            Err(e) => {
+                tracing::warn!(addr, error = %e, "listen bind failed; trying next address");
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "no addresses to bind")
+    }))
+}
+
 #[cfg(test)]
 mod utils_tests {
+    use super::*;
+
+    const HASH_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    #[test]
+    fn empty_description_with_hash_mints_hash_invoice() {
+        let d = invoice_description_from_request(Some(""), Some(HASH_HEX)).unwrap();
+        assert!(matches!(d, Bolt11InvoiceDescription::Hash(_)));
+    }
+
+    #[test]
+    fn present_description_with_hash_is_rejected() {
+        assert!(invoice_description_from_request(Some("hi"), Some(HASH_HEX)).is_err());
+    }
+
+    #[tokio::test]
+    async fn bind_first_available_falls_back_when_first_addr_fails() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let taken = occupied.local_addr().unwrap().to_string();
+        let listener = super::bind_first_available(&[taken.clone(), "127.0.0.1:0".to_string()])
+            .await
+            .expect("must fall back to the second address");
+        assert_ne!(listener.local_addr().unwrap().to_string(), taken);
+
+        let err = super::bind_first_available(&[taken.clone(), taken]).await;
+        assert!(err.is_err(), "all candidates failing must surface an error");
+    }
+
     use super::validate_vss_url;
 
     #[test]
@@ -862,37 +1074,5 @@ mod utils_tests {
     fn vss_url_other_schemes_rejected() {
         assert!(validate_vss_url("ftp://example.com/vss", true).is_err());
         assert!(validate_vss_url("example.com/vss", true).is_err());
-    }
-}
-
-#[cfg(test)]
-mod call_on_drop_tests {
-    use super::CallOnDrop;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-
-    #[test]
-    fn runs_action_on_scope_exit() {
-        let ran = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&ran);
-        {
-            let _g = CallOnDrop::new(move || flag.store(true, Ordering::SeqCst));
-        }
-        assert!(ran.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn runs_action_during_panic_unwind() {
-        let ran = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&ran);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _g = CallOnDrop::new(move || flag.store(true, Ordering::SeqCst));
-            panic!("boom");
-        }));
-        assert!(result.is_err(), "closure should have panicked");
-        assert!(
-            ran.load(Ordering::SeqCst),
-            "action must run while unwinding a panic"
-        );
     }
 }

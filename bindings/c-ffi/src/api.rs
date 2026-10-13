@@ -21,8 +21,7 @@ use crate::COpaqueStruct;
 // ---------------------------------------------------------------------------
 
 fn parse_bolt11(s: &str) -> Result<rln::Bolt11Invoice, Error> {
-    rln::Bolt11Invoice::from_str(s)
-        .map_err(|e| Error::StringParse(format!("invalid bolt11: {e}")))
+    rln::Bolt11Invoice::from_str(s).map_err(|e| Error::StringParse(format!("invalid bolt11: {e}")))
 }
 
 fn parse_payment_hash(s: &str) -> Result<rln::PaymentHash, Error> {
@@ -185,7 +184,12 @@ pub(crate) fn close_channel(
 pub(crate) fn list_channels(node: &COpaqueStruct) -> Result<String, Error> {
     let node = require_handle(node)?;
     let channels = node.list_channels()?;
-    json(channels.into_iter().map(JsonChannel::from).collect::<Vec<_>>())
+    json(
+        channels
+            .into_iter()
+            .map(JsonChannel::from)
+            .collect::<Vec<_>>(),
+    )
 }
 
 pub(crate) fn list_peers(node: &COpaqueStruct) -> Result<String, Error> {
@@ -199,7 +203,8 @@ pub(crate) fn get_channel_id(
     temporary_channel_id_hex: *const c_char,
 ) -> Result<String, Error> {
     let node = require_handle(node)?;
-    let temp = lightning::ln::types::ChannelId(parse_32_hex(&ptr_to_string(temporary_channel_id_hex))?);
+    let temp =
+        lightning::ln::types::ChannelId(parse_32_hex(&ptr_to_string(temporary_channel_id_hex))?);
     let result = node.get_channel_id(temp)?;
     json(JsonChannelIdResponse {
         channel_id: result.0.as_hex().to_string(),
@@ -220,10 +225,7 @@ pub(crate) fn send_payment(
     json(JsonSendPaymentResponse::from(resp))
 }
 
-pub(crate) fn keysend(
-    node: &COpaqueStruct,
-    request_json: *const c_char,
-) -> Result<String, Error> {
+pub(crate) fn keysend(node: &COpaqueStruct, request_json: *const c_char) -> Result<String, Error> {
     let node = require_handle(node)?;
     let req: JsonKeysendRequest = parse_req(request_json)?;
     let resp = node.keysend(req.try_into()?)?;
@@ -307,7 +309,12 @@ pub(crate) fn get_payment(
 pub(crate) fn list_payments(node: &COpaqueStruct) -> Result<String, Error> {
     let node = require_handle(node)?;
     let payments = node.list_payments()?;
-    json(payments.into_iter().map(JsonPayment::from).collect::<Vec<_>>())
+    json(
+        payments
+            .into_iter()
+            .map(JsonPayment::from)
+            .collect::<Vec<_>>(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -324,14 +331,31 @@ pub(crate) fn rgb_invoice(
     json(JsonRgbInvoiceResponse::from(resp))
 }
 
-pub(crate) fn send_rgb(
-    node: &COpaqueStruct,
-    request_json: *const c_char,
-) -> Result<String, Error> {
+pub(crate) fn send_rgb(node: &COpaqueStruct, request_json: *const c_char) -> Result<String, Error> {
     let node = require_handle(node)?;
     let req: JsonSendRgbRequest = parse_req(request_json)?;
     let resp = node.send_rgb(req.try_into()?)?;
     json(JsonSendRgbResponse::from(resp))
+}
+
+pub(crate) fn import_rgb_transfer_consignment(
+    node: &COpaqueStruct,
+    request_json: *const c_char,
+) -> Result<String, Error> {
+    let node = require_handle(node)?;
+    let req: JsonImportRgbTransferConsignmentRequest = parse_req(request_json)?;
+    let resp = node.importrgbtransferconsignment(req.try_into()?)?;
+    json(JsonImportRgbTransferConsignmentResponse::from(resp))
+}
+
+pub(crate) fn import_rgb_contract(
+    node: &COpaqueStruct,
+    request_json: *const c_char,
+) -> Result<String, Error> {
+    let node = require_handle(node)?;
+    let req: JsonImportRgbContractRequest = parse_req(request_json)?;
+    let resp = node.importrgbcontract(req.try_into()?)?;
+    json(JsonImportRgbContractResponse::from(resp))
 }
 
 pub(crate) fn refresh_transfers(
@@ -340,8 +364,8 @@ pub(crate) fn refresh_transfers(
 ) -> Result<String, Error> {
     let node = require_handle(node)?;
     let req: JsonRefreshTransfersRequest = parse_req(request_json)?;
-    node.refreshtransfers(req.into())?;
-    ok_void()
+    let resp = node.refreshtransfers(req.into())?;
+    json(JsonRefreshTransfersResponse::from(resp))
 }
 
 pub(crate) fn fail_transfers(
@@ -354,10 +378,48 @@ pub(crate) fn fail_transfers(
     json(JsonFailTransfersResponse::from(resp))
 }
 
-pub(crate) fn inflate(
+pub(crate) fn burn(node: &COpaqueStruct, request_json: *const c_char) -> Result<String, Error> {
+    let node = require_handle(node)?;
+    let req: JsonBurnRequest = parse_req(request_json)?;
+    let resp = node.burn(req.try_into()?)?;
+    json(JsonBurnResponse::from(resp))
+}
+
+fn parse_consignment_lookup(
+    asset_id: *const c_char,
+    txid: *const c_char,
+) -> Result<(rln::ContractId, rln::Txid), Error> {
+    let asset_id = parse_contract_id(&ptr_to_string(asset_id))?;
+    let txid = rln::Txid::from_str(&ptr_to_string(txid))
+        .map_err(|e| Error::StringParse(format!("invalid txid: {e}")))?;
+    Ok((asset_id, txid))
+}
+
+pub(crate) fn get_consignment_path(
     node: &COpaqueStruct,
-    request_json: *const c_char,
+    asset_id: *const c_char,
+    txid: *const c_char,
 ) -> Result<String, Error> {
+    let node = require_handle(node)?;
+    let (asset_id, txid) = parse_consignment_lookup(asset_id, txid)?;
+    let path = node.get_consignment_path(asset_id, txid)?;
+    json(JsonGetConsignmentPathResponse { path })
+}
+
+pub(crate) fn get_consignment(
+    node: &COpaqueStruct,
+    asset_id: *const c_char,
+    txid: *const c_char,
+) -> Result<String, Error> {
+    let node = require_handle(node)?;
+    let (asset_id, txid) = parse_consignment_lookup(asset_id, txid)?;
+    let bytes = node.get_consignment(asset_id, txid)?;
+    json(JsonGetConsignmentResponse {
+        bytes_hex: bytes.to_lower_hex_string(),
+    })
+}
+
+pub(crate) fn inflate(node: &COpaqueStruct, request_json: *const c_char) -> Result<String, Error> {
     let node = require_handle(node)?;
     let req: JsonInflateRequest = parse_req(request_json)?;
     let resp = node.inflate(req.try_into()?)?;
@@ -366,30 +428,33 @@ pub(crate) fn inflate(
 
 pub(crate) fn list_transfers(
     node: &COpaqueStruct,
-    asset_id: *const c_char,
+    asset_id_opt: *const c_char,
+    txid_opt: *const c_char,
 ) -> Result<String, Error> {
     let node = require_handle(node)?;
-    let asset_id = parse_contract_id(&ptr_to_string(asset_id))?;
-    let transfers = node.list_transfers(asset_id)?;
-    json(transfers.into_iter().map(JsonTransfer::from).collect::<Vec<_>>())
+    let asset_id = match convert_optional_string(asset_id_opt) {
+        Some(id) => Some(parse_contract_id(&id)?),
+        None => None,
+    };
+    let txid = convert_optional_string(txid_opt);
+    let transfers = node.list_transfers(asset_id, txid)?;
+    json(
+        transfers
+            .into_iter()
+            .map(JsonTransfer::from)
+            .collect::<Vec<_>>(),
+    )
 }
 
-pub(crate) fn list_transfers_by_txid(
-    node: &COpaqueStruct,
-    txid: *const c_char,
-) -> Result<String, Error> {
-    let node = require_handle(node)?;
-    let transfers = node.list_transfers_by_txid(ptr_to_string(txid))?;
-    json(transfers.into_iter().map(JsonTransfer::from).collect::<Vec<_>>())
-}
-
-pub(crate) fn list_unspents(
-    node: &COpaqueStruct,
-    skip_sync: bool,
-) -> Result<String, Error> {
+pub(crate) fn list_unspents(node: &COpaqueStruct, skip_sync: bool) -> Result<String, Error> {
     let node = require_handle(node)?;
     let unspents = node.list_unspents(skip_sync)?;
-    json(unspents.into_iter().map(JsonUnspent::from).collect::<Vec<_>>())
+    json(
+        unspents
+            .into_iter()
+            .map(JsonUnspent::from)
+            .collect::<Vec<_>>(),
+    )
 }
 
 pub(crate) fn post_asset_media(
@@ -441,7 +506,7 @@ pub(crate) fn issue_asset_ifa(
 ) -> Result<String, Error> {
     let node = require_handle(node)?;
     let req: JsonIssueAssetIfaRequest = parse_req(request_json)?;
-    let asset = node.issueassetifa(req.into())?;
+    let asset = node.issueassetifa(req.try_into()?)?;
     json(JsonAssetIfa::from(asset))
 }
 
@@ -473,6 +538,16 @@ pub(crate) fn asset_balance(
     let asset_id = parse_contract_id(&ptr_to_string(asset_id))?;
     let resp = node.asset_balance(asset_id)?;
     json(JsonAssetBalanceInfo::from(resp))
+}
+
+pub(crate) fn asset_link_create(
+    node: &COpaqueStruct,
+    request_json: *const c_char,
+) -> Result<String, Error> {
+    let node = require_handle(node)?;
+    let req: JsonAssetLinkRequest = parse_req(request_json)?;
+    let asset_link = node.asset_link(req.try_into()?)?;
+    json(JsonAssetLinkRecord::from(asset_link))
 }
 
 pub(crate) fn asset_metadata(
@@ -513,22 +588,26 @@ pub(crate) fn rotate_address(node: &COpaqueStruct) -> Result<String, Error> {
     json(JsonAddressInfo::from(resp))
 }
 
-pub(crate) fn btc_balance(
-    node: &COpaqueStruct,
-    skip_sync: bool,
-) -> Result<String, Error> {
+pub(crate) fn btc_balance(node: &COpaqueStruct, skip_sync: bool) -> Result<String, Error> {
     let node = require_handle(node)?;
     let resp = node.btc_balance(skip_sync)?;
     json(JsonBtcBalanceInfo::from(resp))
 }
 
-pub(crate) fn sign_message(
-    node: &COpaqueStruct,
-    message: *const c_char,
-) -> Result<String, Error> {
+pub(crate) fn sign_message(node: &COpaqueStruct, message: *const c_char) -> Result<String, Error> {
     let node = require_handle(node)?;
     let resp = node.sign_message(ptr_to_string(message))?;
     json(JsonSignMessageResponse::from(resp))
+}
+
+pub(crate) fn verify_message(
+    node: &COpaqueStruct,
+    message: *const c_char,
+    signature: *const c_char,
+) -> Result<String, Error> {
+    let node = require_handle(node)?;
+    let resp = node.verify_message(ptr_to_string(message), ptr_to_string(signature))?;
+    json(JsonVerifyMessageResponse::from(resp))
 }
 
 pub(crate) fn estimate_fee(node: &COpaqueStruct, blocks: u16) -> Result<String, Error> {
@@ -555,10 +634,7 @@ pub(crate) fn check_proxy_endpoint(
     ok_void()
 }
 
-pub(crate) fn send_btc(
-    node: &COpaqueStruct,
-    request_json: *const c_char,
-) -> Result<String, Error> {
+pub(crate) fn send_btc(node: &COpaqueStruct, request_json: *const c_char) -> Result<String, Error> {
     let node = require_handle(node)?;
     let req: JsonSendBtcRequest = parse_req(request_json)?;
     let resp = node.sendbtc(req.into())?;
@@ -578,20 +654,16 @@ pub(crate) fn create_utxos(
 pub(crate) fn list_transactions(
     node: &COpaqueStruct,
     skip_sync: bool,
+    txid_opt: *const c_char,
 ) -> Result<String, Error> {
     let node = require_handle(node)?;
-    let txs = node.list_transactions(skip_sync)?;
-    json(txs.into_iter().map(JsonTransaction::from).collect::<Vec<_>>())
-}
-
-pub(crate) fn list_transactions_by_txid(
-    node: &COpaqueStruct,
-    txid: *const c_char,
-    skip_sync: bool,
-) -> Result<String, Error> {
-    let node = require_handle(node)?;
-    let txs = node.list_transactions_by_txid(ptr_to_string(txid), skip_sync)?;
-    json(txs.into_iter().map(JsonTransaction::from).collect::<Vec<_>>())
+    let txid = convert_optional_string(txid_opt);
+    let txs = node.list_transactions(skip_sync, txid)?;
+    json(
+        txs.into_iter()
+            .map(JsonTransaction::from)
+            .collect::<Vec<_>>(),
+    )
 }
 
 pub(crate) fn sync(node: &COpaqueStruct) -> Result<String, Error> {
@@ -624,10 +696,7 @@ pub(crate) fn maker_execute(
     ok_void()
 }
 
-pub(crate) fn taker(
-    node: &COpaqueStruct,
-    request_json: *const c_char,
-) -> Result<String, Error> {
+pub(crate) fn taker(node: &COpaqueStruct, request_json: *const c_char) -> Result<String, Error> {
     let node = require_handle(node)?;
     let req: JsonTakerRequest = parse_req(request_json)?;
     node.taker(req.into())?;
@@ -708,9 +777,7 @@ pub(crate) fn native_external_signer_new(
     )?)
 }
 
-pub(crate) fn native_external_signer_bootstrap(
-    signer: &COpaqueStruct,
-) -> Result<String, Error> {
+pub(crate) fn native_external_signer_bootstrap(signer: &COpaqueStruct) -> Result<String, Error> {
     let signer = require_signer(signer)?;
     let bootstrap = signer.bootstrap()?;
     json(JsonSdkExternalSignerBootstrap::from(bootstrap))
@@ -744,17 +811,7 @@ pub(crate) fn sdk_node_unlock_with_native_external_signer(
     let node = require_handle(node)?;
     let signer = require_signer(signer)?;
     let r: JsonSdkExternalUnlockRequest = parse_req(request_json)?;
-    node.unlock_with_native_external_signer(
-        Arc::clone(signer),
-        r.bitcoind_rpc_username,
-        r.bitcoind_rpc_password,
-        r.bitcoind_rpc_host,
-        r.bitcoind_rpc_port,
-        r.indexer_url,
-        r.proxy_endpoint,
-        r.announce_addresses,
-        r.announce_alias,
-    )?;
+    node.unlock_with_native_external_signer_request(Arc::clone(signer), r.into())?;
     ok_void()
 }
 
@@ -768,9 +825,7 @@ pub(crate) fn sdk_node_init_with_external_signer(
     ok_void()
 }
 
-pub(crate) fn sdk_node_detach_external_signer(
-    node: &COpaqueStruct,
-) -> Result<String, Error> {
+pub(crate) fn sdk_node_detach_external_signer(node: &COpaqueStruct) -> Result<String, Error> {
     let node = require_handle(node)?;
     node.detach_external_signer();
     ok_void()
@@ -782,15 +837,6 @@ pub(crate) fn sdk_node_unlock_with_attached_external_signer(
 ) -> Result<String, Error> {
     let node = require_handle(node)?;
     let r: JsonSdkExternalUnlockRequest = parse_req(request_json)?;
-    node.unlock_with_attached_external_signer(
-        r.bitcoind_rpc_username,
-        r.bitcoind_rpc_password,
-        r.bitcoind_rpc_host,
-        r.bitcoind_rpc_port,
-        r.indexer_url,
-        r.proxy_endpoint,
-        r.announce_addresses,
-        r.announce_alias,
-    )?;
+    node.unlock_with_attached_external_signer_request(r.into())?;
     ok_void()
 }

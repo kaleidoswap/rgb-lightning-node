@@ -25,6 +25,7 @@ import org.utexo.rgblightningnode.SdkCloseChannelRequest
 import org.utexo.rgblightningnode.SdkCreateUtxosRequest
 import org.utexo.rgblightningnode.SdkInitRequest
 import org.utexo.rgblightningnode.SdkIssueAssetNiaRequest
+import org.utexo.rgblightningnode.SdkLdkChainSync
 import org.utexo.rgblightningnode.SdkNode
 import org.utexo.rgblightningnode.SdkOpenChannelRequest
 import org.utexo.rgblightningnode.SdkRefreshTransfersRequest
@@ -123,10 +124,12 @@ class PaymentTest {
 
     private fun unlockRequest(password: String) = SdkUnlockRequest(
         password = password,
-        bitcoindRpcUsername = bitcoindUser,
-        bitcoindRpcPassword = bitcoindPass,
-        bitcoindRpcHost = bitcoindHost,
-        bitcoindRpcPort = bitcoindPort.toUShort(),
+        ldkChainSync = SdkLdkChainSync.BlockSync(
+            bitcoindRpcUsername = bitcoindUser,
+            bitcoindRpcPassword = bitcoindPass,
+            bitcoindRpcHost = bitcoindHost,
+            bitcoindRpcPort = bitcoindPort.toUShort(),
+        ),
         indexerUrl = "$bitcoindHost:50001",
         proxyEndpoint = proxyEndpoint,
         announceAddresses = listOf(),
@@ -162,7 +165,8 @@ class PaymentTest {
             SdkCreateUtxosRequest(
                 upTo = false,
                 num = utxosNum,
-                size = null,
+                // explicit size keeps fixture balances independent of the default
+                size = 32_000u,
                 feeRate = utxosFeeRate,
                 skipSync = false,
             )
@@ -226,7 +230,7 @@ class PaymentTest {
         val deadline = System.currentTimeMillis() + timeoutSec * 1_000L
         while (System.currentTimeMillis() < deadline) {
             node.sync()
-            val tx = node.listTransactions(false).firstOrNull { it.txid == txid }
+            val tx = node.listTransactions(false, null).firstOrNull { it.txid == txid }
             if (tx != null && tx.confirmationTime != null) {
                 log("funding tx confirmed in block: $txid")
                 return
@@ -756,7 +760,7 @@ class PaymentTest {
             assertEquals(25uL, assetBalanceSpendable(nodeB, assetId))
             assertEquals(950uL, assetBalanceSpendable(nodeC, assetId))
 
-            val transactions = nodeA.listTransactions(false)
+            val transactions = nodeA.listTransactions(false, null)
             val txUser = transactions.first { it.received == 100_000_000uL }
             val txUtxos = transactions.first { it.sent == 100_000_000uL }
             val txSend = transactions.first { it.sent == 128_000uL }
@@ -765,7 +769,7 @@ class PaymentTest {
             assertEquals(TransactionType.RGB_SEND, txSend.transactionType)
             assertNotNull(txUtxos.confirmationTime)
 
-            val transfers = nodeA.listTransfers(assetId)
+            val transfers = nodeA.listTransfers(assetId, null)
             val xfer1 = transfers.first { it.idx == 1 }
             assertEquals("Settled", xfer1.status)
             assertEquals("Issuance", xfer1.kind)
@@ -786,8 +790,9 @@ class PaymentTest {
             assertNotNull(xfer2.recipientId)
             assertNull(xfer2.receiveUtxo)
             assertNotNull(xfer2.changeUtxo)
-            assertNull(xfer2.expiration)
-            assertTrue(xfer2.transportEndpoints.isNotEmpty())
+            assertNotNull(xfer2.expiration)
+            // the channel funding consignment travels over the p2p link, so no proxy is involved
+            assertTrue(xfer2.transportEndpoints.isEmpty())
 
             val xfer3 = transfers.first { it.idx == 3 }
             assertEquals("Settled", xfer3.status)
@@ -797,8 +802,8 @@ class PaymentTest {
             assertNotNull(xfer3.recipientId)
             assertNotNull(xfer3.receiveUtxo)
             assertNull(xfer3.changeUtxo)
-            assertNull(xfer3.expiration)
-            assertTrue(xfer3.transportEndpoints.isNotEmpty())
+            assertNotNull(xfer3.expiration)
+            assertTrue(xfer3.transportEndpoints.isEmpty())
 
             log("SUCCESS: Android payment parity flow completed")
         } finally {

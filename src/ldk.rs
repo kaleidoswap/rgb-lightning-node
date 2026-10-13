@@ -1,9 +1,14 @@
-use crate::async_order::{
-    AsyncOrderAccessControl, AsyncOrderInvoiceProvider, AsyncOrderMessageHandler,
-    AsyncOrderOutboundInvoiceResultWire, AsyncOrderRequestInvoiceParamsWire,
-    AsyncPaymentsPreimageRoot, JsonRpcErrorWire, ASYNC_ERROR_INVOICE_HASH_MISMATCH,
-    ASYNC_ERROR_STALE_FLOW,
+use crate::asset_link::{
+    AssetLinkAuthorizeParamsWire, AssetLinkAuthorizer, AssetLinkMessageHandler,
+    ASSET_LINK_ERROR_DUPLICATE_PAYMENT_HASH, ASSET_LINK_ERROR_INSUFFICIENT_LIQUIDITY,
+    ASSET_LINK_ERROR_UNKNOWN_ASSET, ASSET_LINK_ERROR_UNKNOWN_LINK,
 };
+use crate::async_order::{
+    AsyncOrderInvoiceProvider, AsyncOrderMessageHandler, AsyncOrderOutboundInvoiceResultWire,
+    AsyncOrderRequestInvoiceParamsWire, AsyncPaymentsPreimageRoot,
+    ASYNC_ERROR_INVOICE_HASH_MISMATCH, ASYNC_ERROR_STALE_FLOW,
+};
+use crate::custom_msg_rpc::{CustomMessenger, CustomMsgPeerAccessControl, JsonRpcErrorWire};
 use crate::synced_kv_store::SyncedKvStore;
 use amplify::{map, s};
 use bitcoin::blockdata::locktime::absolute::LockTime;
@@ -15,8 +20,10 @@ use bitcoin::{io, Amount, Network};
 use bitcoin::{BlockHash, TxOut};
 use bitcoin_bech32::WitnessProgram;
 use hex::DisplayHex;
+#[cfg(feature = "transaction-sync")]
+use lightning::chain::Confirm;
 use lightning::chain::{chainmonitor, transaction::OutPoint, ChannelMonitorUpdateStatus};
-use lightning::chain::{BestBlock, Confirm, Filter};
+use lightning::chain::{BestBlock, Filter};
 use lightning::events::bump_transaction::{BumpTransactionEventHandler, Wallet};
 use lightning::events::{Event, PaymentFailureReason, PaymentPurpose, ReplayEvent};
 use lightning::ln::channel_state::ChannelDetails;
@@ -33,19 +40,22 @@ use lightning::onion_message::messenger::{
     DefaultMessageRouter, OnionMessenger as LdkOnionMessenger,
 };
 use lightning::rgb_utils::{
-    get_rgb_channel_info_pending, is_channel_rgb, update_rgb_channel_amount, RgbKvStoreExt,
-    RGB_PAYMENT_INFO_INBOUND_NS, RGB_PAYMENT_INFO_OUTBOUND_NS, RGB_PRIMARY_NS,
+    deserialize_fascia, get_rgb_channel_info_pending, is_channel_rgb, update_rgb_channel_amount,
+    RgbKvStoreExt, RGB_COMMITMENT_FASCIA_NS, RGB_PAYMENT_INFO_INBOUND_NS,
+    RGB_PAYMENT_INFO_OUTBOUND_NS, RGB_PRIMARY_NS,
 };
-use lightning::rgb_utils::{RgbPaymentInfo, STATIC_BLINDING};
+use lightning::rgb_utils::{RgbPaymentInfo, TransferInfo, STATIC_BLINDING};
 use lightning::routing::gossip;
 use lightning::routing::gossip::NodeId;
 use lightning::routing::router::DefaultRouter;
 use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringFeeParameters};
+use lightning::routing::utxo::UtxoLookup;
 use lightning::sign::{KeysManager, OutputSpender, SpendableOutputDescriptor};
 // Used by the non-VSS ChainMonitor encryptor closure and the signer unit tests.
+#[cfg(feature = "block-sync")]
+use lightning::chain;
 #[cfg(feature = "vss")]
 use lightning::chain::chainmonitor::AsyncPersister;
-#[cfg(any(not(feature = "vss"), test))]
 use lightning::sign::NodeSigner;
 #[cfg(feature = "vss")]
 use lightning::sign::PeerStorageKey;
@@ -56,28 +66,25 @@ use lightning::util::hash_tables::{new_hash_map, HashMap as LdkHashMap};
 #[cfg(feature = "vss")]
 use lightning::util::native_async::FutureSpawner;
 #[cfg(not(feature = "vss"))]
+use lightning::util::persist::KVStoreSyncWrapper;
+#[cfg(not(feature = "vss"))]
 use lightning::util::persist::MonitorUpdatingPersister;
 #[cfg(feature = "vss")]
 use lightning::util::persist::MonitorUpdatingPersisterAsync;
 use lightning::util::persist::{
-    KVStoreSync, KVStoreSyncWrapper, CHANNEL_MANAGER_PERSISTENCE_KEY,
-    CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE, CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
-    OUTPUT_SWEEPER_PERSISTENCE_KEY, OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE,
-    OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE,
+    KVStoreSync, CHANNEL_MANAGER_PERSISTENCE_KEY, CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+    CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE, OUTPUT_SWEEPER_PERSISTENCE_KEY,
+    OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE, OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE,
 };
 use lightning::util::ser::{Readable, ReadableArgs, Writeable};
 use lightning::util::sweep as ldk_sweep;
-use lightning::{chain, impl_writeable_tlv_based, impl_writeable_tlv_based_enum};
+use lightning::{impl_writeable_tlv_based, impl_writeable_tlv_based_enum};
 use lightning_background_processor::{process_events_async, NO_LIQUIDITY_MANAGER};
-use lightning_block_sync::gossip::TokioSpawner;
-use lightning_block_sync::init;
-use lightning_block_sync::poll;
-use lightning_block_sync::SpvClient;
-use lightning_block_sync::UnboundedCache;
+#[cfg(feature = "block-sync")]
+use lightning_block_sync::{init, poll, SpvClient, UnboundedCache};
 use lightning_dns_resolver::OMDomainResolver;
 use lightning_invoice::{Bolt11InvoiceDescription, PaymentSecret};
 use lightning_net_tokio::SocketDescriptor;
-use lightning_transaction_sync::{ElectrumSyncClient, EsploraSyncClient};
 use rand::RngCore;
 use rgb_lib::{
     bdk_wallet::keys::{DerivableKey, ExtendedKey},
@@ -91,49 +98,59 @@ use rgb_lib::{
     utils::{get_account_data, recipient_id_from_script_buf, script_buf_from_recipient_id},
     wallet::{
         rust_only::{check_indexer_url, AssetColoringInfo, ColoringInfo},
-        DatabaseType, OnlineOptions, Recipient, SinglesigKeys, TransportEndpoint,
-        Wallet as RgbLibWallet, WalletData, WitnessData,
+        DatabaseType, OnlineOptions, Recipient, SinglesigKeys, Wallet as RgbLibWallet, WalletData,
+        WitnessData,
     },
     AssetSchema, Assignment, BitcoinNetwork, ConsignmentExt, ContractId, Error as RgbLibError,
-    Fascia, FileContent, RgbTransfer, RgbTxid, WitnessOrd,
+    Fascia, FileContent, RgbTransfer, RgbTxid, TransferStatus, WitnessOrd,
 };
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::convert::TryInto;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::ToSocketAddrs;
 use std::net::{SocketAddr, TcpListener};
-use std::path::PathBuf;
+use std::path::Path;
 use std::str::FromStr;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
+#[cfg(any(test, feature = "vss"))]
+use std::time::Instant;
 use std::time::{Duration, SystemTime};
 use time::OffsetDateTime;
 use tokio::runtime::Handle;
 use tokio::sync::watch::Sender;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "vss")]
 use crate::async_kv_store::RemoteFirstKvStore;
-use crate::bitcoind::BitcoindClient;
-use crate::chain_backend::ChainBackend;
 use crate::core_types::{
-    HTLCStatus, NodeKeySource, SwapStatus, UnlockRequest, DUST_LIMIT_MSAT, FEE_RATE, HTLC_MIN_MSAT,
-    MIN_CHANNEL_CONFIRMATIONS, VIRTUAL_HTLC_MIN_MSAT,
+    HTLCStatus, LdkChainSync, NodeKeySource, SwapStatus, UnlockRequest, PENDING_SWAP_TIMEOUT_SECS,
 };
 use crate::database::RlnDatabase;
 use crate::disk::{self, FilesystemLogger};
 use crate::gossip::{GossipSource, GossipSourceConfig};
-use crate::indexer::{ElectrumIndexerClient, EsploraIndexerClient};
 
 pub(crate) const INBOUND_PAYMENTS_KEY: &str = "inbound_payments";
 const OUTBOUND_PAYMENTS_KEY: &str = "outbound_payments";
 const CHANNEL_IDS_KEY: &str = "channel_ids";
 const MAKER_SWAPS_KEY: &str = "maker_swaps";
 const TAKER_SWAPS_KEY: &str = "taker_swaps";
+const ASSET_LINK_SWAP_AUTHORIZATION_MAX_EXPIRY_SECS: u64 = 24 * 60 * 60;
 const OUTPUT_SPENDER_TXES_KEY: &str = "output_spender_txes";
 const PSBT_NAMESPACE: &str = "psbt";
 const PENDING_FUNDING_NAMESPACE: &str = "pending_funding";
+/// Funding consignments keyed by funding txid, kept for wallet re-seeding
+/// after a restore without an RGB backup (issue #111).
+const FUNDING_CONSIGNMENT_NAMESPACE: &str = "funding_consignment";
+/// Local-only marker: absent on a freshly restored device, so the fascia
+/// replay reruns until it completes once.
+pub(crate) const REIMPORT_MARKER_NAMESPACE: &str = "reimport_marker";
+pub(crate) const REIMPORT_MARKER_KEY: &str = "fascia_replay";
 const CONFIG_INDEXER_URL: &str = "indexer_url";
 const CONFIG_BITCOIN_NETWORK: &str = "bitcoin_network";
 const CONFIG_WALLET_FINGERPRINT: &str = "wallet_fingerprint";
@@ -143,9 +160,21 @@ const CONFIG_WALLET_MASTER_FINGERPRINT: &str = "wallet_master_fingerprint";
 const VIRTUAL_CHANNEL_DRAFTS_KEY: &str = "virtual_channel_drafts";
 const VIRTUAL_CHANNEL_SESSIONS_KEY: &str = "virtual_channel_sessions";
 use crate::error::APIError;
+#[cfg(feature = "block-sync")]
+use crate::ldk_chain_backend::block_sync::{BitcoindClient, BlockSyncGossipVerifier};
+#[cfg(feature = "transaction-sync")]
+use crate::ldk_chain_backend::sync_chain_data;
+#[cfg(feature = "transaction-sync")]
+use crate::ldk_chain_backend::transaction_sync::{
+    IndexerClient, IndexerGossipVerifier, IndexerSyncClient,
+};
+use crate::ldk_chain_backend::{ChainBackend, ChainSetup, DynBroadcaster, DynFeeEstimator};
 use crate::rgb::{
     check_rgb_proxy_endpoint, get_rgb_channel_info_optional, RgbBumpWalletSource,
     RgbLibWalletWrapper,
+};
+use crate::rgb_file_transfer::{
+    PeerChannelGate, RgbFileTransferHandler, REASSEMBLY_SWEEP_INTERVAL,
 };
 use crate::signer::vls_adapter::{ExternalSignerBackend, VlsSignerAdapter};
 use crate::signer::{
@@ -156,15 +185,35 @@ use crate::signer::{
     ActiveSignerRef, DynRlnChannelSigner, DynRlnSigner, LightningEntropySource, RlnKeysInterface,
     SystemEntropySource,
 };
-use crate::swap::SwapData;
+use crate::swap::{SwapData, SwapInfo};
 use crate::utils::{
-    check_port_is_available, connect_peer_if_necessary, do_connect_peer, get_current_timestamp,
-    hex_str, validate_and_parse_payment_hash, validate_and_parse_payment_preimage, AppState,
-    StaticState, UnlockedAppState, ELECTRUM_URL_MAINNET, ELECTRUM_URL_REGTEST, ELECTRUM_URL_SIGNET,
-    ELECTRUM_URL_TESTNET, ELECTRUM_URL_TESTNET4, PROXY_ENDPOINT_LOCAL, PROXY_ENDPOINT_PUBLIC,
+    check_port_is_available, connect_peer_if_necessary, description_from_invoice,
+    description_hash_from_invoice, do_connect_peer, get_current_timestamp,
+    get_max_local_rgb_amount, hex_str, validate_and_parse_payment_hash,
+    validate_and_parse_payment_preimage, AppState, CommonState, LightningState, StaticState,
+    UnlockedAppState, FATAL_ERROR, PROXY_ENDPOINT_LOCAL, PROXY_ENDPOINT_PUBLIC,
 };
 
+const RGB_TRANSFER_CHAN_EXPIRATION_SECS: u64 = 86400;
+// don't reuse a cached sweep receive this close to its expiration
+const RGB_RECEIVE_REUSE_MARGIN_SECS: u64 = 3600;
+// smaller margin when addresses are reused, where reissuing is harmful: still enough for the
+// receive to outlast the sweep that uses it
+const RGB_RECEIVE_REUSE_MARGIN_ADDR_REUSE_SECS: u64 = 300;
 const VIRTUAL_CHANNEL_DOMAIN_SEPARATOR: &[u8] = b"rln_virtual_channels_v0";
+
+// A reissued receive under address reuse gets the same recipient id as the cached one (rgb-lib
+// rotates only the invoice nonce), so the sweep's provide_out_of_band_consignment later fails with
+// an ambiguous-recipient error. Hold the cached entry longer in that case, keeping enough margin
+// for it to outlast the sweep it is used by.
+fn sweep_receive_is_reusable(now: u64, expiration: u64, reuse_addresses: bool) -> bool {
+    let margin = if reuse_addresses {
+        RGB_RECEIVE_REUSE_MARGIN_ADDR_REUSE_SECS
+    } else {
+        RGB_RECEIVE_REUSE_MARGIN_SECS
+    };
+    now + margin < expiration
+}
 
 pub(crate) fn virtual_channel_synthetic_outpoint(
     network: BitcoinNetwork,
@@ -244,8 +293,53 @@ fn sync_config_to_kvstore(
     Ok(())
 }
 
+// Test-only: while set, the node with this pubkey defers claiming incoming payments; handling of
+// the PaymentClaimable event is suspended until the gate is cleared
+#[cfg(test)]
+pub(crate) static DEFER_PAYMENT_CLAIMABLE_ON_NODE: Mutex<Option<PublicKey>> = Mutex::new(None);
+
+// Test-only: whether a payment has been deferred via DEFER_PAYMENT_CLAIMABLE_ON_NODE since the
+// gate was set. This is a flag rather than a count because a node handles its events sequentially:
+// while a PaymentClaimable is being deferred no further event is handled, so at most one payment
+// can be deferred at a time
+#[cfg(test)]
+pub(crate) static PAYMENT_CLAIMABLE_DEFERRED: AtomicBool = AtomicBool::new(false);
+
+// Test-only: a payment is never deferred for longer than this, so that a test failing to release
+// the gate fails on its own assertions instead of hanging the node's event handling
+#[cfg(test)]
+const MAX_PAYMENT_DEFERRAL: Duration = Duration::from_secs(60);
+
 #[cfg(test)]
 pub(crate) static IGNORE_INBOUND_CHANNELS_ON_NODE: Mutex<Option<PublicKey>> = Mutex::new(None);
+
+// Test-only: the node with this pubkey holds incoming payments instead of claiming them, keeping
+// their HTLCs pending
+#[cfg(test)]
+pub(crate) static HOLD_PAYMENT_CLAIMABLE_ON_NODE: Mutex<Option<PublicKey>> = Mutex::new(None);
+
+// Test-only: number of payments held via HOLD_PAYMENT_CLAIMABLE_ON_NODE
+#[cfg(test)]
+pub(crate) static HELD_PAYMENT_CLAIMABLE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+// Test-only: the node with this pubkey emits a `push_asset_amount` greater than the channel asset
+// amount on the wire in `open_channel`, regardless of the value validated by its REST layer. Used
+// to model a channel counterparty whose wire client is not bound by the sender-side clamp.
+#[cfg(test)]
+pub(crate) static FORCE_PUSH_ASSET_AMOUNT_ON_NODE: Mutex<Option<PublicKey>> = Mutex::new(None);
+
+// Test-only: whether the given override targets the node we are running as
+#[cfg(test)]
+pub(crate) fn node_override_matches(
+    target: &Mutex<Option<PublicKey>>,
+    our_node_id: PublicKey,
+) -> bool {
+    target
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|id| *id == our_node_id)
+}
 
 pub(crate) struct LdkBackgroundServices {
     stop_processing: Arc<AtomicBool>,
@@ -267,6 +361,7 @@ pub(crate) struct PaymentInfo {
     pub(crate) expires_at: Option<u64>,
     pub(crate) claim_deadline_height: Option<u32>,
     pub(crate) invoice_type: Option<InvoiceType>,
+    pub(crate) description: Option<String>,
     pub(crate) description_hash: Option<[u8; 32]>,
     pub(crate) payment_idx: Option<u64>,
     pub(crate) async_hash_index: Option<u64>,
@@ -288,6 +383,8 @@ impl_writeable_tlv_based!(PaymentInfo, {
     (22, payment_idx, option),
     (24, async_hash_index, option),
     (26, async_host_node_id, option),
+    // odd type so older binaries skip the field instead of failing the whole read
+    (29, description, option),
 });
 
 pub(crate) struct InboundPaymentInfoStorage {
@@ -419,7 +516,7 @@ fn persist_staged_inbound_payment(
     Ok(())
 }
 
-impl UnlockedAppState {
+impl LightningState {
     pub(crate) fn add_maker_swap(&self, payment_hash: PaymentHash, swap: SwapData) {
         let mut maker_swaps = self.get_maker_swaps();
         maker_swaps.swaps.insert(payment_hash, swap);
@@ -450,12 +547,26 @@ impl UnlockedAppState {
         self.save_taker_swaps(taker_swaps);
     }
 
+    pub(crate) fn update_taker_swap_pending_intercept(
+        &self,
+        payment_hash: &PaymentHash,
+        intercept_id: channelmanager::InterceptId,
+    ) {
+        let mut taker_swaps = self.get_taker_swaps();
+        let taker_swap = taker_swaps.swaps.get_mut(payment_hash).unwrap();
+        taker_swap.status = SwapStatus::Pending;
+        taker_swap.initiated_at = Some(get_current_timestamp());
+        taker_swap.pending_intercept_id = Some(intercept_id);
+        self.save_taker_swaps(taker_swaps);
+    }
+
     pub(crate) fn update_taker_swap_status(&self, payment_hash: &PaymentHash, status: SwapStatus) {
         let mut taker_swaps = self.get_taker_swaps();
         let taker_swap = taker_swaps.swaps.get_mut(payment_hash).unwrap();
         match &status {
             SwapStatus::Succeeded | SwapStatus::Failed | SwapStatus::Expired => {
-                taker_swap.completed_at = Some(get_current_timestamp())
+                taker_swap.completed_at = Some(get_current_timestamp());
+                taker_swap.pending_intercept_id = None;
             }
             SwapStatus::Pending => taker_swap.initiated_at = Some(get_current_timestamp()),
             SwapStatus::Waiting => panic!("this doesn't make sense: swap starts in Waiting status"),
@@ -694,6 +805,7 @@ impl UnlockedAppState {
                     expires_at: None,
                     claim_deadline_height,
                     invoice_type,
+                    description: None,
                     description_hash: None,
                     payment_idx: None,
                     async_hash_index: None,
@@ -1010,8 +1122,8 @@ pub(crate) type MonitorPersister = AsyncPersister<
     Arc<FilesystemLogger>,
     ActiveSignerRef,
     ActiveSignerRef,
-    Arc<ChainBackend>,
-    Arc<ChainBackend>,
+    Arc<DynBroadcaster>,
+    Arc<DynFeeEstimator>,
 >;
 
 #[cfg(not(feature = "vss"))]
@@ -1021,25 +1133,19 @@ pub(crate) type MonitorPersister = Arc<
         Arc<FilesystemLogger>,
         ActiveSignerRef,
         ActiveSignerRef,
-        Arc<ChainBackend>,
-        Arc<ChainBackend>,
+        Arc<DynBroadcaster>,
+        Arc<DynFeeEstimator>,
     >,
 >;
 
 pub(crate) type ChainMonitor = chainmonitor::ChainMonitor<
     DynRlnChannelSigner,
     Arc<dyn Filter + Send + Sync>,
-    Arc<ChainBackend>,
-    Arc<ChainBackend>,
+    Arc<DynBroadcaster>,
+    Arc<DynFeeEstimator>,
     Arc<FilesystemLogger>,
     MonitorPersister,
     ActiveSignerRef,
->;
-
-pub(crate) type GossipVerifier = lightning_block_sync::gossip::GossipVerifier<
-    TokioSpawner,
-    Arc<lightning_block_sync::rpc::RpcClient>,
-    Arc<FilesystemLogger>,
 >;
 
 pub(crate) type RoutingMessageHandler =
@@ -1051,7 +1157,7 @@ pub(crate) type PeerManager = LdkPeerManager<
     Arc<RoutingMessageHandler>,
     Arc<OnionMessenger>,
     Arc<FilesystemLogger>,
-    Arc<AsyncOrderMessageHandler>,
+    Arc<CustomMessenger>,
     ActiveSignerRef,
     Arc<ChainMonitor>,
 >;
@@ -1069,11 +1175,11 @@ pub(crate) type Router = DefaultRouter<
 
 pub(crate) type ChannelManager = channelmanager::ChannelManager<
     Arc<ChainMonitor>,
-    Arc<ChainBackend>,
+    Arc<DynBroadcaster>,
     Arc<LightningEntropySource>,
     ActiveSignerRef,
     ActiveSignerRef,
-    Arc<ChainBackend>,
+    Arc<DynFeeEstimator>,
     Arc<Router>,
     Arc<
         DefaultMessageRouter<Arc<NetworkGraph>, Arc<FilesystemLogger>, Arc<LightningEntropySource>>,
@@ -1081,11 +1187,26 @@ pub(crate) type ChannelManager = channelmanager::ChannelManager<
     Arc<FilesystemLogger>,
 >;
 
+impl PeerChannelGate for ChannelManager {
+    fn channel_count_with(&self, peer: &PublicKey) -> usize {
+        // unlike list_channels, this doesn't filter out unfunded channels
+        self.list_channels_with_counterparty(peer).len()
+    }
+
+    fn has_channel_funded_by(&self, funding_txid: &str) -> bool {
+        self.list_channels().iter().any(|chan| {
+            chan.funding_txo
+                .is_some_and(|txo| txo.txid.to_string() == funding_txid)
+        })
+    }
+}
+
 pub(crate) type NetworkGraph = gossip::NetworkGraph<Arc<FilesystemLogger>>;
 
+// the UTXO lookup is a trait object so a single gossip type serves both sync backends
 pub(crate) type P2PGossipSync = lightning::routing::gossip::P2PGossipSync<
     Arc<NetworkGraph>,
-    Arc<GossipVerifier>,
+    Arc<dyn UtxoLookup + Send + Sync>,
     Arc<FilesystemLogger>,
 >;
 
@@ -1096,7 +1217,7 @@ pub(crate) type GossipSync = lightning_background_processor::GossipSync<
     Arc<P2PGossipSync>,
     Arc<RapidGossipSync>,
     Arc<NetworkGraph>,
-    Arc<GossipVerifier>,
+    Arc<dyn UtxoLookup + Send + Sync>,
     Arc<FilesystemLogger>,
 >;
 
@@ -1115,13 +1236,15 @@ pub(crate) type OnionMessenger = LdkOnionMessenger<
 >;
 
 pub(crate) type BumpTxEventHandler = BumpTransactionEventHandler<
-    Arc<ChainBackend>,
+    Arc<DynBroadcaster>,
     Arc<Wallet<Arc<RgbBumpWalletSource>, Arc<FilesystemLogger>>>,
     ActiveSignerRef,
     Arc<FilesystemLogger>,
 >;
 
 pub(crate) type OutputSpenderTxes = LdkHashMap<u64, bitcoin::Transaction>;
+// (descriptors hash, contract) -> (recipient id, expiration)
+type SweepRecipients = HashMap<(u64, ContractId), (String, u64)>;
 
 pub(crate) struct RgbOutputSpender {
     static_state: Arc<StaticState>,
@@ -1129,15 +1252,24 @@ pub(crate) struct RgbOutputSpender {
     signer: Arc<dyn RlnKeysInterface<EcdsaSigner = DynRlnChannelSigner>>,
     kv_store: Arc<SyncedKvStore>,
     txes: Arc<Mutex<OutputSpenderTxes>>,
-    proxy_endpoint: String,
+    // receives issued for an in-flight sweep, reused across retries so a repeatedly failing sweep
+    // does not leave a new receive slot behind on every attempt
+    sweep_recipients: Arc<Mutex<SweepRecipients>>,
 }
 
+// The sweeper store type is shared with the background processor's persister
+// (same generic in `process_events_async`).
+#[cfg(feature = "vss")]
+pub(crate) type BpKvStore = Arc<crate::async_kv_store::BpKvStoreRouter>;
+#[cfg(not(feature = "vss"))]
+pub(crate) type BpKvStore = KVStoreSyncWrapper<Arc<SyncedKvStore>>;
+
 pub(crate) type OutputSweeper = ldk_sweep::OutputSweeper<
-    Arc<ChainBackend>,
+    Arc<DynBroadcaster>,
     Arc<RgbLibWalletWrapper>,
-    Arc<ChainBackend>,
+    Arc<DynFeeEstimator>,
     Arc<dyn Filter + Send + Sync>,
-    KVStoreSyncWrapper<Arc<SyncedKvStore>>,
+    BpKvStore,
     Arc<FilesystemLogger>,
     Arc<RgbOutputSpender>,
 >;
@@ -1180,13 +1312,191 @@ impl LiveChannelAccess {
     }
 }
 
-impl AsyncOrderAccessControl for LiveChannelAccess {
+impl CustomMsgPeerAccessControl for LiveChannelAccess {
     fn allows_peer(&self, peer: &PublicKey) -> bool {
         self.lookup.peer_has_live_channel(peer)
     }
 }
 
+struct NodeAssetLinkAuthorizer {
+    unlocked_state_weak: Weak<LightningState>,
+    channel_manager: Arc<ChannelManager>,
+    kv_store: Arc<SyncedKvStore>,
+    taker_swaps: Arc<Mutex<SwapMap>>,
+}
+
+fn reserved_outbound_rgb_amount(
+    taker_swaps: &SwapMap,
+    outbound_contract_id: ContractId,
+    current_time: u64,
+) -> u64 {
+    taker_swaps
+        .swaps
+        .values()
+        .filter(|swap| {
+            if swap.swap_info.from_asset != Some(outbound_contract_id) {
+                return false;
+            }
+
+            match swap.status {
+                SwapStatus::Waiting => current_time <= swap.swap_info.expiry,
+                SwapStatus::Pending => swap.initiated_at.is_none_or(|initiated_at| {
+                    current_time <= initiated_at.saturating_add(PENDING_SWAP_TIMEOUT_SECS)
+                }),
+                SwapStatus::Succeeded | SwapStatus::Expired | SwapStatus::Failed => false,
+            }
+        })
+        .fold(0, |reserved_amount, swap| {
+            reserved_amount.saturating_add(swap.swap_info.qty_from)
+        })
+}
+
+impl AssetLinkAuthorizer for NodeAssetLinkAuthorizer {
+    fn authorize_swap(
+        &self,
+        sender_node_id: PublicKey,
+        params: &AssetLinkAuthorizeParamsWire,
+    ) -> Result<(), JsonRpcErrorWire> {
+        let payment_hash = validate_and_parse_payment_hash(&params.payment_hash)
+            .map_err(|_| JsonRpcErrorWire::invalid_params("invalid_payment_hash"))?;
+        let asset_contract_id = ContractId::from_str(&params.asset_id)
+            .map_err(|_| JsonRpcErrorWire::invalid_params("invalid_asset_id"))?;
+        let linked_contract_id = ContractId::from_str(&params.linked_asset_id)
+            .map_err(|_| JsonRpcErrorWire::invalid_params("invalid_linked_asset_id"))?;
+        if params.amount == 0 {
+            return Err(JsonRpcErrorWire::invalid_params("invalid_amount"));
+        }
+        if params.expiry_sec == 0 {
+            return Err(JsonRpcErrorWire::invalid_params("invalid_expiry_sec"));
+        }
+
+        let unlocked_state = self.unlocked_state_weak.upgrade().ok_or_else(|| {
+            JsonRpcErrorWire::internal_error("asset_link_state_unavailable".to_owned())
+        })?;
+        let asset_metadata = unlocked_state
+            .rgb_get_asset_metadata(asset_contract_id)
+            .map_err(|_| {
+                JsonRpcErrorWire::application_error(ASSET_LINK_ERROR_UNKNOWN_ASSET, "unknown_link")
+            })?;
+        let linked_asset_metadata = unlocked_state
+            .rgb_get_asset_metadata(linked_contract_id)
+            .map_err(|_| {
+                JsonRpcErrorWire::application_error(ASSET_LINK_ERROR_UNKNOWN_ASSET, "unknown_link")
+            })?;
+
+        let asset_is_parent_of_linked_asset = asset_metadata.linked_to_asset_id.as_deref()
+            == Some(params.linked_asset_id.as_str())
+            && linked_asset_metadata.linked_from_asset_id.as_deref()
+                == Some(params.asset_id.as_str());
+
+        let linked_asset_is_parent_of_asset = linked_asset_metadata.linked_to_asset_id.as_deref()
+            == Some(params.asset_id.as_str())
+            && asset_metadata.linked_from_asset_id.as_deref()
+                == Some(params.linked_asset_id.as_str());
+
+        let parent_contract_id = if asset_is_parent_of_linked_asset {
+            Some(asset_contract_id)
+        } else if linked_asset_is_parent_of_asset {
+            Some(linked_contract_id)
+        } else {
+            None
+        };
+
+        let Some(parent_contract_id) = parent_contract_id else {
+            return Err(JsonRpcErrorWire::application_error(
+                ASSET_LINK_ERROR_UNKNOWN_LINK,
+                "unknown_link",
+            ));
+        };
+
+        if asset_metadata.asset_schema != AssetSchema::Ifa
+            || linked_asset_metadata.asset_schema != AssetSchema::Ifa
+        {
+            return Err(JsonRpcErrorWire::application_error(
+                ASSET_LINK_ERROR_UNKNOWN_LINK,
+                "unknown_link",
+            ));
+        }
+
+        let link_is_settled = unlocked_state
+            .rgb_find_link_transfer(parent_contract_id)
+            .map_err(|_| {
+                JsonRpcErrorWire::application_error(ASSET_LINK_ERROR_UNKNOWN_LINK, "unknown_link")
+            })?
+            .is_some_and(|transfer| transfer.status == TransferStatus::Settled);
+        if !link_is_settled {
+            return Err(JsonRpcErrorWire::application_error(
+                ASSET_LINK_ERROR_UNKNOWN_LINK,
+                "unknown_link",
+            ));
+        }
+
+        let max_balance = get_max_local_rgb_amount(
+            asset_contract_id,
+            self.channel_manager.list_channels().iter(),
+            self.kv_store.as_ref(),
+        );
+        let mut taker_swaps = self.taker_swaps.lock().unwrap();
+        if taker_swaps.swaps.contains_key(&payment_hash) {
+            return Err(JsonRpcErrorWire::application_error(
+                ASSET_LINK_ERROR_DUPLICATE_PAYMENT_HASH,
+                "duplicate_payment_hash",
+            ));
+        }
+
+        let authorization_time = get_current_timestamp();
+        let reserved_amount =
+            reserved_outbound_rgb_amount(&taker_swaps, asset_contract_id, authorization_time);
+        let available_amount = max_balance.saturating_sub(reserved_amount);
+        if params.amount > available_amount {
+            return Err(JsonRpcErrorWire::application_error(
+                ASSET_LINK_ERROR_INSUFFICIENT_LIQUIDITY,
+                "insufficient_liquidity",
+            ));
+        }
+
+        let expiry_sec = params
+            .expiry_sec
+            .min(ASSET_LINK_SWAP_AUTHORIZATION_MAX_EXPIRY_SECS);
+        let one_to_one_redemption_amount = params.amount;
+        let swap_info = SwapInfo {
+            qty_from: one_to_one_redemption_amount,
+            qty_to: one_to_one_redemption_amount,
+            from_asset: Some(asset_contract_id),
+            to_asset: Some(linked_contract_id),
+            expiry: authorization_time.saturating_add(expiry_sec),
+        };
+        assert_eq!(
+            swap_info.qty_from, swap_info.qty_to,
+            "linked-asset redemption must remain 1:1"
+        );
+        let mut swap_data = SwapData::create_from_swap_info(&swap_info);
+        swap_data.authorized_peer = Some(sender_node_id);
+        taker_swaps.swaps.insert(payment_hash, swap_data);
+        if let Err(e) = self
+            .kv_store
+            .write("", "", TAKER_SWAPS_KEY, taker_swaps.encode())
+        {
+            taker_swaps.swaps.remove(&payment_hash);
+            return Err(JsonRpcErrorWire::internal_error(format!(
+                "taker_swaps_write_failed: {e}"
+            )));
+        }
+
+        tracing::info!(
+            peer = %sender_node_id,
+            payment_hash = %hex_str(&payment_hash.0),
+            asset_id = %params.asset_id,
+            linked_asset_id = %params.linked_asset_id,
+            amount = params.amount,
+            "authorized linked-asset payment"
+        );
+        Ok(())
+    }
+}
+
 struct AsyncOrderRecipientInvoiceProvider {
+    config: Arc<crate::config::Config>,
     channel_manager: Arc<ChannelManager>,
     inbound_payments: Arc<Mutex<InboundPaymentInfoStorage>>,
     async_payments_preimage_root: Arc<AsyncPaymentsPreimageRoot>,
@@ -1219,9 +1529,9 @@ impl AsyncOrderInvoiceProvider for AsyncOrderRecipientInvoiceProvider {
         let htlc_min_msat = if self.channel_manager.list_channels().iter().any(|channel| {
             channel.counterparty.node_id == sender_node_id && channel.trusted_no_broadcast
         }) {
-            VIRTUAL_HTLC_MIN_MSAT
+            self.config.channels.virtual_htlc_min_msat
         } else {
-            HTLC_MIN_MSAT
+            self.config.channels.htlc_min_msat
         };
         if amount_msat < htlc_min_msat {
             return Err(JsonRpcErrorWire::invalid_params(format!(
@@ -1351,7 +1661,8 @@ impl AsyncOrderInvoiceProvider for AsyncOrderRecipientInvoiceProvider {
                 invoice_type: Some(InvoiceType::Hodl {
                     async_payment_recipient: true,
                 }),
-                description_hash: crate::routes::description_hash_from_invoice(&invoice),
+                description: description_from_invoice(&invoice),
+                description_hash: description_hash_from_invoice(&invoice),
                 payment_idx: None,
                 async_hash_index: self.external_signer_mode.then_some(hash_index),
                 async_host_node_id: self.external_signer_mode.then_some(sender_node_id),
@@ -1539,27 +1850,41 @@ fn handle_funding_prepare_err(
             tracing::error!("Network error during channel opening: {details}");
             Err(ReplayEvent())
         }
-        e => {
-            tracing::error!("Cannot open channel: {e}");
-            if let Err(close_err) = channel_manager.force_close_broadcasting_latest_txn(
-                temporary_channel_id,
-                counterparty_node_id,
-                e.to_string(),
-            ) {
-                tracing::error!(
-                    "Failed to force-close channel {temporary_channel_id} after error: {close_err:?}"
-                );
-            }
-            Ok(())
-        }
+        e => abort_funding(
+            e.to_string(),
+            channel_manager,
+            temporary_channel_id,
+            counterparty_node_id,
+        ),
     }
+}
+
+// Give up on a channel funding for a reason retrying cannot fix, closing the channel rather than
+// leaving the peer waiting on a funding that will never come.
+fn abort_funding(
+    reason: String,
+    channel_manager: &ChannelManager,
+    temporary_channel_id: &ChannelId,
+    counterparty_node_id: &PublicKey,
+) -> Result<(), ReplayEvent> {
+    tracing::error!("Cannot open channel: {reason}");
+    if let Err(close_err) = channel_manager.force_close_broadcasting_latest_txn(
+        temporary_channel_id,
+        counterparty_node_id,
+        reason,
+    ) {
+        tracing::error!(
+            "Failed to abort funding by force-closing the channel {temporary_channel_id} after error: {close_err:?}"
+        );
+    }
+    Ok(())
 }
 
 /// Release the funds locked for a channel open that failed before the funding
 /// transaction was broadcast. For colored channels this fails the pending RGB
 /// batch transfer; for vanilla channels it aborts the pending vanilla tx that
 /// was created (and locked the UTXOs) during `FundingGenerationReady`.
-async fn handle_open_chan_fail(channel_id: &ChannelId, unlocked_state: Arc<UnlockedAppState>) {
+async fn handle_open_chan_fail(channel_id: &ChannelId, unlocked_state: Arc<LightningState>) {
     let channel_id_hex = channel_id.0.as_hex().to_string();
     if let Some(rgb_info) =
         get_rgb_channel_info_optional(channel_id, true, unlocked_state.kv_store.as_ref())
@@ -1604,9 +1929,85 @@ async fn handle_open_chan_fail(channel_id: &ChannelId, unlocked_state: Arc<Unloc
         .remove(PENDING_FUNDING_NAMESPACE, "", &channel_id_hex, false);
 }
 
+/// Undo what a standard channel's `FundingGenerationReady` preparation staged, so a failure
+/// between preparation and a fully-signed funding tx (e.g. a remote external signer briefly
+/// unreachable, or returning a malformed reply) can replay the event without leaking locked funds:
+/// for a colored channel fail the pending RGB batch transfer (releasing the reserved allocation),
+/// for a vanilla channel abort the pending vanilla tx (releasing the locked UTXOs). This runs
+/// *before* the `PENDING_FUNDING_NAMESPACE` mapping exists, so `handle_open_chan_fail` could not do
+/// the vanilla cleanup later — the staged tx would be unabortable. Best-effort: errors are logged
+/// and the caller still replays the event.
+async fn abort_staged_standard_funding(
+    unlocked_state: Arc<LightningState>,
+    temporary_channel_id: &ChannelId,
+    unsigned_psbt: &str,
+    is_colored: bool,
+) {
+    if is_colored {
+        if let Some(mut rgb_info) = get_rgb_channel_info_optional(
+            temporary_channel_id,
+            true,
+            unlocked_state.kv_store.as_ref(),
+        ) {
+            if let Some(batch_transfer_idx) = rgb_info.batch_transfer_idx {
+                let unlocked_state_copy = unlocked_state.clone();
+                let failed = tokio::task::spawn_blocking(move || {
+                    unlocked_state_copy.rgb_fail_transfers(Some(batch_transfer_idx), false, true)
+                })
+                .await
+                .unwrap();
+                match failed {
+                    Ok(_) => {
+                        // Clear the recorded idx: the transfer is already failed, and the replayed
+                        // event will stage a fresh transfer and record its own idx.
+                        rgb_info.batch_transfer_idx = None;
+                        unlocked_state.kv_store.write_rgb_channel_info(
+                            &temporary_channel_id.0.as_hex().to_string(),
+                            &rgb_info,
+                            true,
+                        );
+                    }
+                    Err(e) => tracing::error!(
+                        "Error failing staged RGB transfer batch_transfer_idx={batch_transfer_idx} \
+                         for channel {temporary_channel_id}: {e:?}"
+                    ),
+                }
+            }
+        }
+    } else {
+        // The txid of the pending vanilla tx: witness data is excluded from the txid, so the
+        // unsigned PSBT's tx computes the same txid rgb-lib recorded for the pending tx.
+        match Psbt::from_str(unsigned_psbt) {
+            Ok(psbt) => {
+                let txid = psbt.unsigned_tx.compute_txid().to_string();
+                let unlocked_state_copy = unlocked_state.clone();
+                let txid_copy = txid.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    unlocked_state_copy.rgb_abort_pending_vanilla_tx(txid_copy)
+                })
+                .await
+                .unwrap();
+                match result {
+                    Ok(()) => tracing::info!(
+                        "Aborted staged vanilla funding tx {txid} for channel {temporary_channel_id}"
+                    ),
+                    Err(e) => tracing::error!(
+                        "Error aborting staged vanilla funding tx {txid} for channel \
+                         {temporary_channel_id}: {e:?}"
+                    ),
+                }
+            }
+            Err(e) => tracing::error!(
+                "cannot parse staged funding PSBT while cleaning up channel \
+                 {temporary_channel_id}: {e}"
+            ),
+        }
+    }
+}
+
 async fn handle_ldk_events(
     event: Event,
-    unlocked_state: Arc<UnlockedAppState>,
+    unlocked_state: Arc<LightningState>,
     static_state: Arc<StaticState>,
 ) -> Result<(), ReplayEvent> {
     match event {
@@ -1678,16 +2079,23 @@ async fn handle_ldk_events(
                         &temporary_channel_id,
                         unlocked_state.kv_store.as_ref(),
                     );
-                    let channel_rgb_amount = rgb_info.local_rgb_amount;
+                    let channel_rgb_amount = rgb_info.local_rgb_amount + rgb_info.remote_rgb_amount;
                     let asset_id = rgb_info.contract_id.to_string();
                     let assignment = match rgb_info.schema {
-                        AssetSchema::Nia | AssetSchema::Cfa | AssetSchema::Ifa => {
-                            Assignment::Fungible(channel_rgb_amount)
-                        }
+                        AssetSchema::Nia
+                        | AssetSchema::Cfa
+                        | AssetSchema::Ifa
+                        | AssetSchema::Bfa => Assignment::Fungible(channel_rgb_amount),
                         AssetSchema::Uda => Assignment::NonFungible,
                     };
                     let recipient_id =
-                        recipient_id_from_script_buf(script_buf, static_state.network);
+                        match recipient_id_from_script_buf(script_buf, static_state.network) {
+                            Ok(recipient_id) => recipient_id,
+                            Err(e) => {
+                                reject_virtual_open(format!("invalid funding recipient: {e}"));
+                                return Ok(());
+                            }
+                        };
                     let recipient_map = map! {
                         asset_id.clone() => vec![Recipient {
                             recipient_id,
@@ -1698,33 +2106,59 @@ async fn handle_ldk_events(
                             assignment,
                             transport_endpoints: vec![unlocked_state.proxy_endpoint.clone()]
                     }]};
+                    let fee_rate_sat_vb = unlocked_state.config.rgb.fee_rate_sat_vb;
                     let unlocked_state_copy = unlocked_state.clone();
-                    let res = tokio::task::spawn_blocking(move || -> Result<String, String> {
-                        let res = unlocked_state_copy
-                            .rgb_send_begin(recipient_map, true, FEE_RATE, 0, None, false, Some(0))
-                            .map_err(|e| e.to_string())?;
-                        let fascia_str = fs::read_to_string(&res.details.fascia_path)
-                            .map_err(|e| e.to_string())?;
-                        let fascia: Fascia =
-                            serde_json::from_str(&fascia_str).map_err(|e| e.to_string())?;
-                        unlocked_state_copy
-                            .rgb_consume_fascia(fascia, None)
-                            .map_err(|e| e.to_string())?;
-                        unlocked_state_copy
-                            .rgb_create_consignments(res.psbt.clone())
-                            .map_err(|e| e.to_string())?;
-                        Ok(res.psbt)
-                    })
+                    let res = tokio::task::spawn_blocking(
+                        move || -> Result<(String, Option<i32>), String> {
+                            let res = unlocked_state_copy
+                                .rgb_send_begin(
+                                    recipient_map,
+                                    true,
+                                    fee_rate_sat_vb,
+                                    0,
+                                    get_current_timestamp() + RGB_TRANSFER_CHAN_EXPIRATION_SECS,
+                                    false,
+                                    Some(0),
+                                )
+                                .map_err(|e| e.to_string())?;
+                            let fascia_str = fs::read_to_string(&res.details.fascia_path)
+                                .map_err(|e| e.to_string())?;
+                            let fascia: Fascia =
+                                serde_json::from_str(&fascia_str).map_err(|e| e.to_string())?;
+                            unlocked_state_copy
+                                .rgb_consume_fascia(fascia, None)
+                                .map_err(|e| e.to_string())?;
+                            unlocked_state_copy
+                                .rgb_create_consignments(res.psbt.clone())
+                                .map_err(|e| e.to_string())?;
+                            Ok((res.psbt, res.batch_transfer_idx))
+                        },
+                    )
                     .await
                     .unwrap();
 
-                    let unsigned_psbt = match res {
-                        Ok(psbt) => psbt,
+                    let (unsigned_psbt, batch_transfer_idx) = match res {
+                        Ok(result) => result,
                         Err(e) => {
                             tracing::error!("cannot prepare virtual funding transfer: {e}");
                             return Err(ReplayEvent());
                         }
                     };
+
+                    // Record the batch transfer index so a failed open can fail the pending
+                    // transfer and release the locked assets (see handle_open_chan_fail).
+                    if let Some(mut rgb_info) = get_rgb_channel_info_optional(
+                        &temporary_channel_id,
+                        true,
+                        unlocked_state.kv_store.as_ref(),
+                    ) {
+                        rgb_info.batch_transfer_idx = batch_transfer_idx;
+                        unlocked_state.kv_store.write_rgb_channel_info(
+                            &temporary_channel_id.0.as_hex().to_string(),
+                            &rgb_info,
+                            true,
+                        );
+                    }
 
                     let signed_psbt = match unlocked_state.rgb_sign_psbt(unsigned_psbt) {
                         Ok(psbt) => psbt,
@@ -1800,27 +2234,94 @@ async fn handle_ldk_events(
 
                     let consignment_path =
                         unlocked_state.rgb_get_send_consignment_path(&asset_id, &witness_id);
-                    let proxy_url = TransportEndpoint::new(unlocked_state.proxy_endpoint.clone())
-                        .unwrap()
-                        .endpoint;
-                    let consignment_path_copy = consignment_path.clone();
-                    let unlocked_state_copy = unlocked_state.clone();
-                    let res = tokio::task::spawn_blocking(move || {
-                        unlocked_state_copy.rgb_post_consignment(
-                            &proxy_url,
+                    let consignment_bytes = match fs::read(&consignment_path) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            return abort_funding(
+                                format!("cannot read funding consignment: {e}"),
+                                &unlocked_state.channel_manager,
+                                &temporary_channel_id,
+                                &counterparty_node_id,
+                            );
+                        }
+                    };
+                    if unlocked_state
+                        .rgb_file_transfer_handler
+                        .queue_consignment(
+                            counterparty_node_id,
                             witness_id.clone(),
-                            &consignment_path_copy,
-                            witness_id,
-                            None,
+                            consignment_bytes,
                         )
-                    })
-                    .await
-                    .unwrap();
-
-                    if let Err(e) = res {
-                        tracing::error!("cannot post virtual funding consignment: {e}");
-                        return Err(ReplayEvent());
+                        .is_err()
+                    {
+                        let _ = fs::remove_file(&consignment_path);
+                        return abort_funding(
+                            s!("consignment is too large to send over p2p"),
+                            &unlocked_state.channel_manager,
+                            &temporary_channel_id,
+                            &counterparty_node_id,
+                        );
                     }
+
+                    // send the asset's media files over the same p2p link
+                    if rgb_info.counterparty_knows_asset {
+                        tracing::info!(
+                            "counterparty already knows asset {asset_id}, not sending its media"
+                        );
+                    } else {
+                        let unlocked_state_copy = unlocked_state.clone();
+                        let medias = match tokio::task::spawn_blocking(move || {
+                            unlocked_state_copy.rgb_list_asset_media(asset_id)
+                        })
+                        .await
+                        .unwrap()
+                        {
+                            Ok(medias) => medias,
+                            Err(e) => {
+                                let _ = fs::remove_file(&consignment_path);
+                                return handle_funding_prepare_err(
+                                    e,
+                                    &unlocked_state.channel_manager,
+                                    &temporary_channel_id,
+                                    &counterparty_node_id,
+                                );
+                            }
+                        };
+                        for media in medias {
+                            let media_bytes = match fs::read(&media.file_path) {
+                                Ok(bytes) => bytes,
+                                Err(e) => {
+                                    let _ = fs::remove_file(&consignment_path);
+                                    return abort_funding(
+                                        format!("cannot read asset media file: {e}"),
+                                        &unlocked_state.channel_manager,
+                                        &temporary_channel_id,
+                                        &counterparty_node_id,
+                                    );
+                                }
+                            };
+                            if unlocked_state
+                                .rgb_file_transfer_handler
+                                .queue_media(
+                                    counterparty_node_id,
+                                    witness_id.clone(),
+                                    media.digest,
+                                    media_bytes,
+                                )
+                                .is_err()
+                            {
+                                let _ = fs::remove_file(&consignment_path);
+                                return abort_funding(
+                                    s!("asset media is too large to send over p2p"),
+                                    &unlocked_state.channel_manager,
+                                    &temporary_channel_id,
+                                    &counterparty_node_id,
+                                );
+                            }
+                        }
+                    }
+
+                    unlocked_state.peer_manager.process_events();
                     let _ = fs::remove_file(&consignment_path);
                 }
 
@@ -1885,14 +2386,24 @@ async fn handle_ldk_events(
                 let channel_rgb_amount = rgb_info.local_rgb_amount + rgb_info.remote_rgb_amount;
                 let asset_id = rgb_info.contract_id.to_string();
                 let assignment = match rgb_info.schema {
-                    AssetSchema::Nia | AssetSchema::Cfa | AssetSchema::Ifa => {
+                    AssetSchema::Nia | AssetSchema::Cfa | AssetSchema::Ifa | AssetSchema::Bfa => {
                         Assignment::Fungible(channel_rgb_amount)
                     }
                     AssetSchema::Uda => Assignment::NonFungible,
                 };
 
                 let recipient_id =
-                    recipient_id_from_script_buf(script_buf.clone(), static_state.network);
+                    match recipient_id_from_script_buf(script_buf.clone(), static_state.network) {
+                        Ok(recipient_id) => recipient_id,
+                        Err(e) => {
+                            return handle_funding_prepare_err(
+                                e,
+                                &unlocked_state.channel_manager,
+                                &temporary_channel_id,
+                                &counterparty_node_id,
+                            );
+                        }
+                    };
 
                 let recipient_map = map! {
                     asset_id.clone() => vec![Recipient {
@@ -1902,18 +2413,20 @@ async fn handle_ldk_events(
                             blinding: Some(STATIC_BLINDING),
                         }),
                         assignment,
-                        transport_endpoints: vec![unlocked_state.proxy_endpoint.clone()]
+                        transport_endpoints: vec![]
                 }]};
 
+                let fee_rate_sat_vb = unlocked_state.config.rgb.fee_rate_sat_vb;
+                let min_channel_confirmations = unlocked_state.config.rgb.min_channel_confirmations;
                 let unlocked_state_copy = unlocked_state.clone();
                 let res = tokio::task::spawn_blocking(
                     move || -> Result<(String, Option<i32>), RgbLibError> {
                         let res = unlocked_state_copy.rgb_send_begin(
                             recipient_map,
                             true,
-                            FEE_RATE,
-                            MIN_CHANNEL_CONFIRMATIONS,
-                            None,
+                            fee_rate_sat_vb,
+                            min_channel_confirmations,
+                            get_current_timestamp() + RGB_TRANSFER_CHAN_EXPIRATION_SECS,
                             false,
                             // Final locktime: this colored tx funds an LN channel.
                             Some(0),
@@ -1967,7 +2480,7 @@ async fn handle_ldk_events(
                 let raw_psbt = match unlocked_state.rgb_send_btc_begin(
                     addr.to_address(),
                     channel_value_satoshis,
-                    FEE_RATE,
+                    unlocked_state.config.rgb.fee_rate_sat_vb,
                 ) {
                     Ok(psbt) => psbt,
                     Err(e) => {
@@ -1994,10 +2507,38 @@ async fn handle_ldk_events(
                 (unsigned_psbt, None)
             };
 
-            let signed_psbt = unlocked_state.rgb_sign_psbt(unsigned_psbt).unwrap();
-            let psbt = Psbt::from_str(&signed_psbt).unwrap();
-
-            let funding_tx = psbt.clone().extract_tx().unwrap();
+            // With a remote external signer this call crosses the network: a transient transport
+            // failure or a malformed reply must not panic the event task. Take the same
+            // cooperative path as virtual funding — undo what the preparation staged (the pending
+            // vanilla tx / the RGB batch transfer, which would otherwise be unabortable since the
+            // PENDING_FUNDING mapping is only written after signing), then replay the event to
+            // retry the preparation from scratch.
+            let signing_outcome = unlocked_state
+                .rgb_sign_psbt(unsigned_psbt.clone())
+                .map_err(|e| format!("signing failed: {e}"))
+                .and_then(|signed| {
+                    Psbt::from_str(&signed).map_err(|e| format!("signed PSBT does not parse: {e}"))
+                })
+                .and_then(|psbt| {
+                    psbt.clone()
+                        .extract_tx()
+                        .map(|tx| (psbt, tx))
+                        .map_err(|e| format!("signed PSBT does not extract: {e}"))
+                });
+            let (psbt, funding_tx) = match signing_outcome {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::error!("cannot sign channel funding transaction: {e}");
+                    abort_staged_standard_funding(
+                        unlocked_state.clone(),
+                        &temporary_channel_id,
+                        &unsigned_psbt,
+                        asset_id.is_some(),
+                    )
+                    .await;
+                    return Err(ReplayEvent());
+                }
+            };
             let funding_txid = funding_tx.compute_txid();
             let funding_txid_str = funding_txid.to_string();
             tracing::info!("Funding TXID: {funding_txid_str}");
@@ -2051,34 +2592,110 @@ async fn handle_ldk_events(
                 .await
                 .unwrap();
 
+                // send the consignment to the channel counterparty over the encrypted p2p link
                 let consignment_path =
                     unlocked_state.rgb_get_send_consignment_path(&asset_id, &funding_txid_str);
-                let proxy_url = TransportEndpoint::new(unlocked_state.proxy_endpoint.clone())
-                    .unwrap()
-                    .endpoint;
-                let consignment_path_copy = consignment_path.clone();
-                let unlocked_state_copy = unlocked_state.clone();
-                let res = tokio::task::spawn_blocking(move || {
-                    unlocked_state_copy.rgb_post_consignment(
-                        &proxy_url,
+                let consignment_bytes = match fs::read(&consignment_path) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        return abort_funding(
+                            format!("cannot read funding consignment: {e}"),
+                            &unlocked_state.channel_manager,
+                            &temporary_channel_id,
+                            &counterparty_node_id,
+                        );
+                    }
+                };
+                if let Err(e) = unlocked_state.kv_store.write(
+                    FUNDING_CONSIGNMENT_NAMESPACE,
+                    "",
+                    &funding_txid_str,
+                    consignment_bytes.clone(),
+                ) {
+                    tracing::error!("cannot store funding consignment: {e}");
+                }
+                if unlocked_state
+                    .rgb_file_transfer_handler
+                    .queue_consignment(
+                        counterparty_node_id,
                         funding_txid_str.clone(),
-                        &consignment_path_copy,
-                        funding_txid_str,
-                        None,
+                        consignment_bytes,
                     )
-                })
-                .await
-                .unwrap();
-
-                if let Err(e) = res {
-                    tracing::error!("cannot post consignment: {e}");
-                    return Err(ReplayEvent());
+                    .is_err()
+                {
+                    return abort_funding(
+                        s!("consignment is too large to send over p2p"),
+                        &unlocked_state.channel_manager,
+                        &temporary_channel_id,
+                        &counterparty_node_id,
+                    );
                 }
                 tracing::debug!(
                     asset_id,
                     consignment_path = %consignment_path.display(),
                     "Preserving consignment_out for rgb_send_end"
                 );
+
+                // send the asset's media files over the same p2p link
+                let rgb_info = get_rgb_channel_info_pending(
+                    &temporary_channel_id,
+                    unlocked_state.kv_store.as_ref(),
+                );
+                if rgb_info.counterparty_knows_asset {
+                    tracing::info!(
+                        "counterparty already knows asset {asset_id}, not sending its media"
+                    );
+                } else {
+                    let unlocked_state_copy = unlocked_state.clone();
+                    let medias = match tokio::task::spawn_blocking(move || {
+                        unlocked_state_copy.rgb_list_asset_media(asset_id)
+                    })
+                    .await
+                    .unwrap()
+                    {
+                        Ok(medias) => medias,
+                        Err(e) => {
+                            return handle_funding_prepare_err(
+                                e,
+                                &unlocked_state.channel_manager,
+                                &temporary_channel_id,
+                                &counterparty_node_id,
+                            );
+                        }
+                    };
+                    for media in medias {
+                        let media_bytes = match fs::read(&media.file_path) {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                return abort_funding(
+                                    format!("cannot read asset media file: {e}"),
+                                    &unlocked_state.channel_manager,
+                                    &temporary_channel_id,
+                                    &counterparty_node_id,
+                                );
+                            }
+                        };
+                        if unlocked_state
+                            .rgb_file_transfer_handler
+                            .queue_media(
+                                counterparty_node_id,
+                                funding_txid_str.clone(),
+                                media.digest,
+                                media_bytes,
+                            )
+                            .is_err()
+                        {
+                            return abort_funding(
+                                s!("asset media is too large to send over p2p"),
+                                &unlocked_state.channel_manager,
+                                &temporary_channel_id,
+                                &counterparty_node_id,
+                            );
+                        }
+                    }
+                }
+
+                unlocked_state.peer_manager.process_events();
             }
 
             let channel_manager_copy = unlocked_state.channel_manager.clone();
@@ -2116,6 +2733,33 @@ async fn handle_ldk_events(
                 payment_hash,
                 amount_msat,
             );
+            #[cfg(test)]
+            if node_override_matches(
+                &HOLD_PAYMENT_CLAIMABLE_ON_NODE,
+                unlocked_state.channel_manager.get_our_node_id(),
+            ) {
+                tracing::info!("TEST: holding PaymentClaimable for {}", payment_hash);
+                HELD_PAYMENT_CLAIMABLE_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Ok(());
+            }
+            #[cfg(test)]
+            {
+                let our_node_id = unlocked_state.channel_manager.get_our_node_id();
+                if node_override_matches(&DEFER_PAYMENT_CLAIMABLE_ON_NODE, our_node_id) {
+                    tracing::info!("TEST: deferring PaymentClaimable for {}", payment_hash);
+                    PAYMENT_CLAIMABLE_DEFERRED.store(true, Ordering::SeqCst);
+                    let deferred_at = Instant::now();
+                    while node_override_matches(&DEFER_PAYMENT_CLAIMABLE_ON_NODE, our_node_id) {
+                        if deferred_at.elapsed() > MAX_PAYMENT_DEFERRAL {
+                            panic!(
+                                "TEST: PaymentClaimable for {payment_hash} deferred for too long"
+                            )
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    tracing::info!("TEST: resuming PaymentClaimable for {}", payment_hash);
+                }
+            }
 
             // `color_commitment` writes the authoritative per-HTLC record under
             // `chan_id || payment_hash` but never under the bare `<payment_hash>` key — that would
@@ -2439,12 +3083,10 @@ async fn handle_ldk_events(
             ..
         } => {
             #[cfg(test)]
-            if IGNORE_INBOUND_CHANNELS_ON_NODE
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|id| *id == unlocked_state.channel_manager.get_our_node_id())
-            {
+            if node_override_matches(
+                &IGNORE_INBOUND_CHANNELS_ON_NODE,
+                unlocked_state.channel_manager.get_our_node_id(),
+            ) {
                 tracing::info!(
                     "TEST: ignoring inbound channel {} from {}",
                     temporary_channel_id,
@@ -2744,6 +3386,10 @@ async fn handle_ldk_events(
                     "EVENT: virtual channel {} is pending in trusted no-broadcast mode",
                     channel_id,
                 );
+                // reclaim the staged-funding slot now instead of waiting for the sweeper
+                unlocked_state
+                    .rgb_file_transfer_handler
+                    .forget_staged_funding(&funding_txo.txid.to_string());
                 return Ok(());
             }
 
@@ -2766,7 +3412,11 @@ async fn handle_ldk_events(
 
                     let join_result = tokio::task::spawn_blocking(move || {
                         if is_chan_colored {
-                            state_copy.rgb_send_end(psbt_str_copy).map(|r| r.txid)
+                            // the consignment already went to the peer over p2p at funding time,
+                            // so only the local DB bookkeeping is left to do here
+                            state_copy
+                                .rgb_send_end_db_update_only(psbt_str_copy)
+                                .map(|r| r.txid)
                         } else {
                             state_copy.rgb_send_btc_end(psbt_str_copy)
                         }
@@ -2802,6 +3452,15 @@ async fn handle_ldk_events(
                                 return Ok(());
                             }
                         };
+                    unlocked_state
+                        .kv_store
+                        .write(
+                            FUNDING_CONSIGNMENT_NAMESPACE,
+                            "",
+                            &funding_txid,
+                            consignment_data.clone(),
+                        )
+                        .unwrap();
                     let consignment =
                         RgbTransfer::load(&mut std::io::Cursor::new(consignment_data))
                             .expect("successful consignment load");
@@ -2809,11 +3468,16 @@ async fn handle_ldk_events(
                         .kv_store
                         .remove_rgb_consignment(&funding_txid);
 
-                    match unlocked_state.rgb_save_new_asset(consignment, funding_txid) {
+                    match unlocked_state.rgb_save_new_asset(consignment, funding_txid.clone()) {
                         Ok(_) => {}
                         Err(e) if e.to_string().contains("UNIQUE constraint failed") => {}
                         Err(e) => panic!("Failed saving asset: {e}"),
                     }
+
+                    // the consignment record can stop counting against the node-wide cap
+                    unlocked_state
+                        .rgb_file_transfer_handler
+                        .forget_staged_funding(&funding_txid);
                 }
                 Err(e) => panic!("Failed to read PSBT from KVStore: {e}"),
             }
@@ -2831,12 +3495,13 @@ async fn handle_ldk_events(
                 hex_str(&counterparty_node_id.serialize()),
             );
 
-            tokio::task::spawn_blocking(move || {
-                unlocked_state.rgb_refresh(None, vec![], false).unwrap();
-                unlocked_state.rgb_refresh(None, vec![], true).unwrap()
+            refresh_after_channel_ready(*channel_id, move |skip_sync| {
+                unlocked_state
+                    .rgb_refresh(None, vec![], skip_sync)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
             })
-            .await
-            .unwrap();
+            .await?;
         }
         Event::ChannelClosed {
             channel_id,
@@ -2844,7 +3509,7 @@ async fn handle_ldk_events(
             user_channel_id: _,
             counterparty_node_id,
             channel_capacity_sats: _,
-            channel_funding_txo: _,
+            channel_funding_txo,
             last_local_balance_msat: _,
         } => {
             tracing::info!(
@@ -2855,6 +3520,18 @@ async fn handle_ldk_events(
                     .unwrap_or("".to_owned()),
                 reason
             );
+
+            // we can drop the funding consignment now that the channel has been closed
+            if let Some(funding_txo) = channel_funding_txo {
+                let funding_txid = funding_txo.txid.to_string();
+                unlocked_state
+                    .kv_store
+                    .remove_rgb_consignment(&funding_txid);
+                // drop the in-memory record too, so it stops counting against the node-wide cap
+                unlocked_state
+                    .rgb_file_transfer_handler
+                    .forget_staged_funding(&funding_txid);
+            }
 
             // Release any funds locked for a funding tx that was never broadcast.
             handle_open_chan_fail(&channel_id, unlocked_state.clone()).await;
@@ -2923,12 +3600,18 @@ async fn handle_ldk_events(
             requested_next_hop_scid,
             prev_outbound_scid_alias,
         } => {
-            if !is_swap {
-                tracing::warn!("Intercepted an HTLC that's not related to a swap");
-                unlocked_state
+            let reject_intercept = |reason: &str| {
+                if let Err(e) = unlocked_state
                     .channel_manager
                     .fail_intercepted_htlc(intercept_id)
-                    .unwrap();
+                {
+                    tracing::debug!("could not fail intercepted HTLC ({reason}): {e:?}");
+                }
+            };
+
+            if !is_swap {
+                tracing::warn!("Intercepted an HTLC that's not related to a swap");
+                reject_intercept("not a swap");
                 return Ok(());
             }
 
@@ -2943,55 +3626,109 @@ async fn handle_ldk_events(
                     })
             };
 
-            let inbound_channel = unlocked_state
+            let Some(inbound_channel) = unlocked_state
                 .channel_manager
                 .list_channels()
                 .into_iter()
                 .find(|details| details.outbound_scid_alias == Some(prev_outbound_scid_alias))
-                .expect("Should always be a valid channel");
-            let outbound_channel = unlocked_state
+            else {
+                tracing::error!(
+                    "ERROR: no inbound channel matches the intercepted HTLC prev scid alias {prev_outbound_scid_alias}, rejecting it"
+                );
+                reject_intercept("no inbound channel");
+                return Ok(());
+            };
+            let Some(outbound_channel) = unlocked_state
                 .channel_manager
                 .list_channels()
                 .into_iter()
-                .find(|details| details.short_channel_id == Some(requested_next_hop_scid))
-                .expect("Should always be a valid channel");
+                .find(|details| {
+                    details.short_channel_id == Some(requested_next_hop_scid)
+                        || details.outbound_scid_alias == Some(requested_next_hop_scid)
+                })
+            else {
+                tracing::error!(
+                    "ERROR: no outbound channel matches the intercepted HTLC next hop scid {requested_next_hop_scid}, rejecting it"
+                );
+                reject_intercept("no outbound channel");
+                return Ok(());
+            };
 
             let inbound_rgb_info = get_rgb_info(&inbound_channel.channel_id);
             let outbound_rgb_info = get_rgb_info(&outbound_channel.channel_id);
 
             tracing::debug!("EVENT: Requested swap with params inbound_msat={} outbound_msat={} inbound_rgb={:?} outbound_rgb={:?} inbound_contract_id={:?}, outbound_contract_id={:?}", inbound_amount_msat, expected_outbound_amount_msat, inbound_rgb_amount, expected_outbound_rgb_payment.map(|(_, a)| a), inbound_rgb_info.map(|i| i.0), expected_outbound_rgb_payment.map(|(c, _)| c));
 
-            let swaps_lock = unlocked_state.taker_swaps.lock().unwrap();
-            let whitelist_swap = match swaps_lock.swaps.get(&payment_hash) {
-                None => {
-                    tracing::error!("ERROR: rejecting non-whitelisted swap");
-                    unlocked_state
-                        .channel_manager
-                        .fail_intercepted_htlc(intercept_id)
-                        .unwrap();
-                    return Ok(());
+            let (whitelist_swap_info, whitelist_swap_status, pending_intercept_id, authorized_peer) = {
+                let swaps_lock = unlocked_state.taker_swaps.lock().unwrap();
+                match swaps_lock.swaps.get(&payment_hash) {
+                    None => {
+                        tracing::error!("ERROR: rejecting non-whitelisted swap");
+                        reject_intercept("non-whitelisted swap");
+                        return Ok(());
+                    }
+                    Some(x) => (
+                        x.swap_info.clone(),
+                        x.status,
+                        x.pending_intercept_id,
+                        x.authorized_peer,
+                    ),
                 }
-                Some(x) => x,
             };
 
+            match whitelist_swap_status {
+                SwapStatus::Waiting => {}
+                SwapStatus::Pending if pending_intercept_id == Some(intercept_id) => {}
+                _ => {
+                    tracing::error!(
+                        "ERROR: swap whitelist entry is not in a forwardable state (status {whitelist_swap_status:?}), rejecting it"
+                    );
+                    reject_intercept(&format!(
+                        "whitelist entry not forwardable (status {whitelist_swap_status:?})"
+                    ));
+                    return Ok(());
+                }
+            }
+
+            if let Some(authorized_peer) = authorized_peer {
+                if inbound_channel.counterparty.node_id != authorized_peer {
+                    tracing::error!(
+                        "ERROR: swap whitelist entry was authorized for peer {}, but intercepted HTLC came from {}, rejecting it",
+                        authorized_peer,
+                        inbound_channel.counterparty.node_id
+                    );
+                    reject_intercept("unauthorized peer");
+                    return Ok(());
+                }
+            }
+
+            if get_current_timestamp() > whitelist_swap_info.expiry {
+                tracing::error!("ERROR: swap whitelist entry expired, rejecting it");
+                unlocked_state.update_taker_swap_status(&payment_hash, SwapStatus::Expired);
+                reject_intercept("whitelist entry expired");
+                return Ok(());
+            }
+
             let mut fail = false;
-            if whitelist_swap.swap_info.is_from_btc() {
+            if whitelist_swap_info.is_from_btc() {
                 let net_msat_diff = expected_outbound_amount_msat.checked_sub(inbound_amount_msat);
 
-                if inbound_rgb_amount != Some(whitelist_swap.swap_info.qty_to)
-                    || inbound_rgb_info.map(|x| x.0) != whitelist_swap.swap_info.to_asset
-                    || net_msat_diff != Some(whitelist_swap.swap_info.qty_from)
+                if inbound_rgb_amount != Some(whitelist_swap_info.qty_to)
+                    || inbound_rgb_info.map(|x| x.0) != whitelist_swap_info.to_asset
+                    || net_msat_diff != Some(whitelist_swap_info.qty_from)
                 {
                     fail = true;
                 }
-            } else if whitelist_swap.swap_info.is_to_btc() {
+            } else if whitelist_swap_info.is_to_btc() {
                 let net_msat_diff =
                     inbound_amount_msat.saturating_sub(expected_outbound_amount_msat);
 
-                if expected_outbound_rgb_payment.map(|(_, a)| a)
-                    != Some(whitelist_swap.swap_info.qty_from)
-                    || outbound_rgb_info.map(|x| x.0) != whitelist_swap.swap_info.from_asset
-                    || net_msat_diff != whitelist_swap.swap_info.qty_to
+                if expected_outbound_rgb_payment
+                    != whitelist_swap_info
+                        .from_asset
+                        .map(|asset| (asset, whitelist_swap_info.qty_from))
+                    || outbound_rgb_info.map(|x| x.0) != whitelist_swap_info.from_asset
+                    || net_msat_diff != whitelist_swap_info.qty_to
                 {
                     fail = true;
                 }
@@ -2999,41 +3736,39 @@ async fn handle_ldk_events(
                 let net_msat_diff = inbound_amount_msat.checked_sub(expected_outbound_amount_msat);
 
                 if net_msat_diff != Some(0)
-                    || expected_outbound_rgb_payment.map(|(_, a)| a)
-                        != Some(whitelist_swap.swap_info.qty_from)
-                    || outbound_rgb_info.map(|x| x.0) != whitelist_swap.swap_info.from_asset
-                    || inbound_rgb_amount != Some(whitelist_swap.swap_info.qty_to)
-                    || inbound_rgb_info.map(|x| x.0) != whitelist_swap.swap_info.to_asset
+                    || expected_outbound_rgb_payment
+                        != whitelist_swap_info
+                            .from_asset
+                            .map(|asset| (asset, whitelist_swap_info.qty_from))
+                    || outbound_rgb_info.map(|x| x.0) != whitelist_swap_info.from_asset
+                    || inbound_rgb_amount != Some(whitelist_swap_info.qty_to)
+                    || inbound_rgb_info.map(|x| x.0) != whitelist_swap_info.to_asset
                 {
                     fail = true;
                 }
             }
 
-            drop(swaps_lock);
-
             if fail {
                 tracing::error!("ERROR: swap doesn't match the whitelisted info, rejecting it");
                 unlocked_state.update_taker_swap_status(&payment_hash, SwapStatus::Failed);
-                unlocked_state
-                    .channel_manager
-                    .fail_intercepted_htlc(intercept_id)
-                    .unwrap();
+                reject_intercept("whitelist mismatch");
                 return Ok(());
             }
 
             tracing::debug!("Swap is whitelisted, forwarding the htlc...");
-            unlocked_state.update_taker_swap_status(&payment_hash, SwapStatus::Pending);
+            unlocked_state.update_taker_swap_pending_intercept(&payment_hash, intercept_id);
 
-            unlocked_state
-                .channel_manager
-                .forward_intercepted_htlc(
-                    intercept_id,
-                    channelmanager::NextHopForward::ShortChannelId(requested_next_hop_scid),
-                    outbound_channel.counterparty.node_id,
-                    expected_outbound_amount_msat,
-                    expected_outbound_rgb_payment,
-                )
-                .expect("Forward should be valid");
+            if let Err(e) = unlocked_state.channel_manager.forward_intercepted_htlc(
+                intercept_id,
+                channelmanager::NextHopForward::ShortChannelId(requested_next_hop_scid),
+                outbound_channel.counterparty.node_id,
+                expected_outbound_amount_msat,
+                expected_outbound_rgb_payment,
+            ) {
+                tracing::error!("ERROR: failed to forward whitelisted swap HTLC: {e:?}");
+                unlocked_state.update_taker_swap_status(&payment_hash, SwapStatus::Failed);
+                reject_intercept("forward failed");
+            }
         }
         Event::OnionMessageIntercepted { .. } => {
             // We don't use the onion message interception feature, so this event should never be
@@ -3082,8 +3817,48 @@ async fn handle_ldk_events(
     Ok(())
 }
 
-impl OutputSpender for RgbOutputSpender {
-    fn spend_spendable_outputs(
+// Refresh is supplementary: replaying ChannelReady would block later ChannelManager events
+// on an unavailable indexer. A later API refresh/ChannelReady can retry this work.
+async fn refresh_after_channel_ready(
+    channel_id: ChannelId,
+    mut refresh: impl FnMut(bool) -> Result<(), String> + Send + 'static,
+) -> Result<(), ReplayEvent> {
+    match tokio::task::spawn_blocking(move || {
+        refresh(false)?;
+        refresh(true)
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::error!(%channel_id, %error, "ChannelReady RGB refresh failed; event acknowledged")
+        }
+        Err(error) => {
+            tracing::error!(%channel_id, %error, "ChannelReady RGB refresh task failed; event acknowledged")
+        }
+    }
+    Ok(())
+}
+
+// Resolves the RGB amount a spendable output carries. An empty map is a truly vanilla tx (0);
+// a non-empty map that lacks the output is an invariant violation and must error so the sweep
+// retries rather than paying the colored output out as vanilla BTC, stranding the allocation.
+fn rgb_amount_for_spendable_output(
+    output_map: &HashMap<u32, u64>,
+    vout: u32,
+    txid: &str,
+) -> Result<u64, String> {
+    match output_map.get(&vout) {
+        Some(amt) => Ok(*amt),
+        None if output_map.is_empty() => Ok(0),
+        None => Err(format!(
+            "spendable output {txid}:{vout} absent from a non-empty transfer info map"
+        )),
+    }
+}
+
+impl RgbOutputSpender {
+    fn try_spend_spendable_outputs(
         &self,
         descriptors: &[&SpendableOutputDescriptor],
         outputs: Vec<TxOut>,
@@ -3091,13 +3866,40 @@ impl OutputSpender for RgbOutputSpender {
         feerate_sat_per_1000_weight: u32,
         locktime: Option<LockTime>,
         secp_ctx: &Secp256k1<All>,
-    ) -> Result<bitcoin::Transaction, ()> {
+    ) -> Result<bitcoin::Transaction, String> {
         let mut hasher = DefaultHasher::new();
         descriptors.hash(&mut hasher);
         let descriptors_hash = hasher.finish();
-        let mut txes = self.txes.lock().unwrap();
+        let mut txes = self.txes.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(tx) = txes.get(&descriptors_hash) {
             return Ok(tx.clone());
+        }
+        let sweep_key = descriptors_hash.to_string();
+        let inputs: HashSet<_> = descriptors
+            .iter()
+            .map(|d| d.spendable_outpoint().into_bitcoin_outpoint())
+            .collect();
+        // The descriptor order and batch can change between LDK attempts. Check cached
+        // transactions too: their active receipt may already have been consumed and removed.
+        for tx in txes.values() {
+            let saved: HashSet<_> = tx.input.iter().map(|i| i.previous_output).collect();
+            if saved == inputs {
+                return Ok(tx.clone());
+            }
+            if !saved.is_disjoint(&inputs) {
+                return Err("inputs overlap a previously signed sweep".into());
+            }
+        }
+        if let Some(prepared) =
+            crate::rgb_sweep::find_prepared_sweep(self.kv_store.as_ref(), &inputs)?
+        {
+            return self.finish_prepared_rgb_sweep(
+                descriptors,
+                descriptors_hash,
+                &mut txes,
+                secp_ctx,
+                prepared,
+            );
         }
 
         let mut vout = 0;
@@ -3116,19 +3918,23 @@ impl OutputSpender for RgbOutputSpender {
             let txid = outpoint.txid;
             let txid_str = txid.to_string();
 
-            let transfer_info_exists = self
-                .kv_store
-                .read(
-                    RGB_PRIMARY_NS,
-                    lightning::rgb_utils::RGB_TRANSFER_INFO_NS,
-                    &txid_str,
-                )
-                .is_ok();
-            if !transfer_info_exists {
+            let Ok(transfer_info_bytes) = self.kv_store.read(
+                RGB_PRIMARY_NS,
+                lightning::rgb_utils::RGB_TRANSFER_INFO_NS,
+                &txid_str,
+            ) else {
                 continue;
-            }
-            let transfer_info = self.kv_store.read_rgb_transfer_info(&txid_str);
-            if transfer_info.rgb_amount == 0 {
+            };
+            // decode here rather than via read_rgb_transfer_info: that one panics, and we hold
+            // the txes lock, so a bad record would poison it and brick every later sweep
+            let transfer_info: TransferInfo = bincode::deserialize(&transfer_info_bytes)
+                .map_err(|e| format!("cannot decode transfer info for {txid_str}: {e}"))?;
+            let amt_rgb = rgb_amount_for_spendable_output(
+                &transfer_info.output_map,
+                outpoint.index.into(),
+                &txid_str,
+            )?;
+            if amt_rgb == 0 {
                 continue;
             }
 
@@ -3137,16 +3943,16 @@ impl OutputSpender for RgbOutputSpender {
             let closing_height = self
                 .rgb_wallet_wrapper
                 .get_tx_height(txid_str.clone())
-                .map_err(|_| ())?;
+                .map_err(|e| format!("cannot get height of {txid_str}: {e}"))?
+                .ok_or_else(|| format!("transaction {txid_str} is not confirmed yet"))?;
             let update_res = self
                 .rgb_wallet_wrapper
-                .update_witnesses(
-                    closing_height.unwrap(),
-                    vec![RgbTxid::from_str(&txid_str).unwrap()],
-                )
-                .unwrap();
+                .update_witnesses(closing_height, vec![RgbTxid::from_str(&txid_str).unwrap()])
+                .map_err(|e| format!("error while updating witnesses for {txid_str}: {e}"))?;
             if !update_res.failed.is_empty() {
-                return Err(());
+                return Err(format!(
+                    "failed to update witnesses for {txid_str}: {update_res:?}"
+                ));
             }
 
             let contract_id = transfer_info.contract_id;
@@ -3156,27 +3962,57 @@ impl OutputSpender for RgbOutputSpender {
                 recipient_id.clone()
             } else {
                 new_asset = true;
-                let receive_data = self
-                    .rgb_wallet_wrapper
-                    .witness_receive(
-                        None,
-                        Assignment::Any,
-                        None,
-                        vec![self.proxy_endpoint.clone()],
-                        0,
-                    )
-                    .unwrap();
-                let script_pubkey = script_buf_from_recipient_id(receive_data.recipient_id.clone())
-                    .unwrap()
-                    .unwrap();
+                let cache_key = (descriptors_hash, contract_id);
+                let cached = {
+                    let mut recipients = self
+                        .sweep_recipients
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    match recipients.get(&cache_key) {
+                        Some((recipient_id, expiration))
+                            if sweep_receive_is_reusable(
+                                get_current_timestamp(),
+                                *expiration,
+                                self.static_state.reuse_addresses,
+                            ) =>
+                        {
+                            Some(recipient_id.clone())
+                        }
+                        // too close to expiry to be used again, don't keep retrying against it
+                        Some(_) => {
+                            recipients.remove(&cache_key);
+                            None
+                        }
+                        None => None,
+                    }
+                };
+                let recipient_id = match cached {
+                    Some(recipient_id) => recipient_id,
+                    None => {
+                        let expiration =
+                            get_current_timestamp() + RGB_TRANSFER_CHAN_EXPIRATION_SECS;
+                        let receive_data = self
+                            .rgb_wallet_wrapper
+                            .witness_receive(None, Assignment::Any, expiration, vec![], 0)
+                            .map_err(|e| format!("cannot get a witness receive script: {e}"))?;
+                        self.sweep_recipients
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(cache_key, (receive_data.recipient_id.clone(), expiration));
+                        receive_data.recipient_id
+                    }
+                };
+                let script_pubkey = script_buf_from_recipient_id(recipient_id.clone())
+                    .map_err(|e| format!("invalid sweep recipient id: {e}"))?
+                    .ok_or_else(|| s!("sweep recipient id has no script"))?;
                 txouts.push(TxOut {
-                    value: Amount::from_sat(DUST_LIMIT_MSAT / 1000),
+                    value: Amount::from_sat(
+                        self.static_state.config.channels.dust_limit_msat / 1000,
+                    ),
                     script_pubkey,
                 });
-                receive_data.recipient_id
+                recipient_id
             };
-
-            let amt_rgb = transfer_info.rgb_amount;
 
             asset_info
                 .entry(contract_id)
@@ -3191,17 +4027,20 @@ impl OutputSpender for RgbOutputSpender {
         }
 
         if vanilla_descriptor {
-            return self.signer.spend_spendable_outputs(
-                descriptors.as_ref(),
-                txouts,
-                change_destination_script,
-                feerate_sat_per_1000_weight,
-                locktime,
-                secp_ctx,
-            );
+            return self
+                .signer
+                .spend_spendable_outputs(
+                    descriptors.as_ref(),
+                    txouts,
+                    change_destination_script,
+                    feerate_sat_per_1000_weight,
+                    locktime,
+                    secp_ctx,
+                )
+                .map_err(|()| s!("cannot spend vanilla spendable outputs"));
         }
 
-        let feerate_sat_per_1000_weight = FEE_RATE as u32 * 250; // 1 sat/vB = 250 sat/kw
+        let feerate_sat_per_1000_weight = self.static_state.config.rgb.fee_rate_sat_vb as u32 * 250; // 1 sat/vB = 250 sat/kw
         let (psbt, _expected_max_weight) =
             SpendableOutputDescriptor::create_spendable_outputs_psbt(
                 secp_ctx,
@@ -3211,7 +4050,7 @@ impl OutputSpender for RgbOutputSpender {
                 feerate_sat_per_1000_weight,
                 locktime,
             )
-            .unwrap();
+            .map_err(|()| s!("cannot create the spendable outputs PSBT"))?;
 
         let mut asset_info_map = map![];
         for (contract_id, (vout, amt_rgb, _)) in asset_info.clone() {
@@ -3230,18 +4069,71 @@ impl OutputSpender for RgbOutputSpender {
             nonce: None,
         };
 
-        let mut psbt = RgbLibPsbt::from_str(&psbt.to_string()).unwrap();
-        let consignments = self
+        let mut psbt = RgbLibPsbt::from_str(&psbt.to_string()).expect("valid PSBT");
+        let prepared = self
             .rgb_wallet_wrapper
-            .color_psbt_and_consume(&mut psbt, coloring_info)
-            .unwrap();
+            .color_psbt_and_prepare_consume(&mut psbt, coloring_info)
+            .map_err(|e| format!("cannot color the sweep PSBT: {e}"))?;
+        let batch_transfer_idx = prepared.batch_transfer_idx;
+        let prepared = crate::rgb_sweep::PreparedRgbSweep::new(psbt.to_string(), prepared)
+            .and_then(|prepared| {
+                prepared.persist(self.kv_store.as_ref(), &sweep_key)?;
+                Ok(prepared)
+            })
+            .inspect_err(|_| {
+                // The transaction has not been signed or handed to LDK for broadcast.
+                if let Err(cleanup) =
+                    self.rgb_wallet_wrapper
+                        .fail_transfers(Some(batch_transfer_idx), false, true)
+                {
+                    tracing::error!(batch_transfer_idx, error = %cleanup,
+                        "cannot fail unpersisted RGB sweep preparation");
+                }
+            })?;
+        self.finish_prepared_rgb_sweep(descriptors, descriptors_hash, &mut txes, secp_ctx, prepared)
+    }
 
-        let mut psbt = Psbt::from_str(&psbt.to_string()).expect("valid transaction");
+    fn finish_prepared_rgb_sweep(
+        &self,
+        descriptors: &[&SpendableOutputDescriptor],
+        descriptors_hash: u64,
+        txes: &mut OutputSpenderTxes,
+        secp_ctx: &Secp256k1<All>,
+        prepared: crate::rgb_sweep::PreparedRgbSweep,
+    ) -> Result<bitcoin::Transaction, String> {
+        let mut psbt = Psbt::from_str(&prepared.psbt)
+            .map_err(|e| format!("invalid prepared sweep PSBT: {e}"))?;
+        let unsigned_tx = psbt.unsigned_tx.clone();
+        let batch_is_active = self
+            .rgb_wallet_wrapper
+            .list_transfers(
+                rgb_lib::wallet::AssetFilter::AnyOrNone,
+                Some(unsigned_tx.compute_txid().to_string()),
+            )
+            .map_err(|e| format!("cannot inspect prepared sweep: {e}"))?
+            .iter()
+            .any(|transfer| {
+                transfer.batch_transfer_idx == prepared.batch_transfer_idx
+                    && matches!(
+                        transfer.status,
+                        TransferStatus::Initiated
+                            | TransferStatus::WaitingConfirmations
+                            | TransferStatus::Settled
+                    )
+            });
+        if !batch_is_active {
+            return Err(s!(
+                "prepared RGB sweep batch is missing or no longer active"
+            ));
+        }
 
         psbt = self
             .signer
             .sign_spendable_outputs_psbt(descriptors, psbt, secp_ctx)
-            .unwrap();
+            .map_err(|e| format!("cannot sign the sweep PSBT: {e:?}"))?;
+        if psbt.unsigned_tx != unsigned_tx {
+            return Err(s!("signer changed the prepared RGB sweep transaction"));
+        }
 
         let spending_tx = match psbt.extract_tx() {
             Ok(tx) => tx,
@@ -3250,58 +4142,93 @@ impl OutputSpender for RgbOutputSpender {
         };
 
         let closing_txid = spending_tx.compute_txid().to_string();
+        if closing_txid != prepared.txid()? {
+            return Err(s!("signing changed the prepared RGB sweep transaction ID"));
+        }
 
         let handle = Handle::current();
         let _ = handle.enter();
 
-        for consignment in consignments {
-            let contract_id = consignment.contract_id();
+        for (asset_id, consignment) in prepared.consignments {
+            // A retry after a failed KV write must not provide an already accepted consignment.
+            let received = self
+                .rgb_wallet_wrapper
+                .list_transfers(
+                    rgb_lib::wallet::AssetFilter::Id(asset_id.clone()),
+                    Some(closing_txid.clone()),
+                )
+                .map_err(|e| format!("cannot inspect sweep receive: {e}"))?
+                .iter()
+                .any(|transfer| {
+                    transfer.txid.as_deref() == Some(closing_txid.as_str())
+                        && transfer.kind == rgb_lib::wallet::TransferKind::ReceiveWitness
+                        && transfer.status != TransferStatus::Failed
+                        && transfer.status != TransferStatus::WaitingCounterparty
+                });
+            if received {
+                continue;
+            }
 
-            let (mut vout, _, recipient_id) = asset_info[&contract_id].clone();
-            vout += 1;
-
+            // persist consignment and hand it to rgb-lib (out-of-band)
             let consignment_path = self
                 .static_state
                 .ldk_data_dir
-                .join(format!("consignment_{}", closing_txid.clone()));
-            consignment
-                .save_file(&consignment_path)
-                .expect("successful save");
-            let proxy_url = TransportEndpoint::new(self.proxy_endpoint.clone())
-                .unwrap()
-                .endpoint;
+                .join(format!("consignment_{closing_txid}_{asset_id}"));
+            fs::write(&consignment_path, consignment)
+                .map_err(|e| format!("cannot save consignment: {e}"))?;
+            let consignment_path_str = consignment_path.to_string_lossy().to_string();
             let rgb_wallet_wrapper_copy = self.rgb_wallet_wrapper.clone();
-            let closing_txid_copy = closing_txid.clone();
-            let consignment_path_copy = consignment_path.clone();
-            let res = crate::runtime::block_on(tokio::task::spawn_blocking(move || {
-                rgb_wallet_wrapper_copy.post_consignment(
-                    &proxy_url,
-                    recipient_id,
-                    &consignment_path_copy,
-                    closing_txid_copy,
-                    Some(vout),
-                )
-            }));
-            match res {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::error!("cannot post consignment: {e}");
-                    return Err(());
-                }
-                Err(e) => {
-                    tracing::error!("cannot post consignment task: {e}");
-                    return Err(());
-                }
+            futures::executor::block_on(tokio::task::spawn_blocking(move || {
+                rgb_wallet_wrapper_copy
+                    .provide_out_of_band_consignment(consignment_path_str, vec![])
+            }))
+            .map_err(|e| format!("consignment task failed: {e}"))?
+            .map_err(|e| format!("cannot provide consignment: {e}"))?;
+            if let Err(e) = fs::remove_file(&consignment_path) {
+                tracing::warn!(error = %e, "cannot remove consignment file, leaving it behind");
             }
-            fs::remove_file(&consignment_path).unwrap();
         }
 
+        // insert so the encoded write includes this entry; roll back if the write fails, or the
+        // early return above would hand back a broadcast tx that was never persisted
         txes.insert(descriptors_hash, spending_tx.clone());
-        self.kv_store
+        if let Err(e) = self
+            .kv_store
             .write("", "", OUTPUT_SPENDER_TXES_KEY, txes.encode())
-            .unwrap();
+        {
+            txes.remove(&descriptors_hash);
+            return Err(format!("cannot persist output spender txes: {e}"));
+        }
+        self.sweep_recipients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(hash, _), _| *hash != descriptors_hash);
 
         Ok(spending_tx)
+    }
+}
+
+impl OutputSpender for RgbOutputSpender {
+    fn spend_spendable_outputs(
+        &self,
+        descriptors: &[&SpendableOutputDescriptor],
+        outputs: Vec<TxOut>,
+        change_destination_script: ScriptBuf,
+        feerate_sat_per_1000_weight: u32,
+        locktime: Option<LockTime>,
+        secp_ctx: &Secp256k1<All>,
+    ) -> Result<bitcoin::Transaction, ()> {
+        self.try_spend_spendable_outputs(
+            descriptors,
+            outputs,
+            change_destination_script,
+            feerate_sat_per_1000_weight,
+            locktime,
+            secp_ctx,
+        )
+        .map_err(|e| {
+            tracing::error!("cannot spend spendable outputs, will retry: {e}");
+        })
     }
 }
 
@@ -3514,9 +4441,8 @@ mod vss_bootstrap_identity_tests {
 
 /// Restore the RGB wallet directory from VSS if (a) VSS is configured for this
 /// node, (b) the local wallet directory for `expected_fingerprint` is absent,
-/// and (c) VSS has a backup for the given store. Mirrors the KV-side
-/// auto-restore policy at `start_ldk`'s top: silent no-op when nothing is on
-/// VSS, hard error otherwise unless `allow_empty_restore` is set.
+/// and (c) VSS has a backup for the given store. Nothing to restore is a no-op;
+/// other restore failures abort startup unless `allow_empty_restore` is set.
 #[cfg(feature = "vss")]
 pub(crate) async fn maybe_restore_rgb_from_vss(
     vss_url: &str,
@@ -3571,108 +4497,751 @@ pub(crate) async fn maybe_restore_rgb_from_vss(
     }
 }
 
-pub(crate) enum ChainBackendSelection {
-    Bitcoind {
-        username: String,
-        password: String,
-        host: String,
-        port: u16,
-    },
-    Esplora {
-        url: String,
-    },
-    Electrum {
-        url: String,
-    },
-}
-
-pub(crate) fn select_chain_backend(
-    unlock_request: &UnlockRequest,
-    bitcoin_network: BitcoinNetwork,
-) -> Result<ChainBackendSelection, APIError> {
-    let bitcoind_all_set = unlock_request.bitcoind_rpc_username.is_some()
-        && unlock_request.bitcoind_rpc_password.is_some()
-        && unlock_request.bitcoind_rpc_host.is_some()
-        && unlock_request.bitcoind_rpc_port.is_some();
-    let bitcoind_any_set = unlock_request.bitcoind_rpc_username.is_some()
-        || unlock_request.bitcoind_rpc_password.is_some()
-        || unlock_request.bitcoind_rpc_host.is_some()
-        || unlock_request.bitcoind_rpc_port.is_some();
-    if bitcoind_any_set && !bitcoind_all_set {
-        return Err(APIError::InvalidIndexer(s!(
-            "bitcoind_rpc_* fields must all be set or all be omitted"
-        )));
-    }
-    let indexer_url = unlock_request.indexer_url.as_deref();
-    match (bitcoind_all_set, indexer_url) {
-        (true, Some(url)) => {
-            let proto = check_indexer_url(url, bitcoin_network)
-                .map_err(|e| APIError::InvalidIndexer(e.to_string()))?;
-            match proto {
-                rgb_lib::wallet::rust_only::IndexerProtocol::Esplora => {
-                    Err(APIError::AmbiguousChainBackend)
-                }
-                rgb_lib::wallet::rust_only::IndexerProtocol::Electrum => {
-                    Ok(ChainBackendSelection::Bitcoind {
-                        username: unlock_request.bitcoind_rpc_username.clone().unwrap(),
-                        password: unlock_request.bitcoind_rpc_password.clone().unwrap(),
-                        host: unlock_request.bitcoind_rpc_host.clone().unwrap(),
-                        port: unlock_request.bitcoind_rpc_port.unwrap(),
-                    })
-                }
-            }
-        }
-        (true, None) => Ok(ChainBackendSelection::Bitcoind {
-            username: unlock_request.bitcoind_rpc_username.clone().unwrap(),
-            password: unlock_request.bitcoind_rpc_password.clone().unwrap(),
-            host: unlock_request.bitcoind_rpc_host.clone().unwrap(),
-            port: unlock_request.bitcoind_rpc_port.unwrap(),
-        }),
-        (false, Some(url)) => {
-            let proto = check_indexer_url(url, bitcoin_network)
-                .map_err(|e| APIError::InvalidIndexer(e.to_string()))?;
-            match proto {
-                rgb_lib::wallet::rust_only::IndexerProtocol::Esplora => {
-                    Ok(ChainBackendSelection::Esplora {
-                        url: url.to_string(),
-                    })
-                }
-                rgb_lib::wallet::rust_only::IndexerProtocol::Electrum => {
-                    Ok(ChainBackendSelection::Electrum {
-                        url: url.to_string(),
-                    })
-                }
-            }
-        }
-        (false, None) => Err(APIError::MissingChainBackend),
-    }
-}
-
 // rgb-lib rejects wallets supporting IFA on mainnet
-fn supported_asset_schemas(bitcoin_network: BitcoinNetwork) -> Vec<AssetSchema> {
+// BFA is opt-in: rgb-lib refuses to go online for a BFA-capable wallet without an Ethereum RPC
+// endpoint (it validates incoming BFA consignments against the bridge contract's FundsIn logs),
+// so the schema is only enabled when one is configured.
+fn supported_asset_schemas(bitcoin_network: BitcoinNetwork, bfa: bool) -> Vec<AssetSchema> {
     let mut schemas = vec![AssetSchema::Nia, AssetSchema::Cfa, AssetSchema::Uda];
     if bitcoin_network != BitcoinNetwork::Mainnet {
         schemas.push(AssetSchema::Ifa);
     }
+    if bfa {
+        schemas.push(AssetSchema::Bfa);
+    }
     schemas
 }
 
-pub(crate) async fn start_ldk(
+// A dead background processor must take the node down, not leave it serving without event
+// processing; only `stop_processing` termination is expected. The shutdown is requested rather
+// than forced, so the VSS teardown still runs; `main` turns `FATAL_ERROR` into exit code 70.
+async fn supervise_background_processor(
+    bp_future: impl std::future::Future<Output = Result<(), io::Error>> + Send,
+    stop_flag: Arc<AtomicBool>,
+    cancel_token: CancellationToken,
+) -> Result<(), io::Error> {
+    let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(bp_future)).await;
+    let stopping = stop_flag.load(Ordering::Acquire);
+    match result {
+        Ok(res) => {
+            if !stopping {
+                let msg = match &res {
+                    Ok(()) => "background processor exited unexpectedly".to_string(),
+                    Err(e) => format!("background processor failed unexpectedly: {e}"),
+                };
+                tracing::error!("{msg}; shutting down");
+                let _ = FATAL_ERROR.set(msg);
+                cancel_token.cancel();
+            }
+            res
+        }
+        Err(panic_payload) => {
+            let msg = panic_payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            tracing::error!(
+                panic = %msg,
+                "background processor panicked; shutting down instead of running without \
+                 event processing"
+            );
+            let _ = FATAL_ERROR.set(format!("background processor panicked: {msg}"));
+            cancel_token.cancel();
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("background processor panicked: {msg}"),
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    use super::*;
+
+    // Exits with the same code `main` would once the server future has returned, via the shared
+    // decision so this test cannot drift from the real one.
+    fn exit_as_main_would() -> ! {
+        std::process::exit(crate::utils::fatal_exit_code());
+    }
+
+    // Child mode re-runs this test in a subprocess so the exit code is observable.
+    #[test]
+    fn exits_with_code_70_on_bp_panic() {
+        if std::env::var("BP_WATCHDOG_CHILD").is_ok() {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let cancel = CancellationToken::new();
+            let _ = rt.block_on(supervise_background_processor(
+                async { panic!("test panic") },
+                stop,
+                cancel.clone(),
+            ));
+            // The shutdown has to be requested, not forced: the VSS teardown runs on it.
+            assert!(cancel.is_cancelled());
+            exit_as_main_would();
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ldk::watchdog_tests::exits_with_code_70_on_bp_panic",
+            ])
+            .env("BP_WATCHDOG_CHILD", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(70));
+    }
+
+    // An unexpected clean return is as fatal as a panic: the node would keep serving without
+    // event processing.
+    #[test]
+    fn exits_with_code_70_on_unexpected_bp_return() {
+        if std::env::var("BP_WATCHDOG_CHILD").is_ok() {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let cancel = CancellationToken::new();
+            let _ = rt.block_on(supervise_background_processor(
+                async { Ok(()) },
+                stop,
+                cancel.clone(),
+            ));
+            assert!(cancel.is_cancelled());
+            exit_as_main_would();
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ldk::watchdog_tests::exits_with_code_70_on_unexpected_bp_return",
+            ])
+            .env("BP_WATCHDOG_CHILD", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(70));
+    }
+
+    #[test]
+    fn returns_without_exiting_when_stop_requested() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let stop = Arc::new(AtomicBool::new(true));
+        let cancel = CancellationToken::new();
+        let res = rt.block_on(supervise_background_processor(
+            async { Err(io::Error::new(io::ErrorKind::Other, "aborted at teardown")) },
+            stop,
+            cancel.clone(),
+        ));
+        assert!(res.is_err());
+        assert!(!cancel.is_cancelled());
+    }
+}
+
+#[cfg(test)]
+mod sweeper_predicate_tests {
+    use super::*;
+
+    #[test]
+    fn rgb_amount_empty_map_is_vanilla() {
+        let map = HashMap::new();
+        assert_eq!(rgb_amount_for_spendable_output(&map, 0, "tx"), Ok(0));
+    }
+
+    #[test]
+    fn rgb_amount_present_output_returns_amount() {
+        let map = HashMap::from_iter([(1u32, 42u64)]);
+        assert_eq!(rgb_amount_for_spendable_output(&map, 1, "tx"), Ok(42));
+    }
+
+    #[test]
+    fn rgb_amount_missing_from_non_empty_map_errors() {
+        let map = HashMap::from_iter([(1u32, 42u64)]);
+        assert!(rgb_amount_for_spendable_output(&map, 0, "tx").is_err());
+    }
+}
+
+/// Re-seed the RGB wallet with funding consignments the wallet doesn't know,
+/// so a wallet restored without an RGB backup can color force-close sweeps
+/// (issue #111). Failures are logged, never fatal: unlock must proceed.
+async fn reimport_funding_consignments(
+    rgb_wallet_wrapper: &Arc<RgbLibWalletWrapper>,
+    kv_store: &Arc<SyncedKvStore>,
+    ldk_data_dir: &Path,
+) {
+    let mark_replay_done = || {
+        let _ =
+            kv_store.write_local_only(REIMPORT_MARKER_NAMESPACE, "", REIMPORT_MARKER_KEY, vec![1]);
+    };
+    let replay_pending = kv_store
+        .read(REIMPORT_MARKER_NAMESPACE, "", REIMPORT_MARKER_KEY)
+        .is_err();
+    let txids = match kv_store.list(FUNDING_CONSIGNMENT_NAMESPACE, "") {
+        Ok(keys) => keys,
+        Err(e) => {
+            tracing::error!("cannot list stored funding consignments: {e}");
+            return;
+        }
+    };
+    if txids.is_empty() {
+        mark_replay_done();
+        return;
+    }
+    let known: HashSet<String> = match rgb_wallet_wrapper.list_assets(vec![]) {
+        Ok(assets) => assets
+            .nia
+            .unwrap_or_default()
+            .into_iter()
+            .map(|a| a.asset_id)
+            .chain(
+                assets
+                    .cfa
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|a| a.asset_id),
+            )
+            .chain(
+                assets
+                    .uda
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|a| a.asset_id),
+            )
+            .chain(
+                assets
+                    .ifa
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|a| a.asset_id),
+            )
+            .collect(),
+        Err(e) => {
+            tracing::error!("cannot list assets before consignment re-import: {e}");
+            return;
+        }
+    };
+    let mut imported_any = false;
+    for txid in txids {
+        let data = match kv_store.read(FUNDING_CONSIGNMENT_NAMESPACE, "", &txid) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::error!("cannot read stored funding consignment for {txid}: {e}");
+                continue;
+            }
+        };
+        let consignment = match RgbTransfer::load(&mut std::io::Cursor::new(&data)) {
+            Ok(consignment) => consignment,
+            Err(e) => {
+                tracing::error!("cannot load stored funding consignment for {txid}: {e}");
+                continue;
+            }
+        };
+        if known.contains(&consignment.contract_id().to_string()) {
+            continue;
+        }
+        let wrapper = Arc::clone(rgb_wallet_wrapper);
+        let txid_copy = txid.clone();
+        let consignment_path = ldk_data_dir.join(format!("reimport_consignment_{txid}"));
+        // Accept our stored copy straight from disk: this consumes the consignment into
+        // the RGB runtime, which save_new_asset requires. Unlike the funding-time acceptor
+        // flow there is no media staging dir to promote from -- only consignment bytes are
+        // persisted -- so any media the contract declares must already be in the wallet.
+        let res = tokio::task::spawn_blocking(move || -> Result<(), String> {
+            fs::write(&consignment_path, &data).map_err(|e| e.to_string())?;
+            let accept_res = wrapper.accept_transfer_consignment(
+                consignment_path.clone(),
+                txid_copy.clone(),
+                1,
+                STATIC_BLINDING,
+            );
+            let _ = fs::remove_file(&consignment_path);
+            let (consignment, _, media_digests) = accept_res.map_err(|e| e.to_string())?;
+            let media_dir = wrapper.get_media_dir();
+            let missing: Vec<String> = media_digests
+                .into_iter()
+                .filter(|digest| !media_dir.join(digest).exists())
+                .collect();
+            if !missing.is_empty() {
+                tracing::warn!(
+                    "re-imported asset for {txid_copy} is missing {} media file(s) locally: {}",
+                    missing.len(),
+                    missing.join(", "),
+                );
+            }
+            match wrapper.save_new_asset(consignment, txid_copy) {
+                Ok(()) => Ok(()),
+                Err(e) if e.to_string().contains("UNIQUE constraint failed") => Ok(()),
+                Err(e) => Err(e.to_string()),
+            }
+        })
+        .await;
+        match res {
+            Ok(Ok(())) => {
+                imported_any = true;
+                tracing::info!("re-imported funding consignment for {txid}");
+            }
+            Ok(Err(e)) => tracing::error!("cannot re-import funding consignment for {txid}: {e}"),
+            Err(e) => tracing::error!("funding consignment re-import task failed for {txid}: {e}"),
+        }
+    }
+
+    // The runtime also needs the funding->commitment transitions to color
+    // force-close sweeps; re-consume the stored latest fascia of each channel.
+    if !imported_any && !replay_pending {
+        return;
+    }
+    let fascia_keys = match kv_store.list(RGB_PRIMARY_NS, RGB_COMMITMENT_FASCIA_NS) {
+        Ok(keys) => keys,
+        Err(e) => {
+            tracing::error!("cannot list stored commitment fascias: {e}");
+            return;
+        }
+    };
+    for key in fascia_keys {
+        let data = match kv_store.read(RGB_PRIMARY_NS, RGB_COMMITMENT_FASCIA_NS, &key) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::error!("cannot read stored commitment fascia {key}: {e}");
+                continue;
+            }
+        };
+        let fascia = match deserialize_fascia(data) {
+            Ok(fascia) => fascia,
+            Err(e) => {
+                tracing::error!("cannot deserialize stored commitment fascia {key}: {e}");
+                continue;
+            }
+        };
+        let wrapper = Arc::clone(rgb_wallet_wrapper);
+        match tokio::task::spawn_blocking(move || {
+            wrapper.consume_fascia(fascia, Some(WitnessOrd::Ignored))
+        })
+        .await
+        {
+            Ok(Ok(())) => tracing::info!("re-consumed commitment fascia {key}"),
+            Ok(Err(e)) => tracing::error!("cannot re-consume commitment fascia {key}: {e}"),
+            Err(e) => tracing::error!("commitment fascia re-consume task failed for {key}: {e}"),
+        }
+    }
+    mark_replay_done();
+}
+
+// The unlock request wins, then the `[chain]` config section. There is no built-in default any
+// more, so an indexer that resolves from neither is a hard error rather than a silent fallback.
+fn resolve_indexer_url<'a>(
+    request: Option<&'a str>,
+    config: Option<&'a str>,
+) -> Result<&'a str, APIError> {
+    request.or(config).ok_or(APIError::MissingIndexerUrl)
+}
+
+/// Common startup resources. No Lightning backend or worker is created here.
+struct NodeStartup {
+    app_state: Arc<AppState>,
+    unlock_request: UnlockRequest,
+    internal_mnemonic: Option<rgb_lib::bdk_wallet::keys::bip39::Mnemonic>,
+    external_signer_mode: bool,
+    external_bootstrap: Option<crate::signer::BootstrapData>,
+    external_signer: Option<Arc<ExternalSigner>>,
+    external_node_id: Option<String>,
+    external_signer_link_watch: Option<Arc<crate::signer::transport::SignerLinkWatch>>,
+    kv_store: Arc<SyncedKvStore>,
+    indexer_url: String,
+    #[cfg(feature = "transaction-sync")]
+    indexer_protocol: rgb_lib::wallet::rust_only::IndexerProtocol,
+    proxy_endpoint: String,
+    #[cfg(feature = "vss")]
+    monitor_kv_store: Option<Arc<RemoteFirstKvStore>>,
+    #[cfg(feature = "vss")]
+    bp_local_kv_store: Arc<crate::kv_store::SeaOrmKvStore>,
+    #[cfg(feature = "vss")]
+    vss_identity: Option<VssIdentity>,
+    #[cfg(feature = "vss")]
+    vss_restored_keys: usize,
+    #[cfg(feature = "vss")]
+    fence_guard: Option<crate::vss_kv_store::FenceReleaseGuard>,
+}
+
+impl NodeStartup {
+    fn create_signer(&self) -> ActiveSignerRef {
+        let external_signer = &self.external_signer;
+        let internal_mnemonic = &self.internal_mnemonic;
+        let network: Network = self.app_state.static_state.network.into();
+        let ldk_data_dir_path = self.app_state.static_state.ldk_data_dir.clone();
+        let kv_store = &self.kv_store;
+        // LDK signing: internal mode uses `KeysManager` from the mnemonic-derived LDK seed (BIP32 child
+        // 535 of the master xpriv). External mode uses `ExternalSigner` only; inbound / peer_storage /
+        // receive_auth key material comes from bootstrap hex fields (see `ExternalSigner::from_attachment`).
+        let cur = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap();
+
+        let keys_manager: ActiveSignerRef = if let Some(s) = external_signer.as_ref() {
+            Arc::new(DynRlnSigner::from_external(Arc::clone(s)))
+        } else {
+            let mnemonic = internal_mnemonic
+                .as_ref()
+                .expect("internal mnemonic must be present when external signer is not configured");
+            let ldk_seed: [u8; 32] = {
+                let xkey: ExtendedKey = mnemonic
+                    .clone()
+                    .into_extended_key()
+                    .expect("a valid key should have been provided");
+                let master_xprv = &xkey
+                    .into_xprv(network.into())
+                    .expect("should be possible to get an extended private key");
+                let xprv: Xpriv = master_xprv
+                    .derive_priv(&Secp256k1_30::new(), &ChildNumber::Hardened { index: 535 })
+                    .unwrap();
+                xprv.private_key.secret_bytes()
+            };
+            let internal_keys_manager = Arc::new(KeysManager::new(
+                &ldk_seed,
+                cur.as_secs(),
+                cur.subsec_nanos(),
+                true,
+                ldk_data_dir_path.clone(),
+                Arc::clone(kv_store) as Arc<dyn KVStoreSync + Send + Sync>,
+            ));
+            Arc::new(DynRlnSigner::from_internal(internal_keys_manager))
+        };
+        keys_manager
+    }
+
+    async fn create_common_state(
+        &mut self,
+        signer: ActiveSignerRef,
+        entropy_source: Arc<dyn crate::signer::RlnEntropySource>,
+    ) -> Result<Arc<CommonState>, APIError> {
+        let static_state = &self.app_state.static_state;
+        let external_signer_mode = self.external_signer_mode;
+        let external_bootstrap = &self.external_bootstrap;
+        let internal_mnemonic = &self.internal_mnemonic;
+        let bitcoin_network = static_state.network;
+        let kv_store = &self.kv_store;
+        let indexer_url = &self.indexer_url;
+        let unlock_request = &self.unlock_request;
+        #[cfg(feature = "vss")]
+        let vss_identity = &self.vss_identity;
+        // Prepare the RGB wallet
+        let (account_xpub_vanilla, account_xpub_colored, master_fingerprint, rgb_wallet_mnemonic) =
+            if external_signer_mode {
+                let bootstrap = external_bootstrap.clone().ok_or_else(|| {
+                    APIError::ExternalSignerProtocolError(
+                        "missing external bootstrap in external mode".to_string(),
+                    )
+                })?;
+                (
+                    bootstrap.identity.account_xpub_vanilla,
+                    bootstrap.identity.account_xpub_colored,
+                    bootstrap.identity.master_fingerprint,
+                    None,
+                )
+            } else {
+                let mnemonic_str = internal_mnemonic
+                    .as_ref()
+                    .ok_or_else(|| {
+                        APIError::ExternalSignerProtocolError(
+                            "missing internal mnemonic in internal mode".to_string(),
+                        )
+                    })?
+                    .to_string();
+                let (_, account_xpub_vanilla, _) = get_account_data(
+                    &bitcoin_network,
+                    &mnemonic_str,
+                    false,
+                    WitnessVersion::Taproot,
+                )
+                .unwrap();
+                let (_, account_xpub_colored, master_fingerprint) = get_account_data(
+                    &bitcoin_network,
+                    &mnemonic_str,
+                    true,
+                    WitnessVersion::Taproot,
+                )
+                .unwrap();
+                (
+                    account_xpub_vanilla.to_string(),
+                    account_xpub_colored.to_string(),
+                    master_fingerprint.to_string(),
+                    Some(mnemonic_str.clone()),
+                )
+            };
+        let data_dir = static_state
+            .storage_dir_path
+            .clone()
+            .to_string_lossy()
+            .to_string();
+
+        // Pull the RGB wallet down from VSS before constructing it locally, when
+        // VSS is configured and the local wallet directory for this identity's
+        // fingerprint is absent. This wallet stream is shared by both network paths;
+        // Lightning KV recovery is separately restricted to supported networks.
+        #[cfg(feature = "vss")]
+        if let (Some(ref vss_url), Some(ref identity)) = (&static_state.vss_url, &vss_identity) {
+            let rgb_store_id = format!("{}_rgb", identity.pubkey_hex);
+            maybe_restore_rgb_from_vss(
+                vss_url,
+                rgb_store_id,
+                identity.signing_key,
+                &static_state.storage_dir_path,
+                &master_fingerprint.to_string(),
+                static_state.vss_allow_empty_restore,
+            )
+            .await?;
+        }
+
+        let keys = SinglesigKeys {
+            account_xpub_vanilla: account_xpub_vanilla.clone(),
+            account_xpub_colored: account_xpub_colored.clone(),
+            vanilla_keychain: None,
+            master_fingerprint: master_fingerprint.clone(),
+            mnemonic: rgb_wallet_mnemonic,
+            witness_version: WitnessVersion::Taproot,
+        };
+        let reuse_addresses = static_state.reuse_addresses;
+        let indexer_url_owned = indexer_url.to_string();
+        let eth_rpc_url = unlock_request
+            .eth_rpc_url
+            .clone()
+            .or_else(|| static_state.config.chain.eth_rpc_url.clone());
+        #[cfg(feature = "vss")]
+        let rgb_vss_backup = match (&static_state.vss_url, &vss_identity) {
+            (Some(vss_url), Some(identity)) => Some((
+                vss_url.clone(),
+                format!("{}_rgb", identity.pubkey_hex),
+                identity.signing_key,
+            )),
+            _ => None,
+        };
+        // go_online and configure_vss_backup drive blocking rgb-lib HTTP clients;
+        // run them off the async runtime so they don't fail on a single-vCPU host.
+        let (rgb_wallet, rgb_online) = tokio::task::spawn_blocking(move || {
+            let mut rgb_wallet = RgbLibWallet::new(
+                WalletData {
+                    data_dir,
+                    bitcoin_network,
+                    database_type: DatabaseType::Sqlite,
+                    max_allocations_per_utxo: 1,
+                    supported_schemas: supported_asset_schemas(
+                        bitcoin_network,
+                        eth_rpc_url.is_some(),
+                    ),
+                    reuse_addresses,
+                },
+                keys,
+            )
+            .expect("valid rgb-lib wallet");
+            let rgb_online = rgb_wallet.go_online(OnlineOptions {
+                indexer_url: indexer_url_owned,
+                skip_consistency_check: false,
+                vanilla_sync_lookback: 20,
+                eth_rpc_url,
+            })?;
+            #[cfg(feature = "vss")]
+            if let Some((vss_url, rgb_store_id, signing_key)) = rgb_vss_backup {
+                let vss_config =
+                    rgb_lib::wallet::vss::VssBackupConfig::new(vss_url, rgb_store_id, signing_key)
+                        .with_encryption(true)
+                        .with_auto_backup(true)
+                        .with_backup_mode(rgb_lib::wallet::vss::VssBackupMode::Blocking);
+                // Fail closed: a misconfigured backup must not silently run local-only.
+                rgb_wallet.configure_vss_backup(vss_config).map_err(|e| {
+                    APIError::FailedVssInit(format!(
+                        "Failed to configure VSS backup for RGB wallet: {e}"
+                    ))
+                })?;
+                tracing::info!("VSS auto-backup (blocking) enabled for RGB wallet");
+                // Auto-backup only tracks local changes; an empty remote (fresh
+                // wallet or wiped store) needs an explicit upload.
+                if let Some(client) = rgb_wallet.vss_client() {
+                    let rt = client.handle().clone();
+                    let info = rt
+                        .block_on(rgb_wallet.vss_backup_info(&client))
+                        .map_err(|e| APIError::FailedVssInit(format!("VSS backup info: {e}")))?;
+                    if !info.backup_exists {
+                        rt.block_on(rgb_wallet.vss_backup(&client)).map_err(|e| {
+                            APIError::FailedVssInit(format!("initial RGB VSS backup failed: {e}"))
+                        })?;
+                        tracing::info!("Uploaded RGB wallet backup to empty VSS store");
+                    }
+                }
+            }
+            Ok::<_, APIError>((rgb_wallet, rgb_online))
+        })
+        .await
+        .map_err(|e| APIError::Unexpected(format!("rgb-lib wallet setup task failed: {e}")))??;
+        save_config(
+            &static_state.db(),
+            kv_store.as_ref(),
+            CONFIG_WALLET_FINGERPRINT,
+            &master_fingerprint,
+        )?;
+        save_config(
+            &static_state.db(),
+            kv_store.as_ref(),
+            CONFIG_WALLET_ACCOUNT_XPUB_COLORED,
+            &account_xpub_colored,
+        )?;
+        save_config(
+            &static_state.db(),
+            kv_store.as_ref(),
+            CONFIG_WALLET_ACCOUNT_XPUB_VANILLA,
+            &account_xpub_vanilla,
+        )?;
+        save_config(
+            &static_state.db(),
+            kv_store.as_ref(),
+            CONFIG_WALLET_MASTER_FINGERPRINT,
+            &master_fingerprint,
+        )?;
+
+        // No second VssBackupClient is constructed here: the manual /vssbackup
+        // and /vssbackupinfo routes use the wallet's own client, retrievable via
+        // `wallet.vss_client()` (R-lib.1 in rgb-lib's PR #31). Keeping a single
+        // client per stream avoids running two tokio runtimes for the same
+        // backups and removes the race between the two clients writing
+        // overlapping state.
+        let rgb_wallet_wrapper = Arc::new(RgbLibWalletWrapper::new(
+            Arc::new(Mutex::new(rgb_wallet)),
+            rgb_online,
+        ));
+
+        let node_id = match self.external_node_id.as_deref() {
+            Some(node_id) => PublicKey::from_str(node_id).map_err(|error| {
+                APIError::ExternalSignerProtocolError(format!(
+                    "invalid bootstrap node identity: {error}"
+                ))
+            })?,
+            None => signer
+                .get_node_id(lightning::sign::Recipient::Node)
+                .map_err(|_| {
+                    APIError::Unexpected("failed to read signer node identity".to_string())
+                })?,
+        };
+        Ok(Arc::new(CommonState {
+            config: Arc::clone(&static_state.config),
+            signer,
+            entropy_source,
+            kv_store: Arc::clone(kv_store),
+            rgb_wallet_wrapper,
+            proxy_endpoint: self.proxy_endpoint.clone(),
+            external_signer_mode,
+            external_signer: self.external_signer.clone(),
+            external_node_id: self.external_node_id.clone(),
+            node_id,
+            indexer_url: self.indexer_url.clone(),
+            #[cfg(feature = "vss")]
+            persistence_shutdown: CancellationToken::new(),
+            #[cfg(feature = "vss")]
+            persistence_worker: Mutex::new(None),
+        }))
+    }
+}
+
+/// Unlock the common wallet/session, constructing Lightning only where supported.
+pub(crate) async fn start_node(
     app_state: Arc<AppState>,
     key_source: NodeKeySource,
     unlock_request: UnlockRequest,
-) -> Result<(LdkBackgroundServices, Arc<UnlockedAppState>), APIError> {
-    let gossip_source_config = unlock_request.gossip_source.clone().unwrap_or_default();
+) -> Result<(Option<LdkBackgroundServices>, Arc<UnlockedAppState>), APIError> {
+    if app_state.cancel_token.is_cancelled() {
+        return Err(APIError::Unexpected("Node is shutting down".to_string()));
+    }
+    #[allow(unused_mut)]
+    let mut setup = prepare_node(app_state, key_source, unlock_request).await?;
+    let result = if setup.app_state.static_state.network == BitcoinNetwork::Mainnet {
+        let common = setup
+            .create_common_state(setup.create_signer(), Arc::new(SystemEntropySource))
+            .await?;
+        #[cfg(feature = "vss")]
+        if let Some(guard) = setup.fence_guard.as_mut() {
+            guard.disarm();
+        }
+        (
+            None,
+            Arc::new(UnlockedAppState {
+                common,
+                lightning: None,
+            }),
+        )
+    } else {
+        start_lightning(setup).await?
+    };
+    #[cfg(feature = "vss")]
+    start_persistence_worker(&result.1.common);
+    Ok(result)
+}
+
+#[cfg(feature = "vss")]
+fn start_persistence_worker(common: &Arc<CommonState>) {
+    if !common.kv_store.has_remote() {
+        return;
+    }
+    let store = Arc::clone(&common.kv_store);
+    let shutdown = common.persistence_shutdown.clone();
+    let worker = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = interval.tick() => {}
+            }
+            let store = Arc::clone(&store);
+            if let Err(e) = tokio::task::spawn_blocking(move || store.drain_pending()).await {
+                tracing::error!(error = %e, "periodic VSS drain task failed");
+            }
+        }
+    });
+    *common.persistence_worker.lock().unwrap() = Some(worker);
+}
+
+async fn prepare_node(
+    app_state: Arc<AppState>,
+    key_source: NodeKeySource,
+    mut unlock_request: UnlockRequest,
+) -> Result<NodeStartup, APIError> {
     let static_state = &app_state.static_state;
+    let mainnet = static_state.network == BitcoinNetwork::Mainnet;
+
+    // Unlock request params take precedence, the config file provides defaults.
+    let file_config = &static_state.config;
+    unlock_request.proxy_endpoint = unlock_request
+        .proxy_endpoint
+        .or_else(|| file_config.chain.proxy_endpoint.clone());
+    unlock_request.announce_alias = unlock_request
+        .announce_alias
+        .or_else(|| file_config.node.announce_alias.clone());
+    if unlock_request.announce_addresses.is_empty() {
+        unlock_request.announce_addresses = file_config.node.announce_addresses.clone();
+    }
     let (
         internal_mnemonic,
         external_signer_mode,
         external_bootstrap,
         external_signer,
         external_node_id,
+        external_signer_link_watch,
     ) = match key_source {
-        NodeKeySource::InternalMnemonic(mnemonic) => (Some(mnemonic), false, None, None, None),
+        NodeKeySource::InternalMnemonic(mnemonic) => {
+            (Some(mnemonic), false, None, None, None, None)
+        }
         NodeKeySource::External(external) => {
+            // Grab this before the transport is wrapped into `ExternalSigner` below: `Some` only for
+            // transports that can genuinely go unreachable and recover (the remote-signer daemon
+            // link), `None` for e.g. an in-process uniffi signer that can never be unreachable.
+            let link_watch = external.signer_attachment.transport.link_watch();
             let signer = ExternalSigner::from_attachment(&external.signer_attachment)
                 .map_err(|e| APIError::ExternalSignerProtocolError(e.to_string()))?;
             let bootstrap = external.signer_attachment.bootstrap.clone();
@@ -3699,6 +5268,7 @@ pub(crate) async fn start_ldk(
                 Some(bootstrap),
                 Some(Arc::new(signer)),
                 external_node_id,
+                link_watch,
             )
         }
     };
@@ -3736,21 +5306,26 @@ pub(crate) async fn start_ldk(
         None
     };
 
-    // Monitors persist remote-first through `monitor_kv_store` (async, VSS-durable
-    // before ack); ChannelManager and aux state keep the local-first `kv_store`
-    // sync facade. Both share the same local DB and (when configured) VSS store.
+    // Monitors and the channel manager persist remote-first (VSS-durable before
+    // ack); aux state keeps the local-first `kv_store` sync facade. All share
+    // the same local DB and (when configured) VSS store.
+    #[cfg(feature = "vss")]
+    let bp_local_kv_store = Arc::clone(&local_kv_store);
     #[cfg(feature = "vss")]
     let mut fence_guard: Option<crate::vss_kv_store::FenceReleaseGuard> = None;
+    #[cfg(feature = "vss")]
+    let mut vss_restored_keys: usize = 0;
     #[cfg(feature = "vss")]
     let (kv_store, monitor_kv_store) = if let (Some(ref vss_url), Some(ref identity)) =
         (&static_state.vss_url, &vss_identity)
     {
         tracing::info!(store_id = %identity.pubkey_hex, "Initializing VSS KV store");
         let vss_kv_store = Arc::new(
-            crate::vss_kv_store::VssKvStore::new(
+            crate::vss_kv_store::VssKvStore::new_with_retry(
                 vss_url.clone(),
                 identity.pubkey_hex.clone(),
                 identity.signing_key,
+                &static_state.config.vss,
             )
             .map_err(|e| APIError::FailedVssInit(e.to_string()))?,
         );
@@ -3772,200 +5347,97 @@ pub(crate) async fn start_ldk(
             }
         }));
 
-        let monitor_kv_store = Arc::new(RemoteFirstKvStore::new(
-            Arc::clone(&local_kv_store),
-            Some(Arc::clone(&vss_kv_store)),
-        ));
-        let synced = Arc::new(SyncedKvStore::with_vss(local_kv_store, vss_kv_store));
+        let monitor_kv_store = (!mainnet).then(|| {
+            Arc::new(RemoteFirstKvStore::new(
+                Arc::clone(&local_kv_store),
+                Some(Arc::clone(&vss_kv_store)),
+            ))
+        });
+        // Mainnet retains old Lightning records without loading or replaying them. Only the
+        // existing common configuration mirrors may be changed or replicated by this session.
+        let synced = Arc::new(if mainnet {
+            SyncedKvStore::with_vss_common_config_only(local_kv_store, vss_kv_store)
+        } else {
+            SyncedKvStore::with_vss(local_kv_store, vss_kv_store)
+        });
 
-        // Auto-restore from VSS if local DB has no channel manager data.
-        // On failure: abort unlock unless --vss-allow-empty-restore was set.
-        // Starting a recovering node with empty local state can lose funds
-        // (no channel monitors → can't watch chain), so we refuse by default.
-        let has_local_data = synced
-            .read(
-                CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
-                CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
-                CHANNEL_MANAGER_PERSISTENCE_KEY,
-            )
-            .is_ok();
-        if !has_local_data {
-            match synced.restore_from_vss(false) {
-                Ok(0) => tracing::info!("No VSS backup data found, starting fresh"),
-                Ok(n) => tracing::info!(keys_restored = n, "Restored node KV state from VSS"),
-                Err(e) => {
-                    if static_state.vss_allow_empty_restore {
-                        tracing::warn!(
-                            error = %e,
-                            "VSS restore failed; starting fresh due to --vss-allow-empty-restore"
-                        );
-                    } else {
-                        return Err(APIError::FailedVssInit(format!(
-                            "VSS restore failed: {e}. Pass --vss-allow-empty-restore \
+        if !mainnet {
+            // Auto-restore from VSS if local DB has no channel manager data.
+            // On failure: abort unlock unless --vss-allow-empty-restore was set.
+            // Starting a recovering node with empty local state can lose funds
+            // (no channel monitors → can't watch chain), so we refuse by default.
+            let has_local_data = synced
+                .read(
+                    CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+                    CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+                    CHANNEL_MANAGER_PERSISTENCE_KEY,
+                )
+                .is_ok();
+            if !has_local_data {
+                match synced.restore_from_vss(false) {
+                    Ok(0) => tracing::info!("No VSS backup data found, starting fresh"),
+                    Ok(n) => {
+                        vss_restored_keys = n;
+                        tracing::info!(keys_restored = n, "Restored node KV state from VSS");
+                    }
+                    Err(e) => {
+                        if static_state.vss_allow_empty_restore {
+                            tracing::warn!(
+                                error = %e,
+                                "VSS restore failed; starting fresh due to --vss-allow-empty-restore"
+                            );
+                        } else {
+                            return Err(APIError::FailedVssInit(format!(
+                                "VSS restore failed: {e}. Pass --vss-allow-empty-restore \
                              to start with an empty local state instead (UNSAFE if \
                              you previously had active channels)."
-                        )));
+                            )));
+                        }
                     }
                 }
+            } else {
+                // Local state is authoritative: refill whatever the remote lacks
+                // (wiped or partial store) without overwriting what it holds.
+                synced.push_missing_to_vss().map_err(|e| {
+                    APIError::FailedVssInit(format!("VSS resync of local state failed: {e}"))
+                })?;
             }
         }
 
         (synced, monitor_kv_store)
     } else {
-        let monitor_kv_store = Arc::new(RemoteFirstKvStore::new(Arc::clone(&local_kv_store), None));
-        let synced = Arc::new(SyncedKvStore::local_only(local_kv_store));
+        let monitor_kv_store = (!mainnet)
+            .then(|| Arc::new(RemoteFirstKvStore::new(Arc::clone(&local_kv_store), None)));
+        let synced = Arc::new(if mainnet {
+            SyncedKvStore::local_common_config_only(local_kv_store)
+        } else {
+            SyncedKvStore::local_only(local_kv_store)
+        });
         (synced, monitor_kv_store)
     };
 
     #[cfg(not(feature = "vss"))]
-    let kv_store = Arc::new(SyncedKvStore::local_only(local_kv_store));
+    let kv_store = Arc::new(if mainnet {
+        SyncedKvStore::local_common_config_only(local_kv_store)
+    } else {
+        SyncedKvStore::local_only(local_kv_store)
+    });
 
     // Sync config from database to KVStore
     sync_config_to_kvstore(&static_state.db(), kv_store.as_ref())?;
 
-    let ldk_data_dir = static_state.ldk_data_dir.clone();
-    let ldk_data_dir_path = PathBuf::from(&ldk_data_dir);
-    let logger = static_state.logger.clone();
     let bitcoin_network = static_state.network;
-    let network: Network = bitcoin_network.into();
-    let ldk_peer_listening_port = static_state.ldk_peer_listening_port;
-
-    // Pick the chain backend from caller-provided inputs.
-    let chain_selection = select_chain_backend(&unlock_request, bitcoin_network)?;
-
-    // Bitcoind path retains the SpvClient/Listen flow; esplora path uses the
-    // EsploraSyncClient/Confirm flow. We populate the same locals from either
-    // branch so the rest of start_ldk is shared.
-    let bitcoind_client_opt: Option<Arc<BitcoindClient>>;
-    let tx_sync_opt: Option<Arc<EsploraSyncClient<Arc<FilesystemLogger>>>>;
-    let electrum_tx_sync_opt: Option<Arc<ElectrumSyncClient<Arc<FilesystemLogger>>>>;
-    let chain_source: Option<Arc<dyn Filter + Send + Sync>>;
-    let chain_backend: Arc<ChainBackend>;
-    let seed_best_block: BestBlock;
-    let polled_chain_tip_opt: Option<lightning_block_sync::poll::ValidatedBlockHeader>;
-
-    match chain_selection {
-        ChainBackendSelection::Bitcoind {
-            username,
-            password,
-            host,
-            port,
-        } => {
-            let client = match BitcoindClient::new(
-                host,
-                port,
-                username,
-                password,
-                tokio::runtime::Handle::current(),
-                Arc::clone(&logger),
-            )
-            .await
-            {
-                Ok(c) => Arc::new(c),
-                Err(e) => return Err(APIError::FailedBitcoindConnection(e.to_string())),
-            };
-            let bitcoind_chain = client.get_blockchain_info().await.chain;
-            if bitcoind_chain
-                != match bitcoin_network {
-                    BitcoinNetwork::Mainnet => "main",
-                    BitcoinNetwork::Testnet => "test",
-                    BitcoinNetwork::Testnet4 => "testnet4",
-                    BitcoinNetwork::Regtest => "regtest",
-                    BitcoinNetwork::Signet | BitcoinNetwork::SignetCustom => "signet",
-                }
-            {
-                return Err(APIError::NetworkMismatch(bitcoind_chain, bitcoin_network));
-            }
-            let polled = init::validate_best_block_header(client.as_ref())
-                .await
-                .expect("Failed to fetch best block header and best block");
-            seed_best_block = polled.to_best_block();
-            chain_backend = Arc::new(ChainBackend::Bitcoind(client.clone()));
-            bitcoind_client_opt = Some(client);
-            tx_sync_opt = None;
-            electrum_tx_sync_opt = None;
-            chain_source = None;
-            polled_chain_tip_opt = Some(polled);
-        }
-        ChainBackendSelection::Esplora { url } => {
-            let esplora = Arc::new(
-                EsploraIndexerClient::new(
-                    url.clone(),
-                    network,
-                    tokio::runtime::Handle::current(),
-                    Arc::clone(&logger),
-                )
-                .map_err(|e| APIError::InvalidIndexer(e.to_string()))?,
-            );
-            let tip_hash = esplora
-                .client
-                .get_tip_hash()
-                .map_err(|e| APIError::InvalidIndexer(e.to_string()))?;
-            let tip_height = esplora
-                .client
-                .get_height()
-                .map_err(|e| APIError::InvalidIndexer(e.to_string()))?;
-            let tx_sync = Arc::new(EsploraSyncClient::new(url, Arc::clone(&logger)));
-            seed_best_block = BestBlock::new(tip_hash, tip_height);
-            chain_backend = Arc::new(ChainBackend::Esplora(esplora));
-            chain_source = Some(Arc::clone(&tx_sync) as Arc<dyn Filter + Send + Sync>);
-            tx_sync_opt = Some(tx_sync);
-            electrum_tx_sync_opt = None;
-            bitcoind_client_opt = None;
-            polled_chain_tip_opt = None;
-        }
-        ChainBackendSelection::Electrum { url } => {
-            use electrum_client::ElectrumApi;
-            let electrum = Arc::new(
-                ElectrumIndexerClient::new(
-                    url.clone(),
-                    network,
-                    tokio::runtime::Handle::current(),
-                    Arc::clone(&logger),
-                )
-                .map_err(|e| APIError::InvalidIndexer(e.to_string()))?,
-            );
-            let tip = electrum
-                .client
-                .block_headers_subscribe()
-                .map_err(|e| APIError::InvalidIndexer(e.to_string()))?;
-            let tx_sync = Arc::new(
-                ElectrumSyncClient::new(url, Arc::clone(&logger))
-                    .map_err(|e| APIError::InvalidIndexer(e.to_string()))?,
-            );
-            seed_best_block = BestBlock::new(tip.header.block_hash(), tip.height as u32);
-            chain_backend = Arc::new(ChainBackend::Electrum(electrum));
-            chain_source = Some(Arc::clone(&tx_sync) as Arc<dyn Filter + Send + Sync>);
-            electrum_tx_sync_opt = Some(tx_sync);
-            tx_sync_opt = None;
-            bitcoind_client_opt = None;
-            polled_chain_tip_opt = None;
-        }
-    }
 
     // RGB setup
-    let indexer_url = if let Some(indexer_url) = &unlock_request.indexer_url {
-        let indexer_protocol = check_indexer_url(indexer_url, bitcoin_network)?;
-        tracing::info!(
-            "Connected to an indexer with the {} protocol",
-            indexer_protocol
-        );
-        indexer_url
-    } else {
-        tracing::info!("Using the default indexer");
-        match bitcoin_network {
-            BitcoinNetwork::Regtest => ELECTRUM_URL_REGTEST,
-            BitcoinNetwork::Signet => ELECTRUM_URL_SIGNET,
-            BitcoinNetwork::Testnet => ELECTRUM_URL_TESTNET,
-            BitcoinNetwork::Testnet4 => ELECTRUM_URL_TESTNET4,
-            BitcoinNetwork::Mainnet => ELECTRUM_URL_MAINNET,
-            BitcoinNetwork::SignetCustom => {
-                return Err(APIError::InvalidIndexer(s!(
-                    "with custom signet indexer must be provided"
-                )))
-            }
-        }
-    };
+    let indexer_url = resolve_indexer_url(
+        unlock_request.indexer_url.as_deref(),
+        static_state.config.chain.indexer_url.as_deref(),
+    )?;
+    let indexer_protocol = check_indexer_url(indexer_url, bitcoin_network)?;
+    tracing::info!(
+        "Connected to an indexer with the {} protocol",
+        indexer_protocol
+    );
     let proxy_endpoint = if let Some(proxy_endpoint) = &unlock_request.proxy_endpoint {
         check_rgb_proxy_endpoint(proxy_endpoint).await?;
         tracing::info!("Using a custom proxy");
@@ -3994,48 +5466,191 @@ pub(crate) async fn start_ldk(
         &bitcoin_network.to_string(),
     )?;
 
-    let fee_estimator = chain_backend.clone();
-    let broadcaster = chain_backend.clone();
+    let indexer_url = indexer_url.to_string();
+    let proxy_endpoint = proxy_endpoint.to_string();
+    Ok(NodeStartup {
+        app_state,
+        unlock_request,
+        internal_mnemonic,
+        external_signer_mode,
+        external_bootstrap,
+        external_signer,
+        external_node_id,
+        external_signer_link_watch,
+        kv_store,
+        indexer_url,
+        #[cfg(feature = "transaction-sync")]
+        indexer_protocol,
+        proxy_endpoint,
+        #[cfg(feature = "vss")]
+        monitor_kv_store,
+        #[cfg(feature = "vss")]
+        bp_local_kv_store,
+        #[cfg(feature = "vss")]
+        vss_identity,
+        #[cfg(feature = "vss")]
+        vss_restored_keys,
+        #[cfg(feature = "vss")]
+        fence_guard,
+    })
+}
 
-    // LDK signing: internal mode uses `KeysManager` from the mnemonic-derived LDK seed (BIP32 child
-    // 535 of the master xpriv). External mode uses `ExternalSigner` only; inbound / peer_storage /
-    // receive_auth key material comes from bootstrap hex fields (see `ExternalSigner::from_attachment`).
+async fn start_lightning(
+    #[allow(unused_mut)] mut setup: NodeStartup,
+) -> Result<(Option<LdkBackgroundServices>, Arc<UnlockedAppState>), APIError> {
+    // Defense in depth: no chain backend, manager or worker precedes this check.
+    setup.app_state.check_lightning_supported()?;
+    let app_state = Arc::clone(&setup.app_state);
+    let static_state = &app_state.static_state;
+    let unlock_request = setup.unlock_request.clone();
+    let gossip_source_config = unlock_request.gossip_source.clone().unwrap_or_default();
+    let kv_store = Arc::clone(&setup.kv_store);
+    let external_signer_mode = setup.external_signer_mode;
+    let internal_mnemonic = setup.internal_mnemonic.clone();
+    let external_bootstrap = setup.external_bootstrap.clone();
+    let external_signer = setup.external_signer.clone();
+    let external_signer_link_watch = setup.external_signer_link_watch.clone();
+    #[cfg(feature = "transaction-sync")]
+    let indexer_url = setup.indexer_url.as_str();
+    #[cfg(feature = "transaction-sync")]
+    let indexer_protocol = setup.indexer_protocol.clone();
+    let ldk_data_dir = static_state.ldk_data_dir.clone();
+    let ldk_data_dir_path = ldk_data_dir.clone();
+    let logger = Arc::clone(&static_state.logger);
+    let bitcoin_network = static_state.network;
+    let network: Network = bitcoin_network.into();
+    let ldk_peer_listening_port = static_state.ldk_peer_listening_port;
+    #[cfg(feature = "vss")]
+    let monitor_kv_store = setup.monitor_kv_store.clone().ok_or_else(|| {
+        APIError::Unexpected("Lightning monitor store is not available".to_string())
+    })?;
+    #[cfg(feature = "vss")]
+    let bp_local_kv_store = Arc::clone(&setup.bp_local_kv_store);
+    #[cfg(feature = "vss")]
+    let vss_restored_keys = setup.vss_restored_keys;
+    #[cfg(feature = "vss")]
+    let bp_kv_store: BpKvStore = Arc::new(crate::async_kv_store::BpKvStoreRouter::new(
+        Arc::clone(&monitor_kv_store),
+        bp_local_kv_store,
+        Arc::clone(&kv_store),
+    ));
+    #[cfg(not(feature = "vss"))]
+    let bp_kv_store: BpKvStore = KVStoreSyncWrapper(Arc::clone(&kv_store));
+
+    // Initialize the chain backend for the requested sync mode
+    let handle = tokio::runtime::Handle::current();
+    let ChainSetup {
+        backend,
+        fee_estimator,
+        broadcaster,
+        chain_filter,
+        initial_best_block,
+    } = match &unlock_request.ldk_chain_sync {
+        #[cfg(feature = "block-sync")]
+        LdkChainSync::BlockSync {
+            bitcoind_rpc_username,
+            bitcoind_rpc_password,
+            bitcoind_rpc_host,
+            bitcoind_rpc_port,
+        } => {
+            let bitcoind_client = match BitcoindClient::new(
+                bitcoind_rpc_host.clone(),
+                *bitcoind_rpc_port,
+                bitcoind_rpc_username.clone(),
+                bitcoind_rpc_password.clone(),
+                handle.clone(),
+                Arc::clone(&logger),
+                static_state.config.chain.fee_refresh_interval_secs,
+            )
+            .await
+            {
+                Ok(client) => Arc::new(client),
+                Err(e) => return Err(APIError::FailedBitcoindConnection(e.to_string())),
+            };
+
+            // Check that the bitcoind we've connected to is running the network we expect
+            let bitcoind_chain = bitcoind_client.get_blockchain_info().await.chain;
+            if bitcoind_chain
+                != match bitcoin_network {
+                    BitcoinNetwork::Mainnet => "main",
+                    BitcoinNetwork::Testnet => "test",
+                    BitcoinNetwork::Testnet4 => "testnet4",
+                    BitcoinNetwork::Regtest => "regtest",
+                    BitcoinNetwork::Signet | BitcoinNetwork::SignetCustom => "signet",
+                }
+            {
+                return Err(APIError::NetworkMismatch(bitcoind_chain, bitcoin_network));
+            }
+
+            // Poll for the best chain tip, used by the channel manager & spv client
+            let polled_chain_tip = init::validate_best_block_header(bitcoind_client.as_ref())
+                .await
+                .expect("Failed to fetch best block header and best block");
+            let initial_best_block = polled_chain_tip.to_best_block();
+
+            ChainSetup {
+                fee_estimator: bitcoind_client.clone(),
+                broadcaster: bitcoind_client.clone(),
+                backend: ChainBackend::BlockSync {
+                    client: bitcoind_client,
+                    polled_chain_tip,
+                },
+                chain_filter: None,
+                initial_best_block,
+            }
+        }
+        #[cfg(feature = "transaction-sync")]
+        LdkChainSync::TransactionSync {
+            indexer_url: ln_indexer_url,
+        } => {
+            // LDK can sync against a different indexer than the RGB wallet, but when the two
+            // match the URL has already been checked above
+            let ln_indexer_protocol = if ln_indexer_url == indexer_url {
+                indexer_protocol.clone()
+            } else {
+                check_indexer_url(ln_indexer_url, bitcoin_network)?
+            };
+            let indexer_client = Arc::new(
+                IndexerClient::new(
+                    ln_indexer_url.to_string(),
+                    ln_indexer_protocol.clone(),
+                    handle.clone(),
+                    Arc::clone(&logger),
+                    static_state.config.chain.indexer_timeout_secs,
+                    static_state.config.chain.fee_refresh_interval_secs,
+                )
+                .map_err(|e| APIError::InvalidIndexer(e.to_string()))?,
+            );
+            let tx_sync = Arc::new(
+                IndexerSyncClient::new(
+                    ln_indexer_url.to_string(),
+                    ln_indexer_protocol,
+                    Arc::clone(&logger),
+                )
+                .map_err(|e| APIError::InvalidIndexer(e.to_string()))?,
+            );
+            let initial_best_block = indexer_client
+                .get_best_block()
+                .map_err(|e| APIError::InvalidIndexer(e.to_string()))?;
+
+            let chain_filter: Arc<dyn Filter + Send + Sync> = tx_sync.clone();
+            ChainSetup {
+                fee_estimator: indexer_client.clone(),
+                broadcaster: indexer_client.clone(),
+                backend: ChainBackend::TransactionSync {
+                    client: indexer_client,
+                    tx_sync,
+                },
+                chain_filter: Some(chain_filter),
+                initial_best_block,
+            }
+        }
+    };
+
+    let keys_manager = setup.create_signer();
     let cur = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap();
-
-    let keys_manager: ActiveSignerRef = if let Some(s) = external_signer.as_ref() {
-        Arc::new(DynRlnSigner::from_external(Arc::clone(s)))
-    } else {
-        let mnemonic = internal_mnemonic
-            .as_ref()
-            .expect("internal mnemonic must be present when external signer is not configured");
-        let ldk_seed: [u8; 32] = {
-            let xkey: ExtendedKey = mnemonic
-                .clone()
-                .into_extended_key()
-                .expect("a valid key should have been provided");
-            let master_xprv = &xkey
-                .into_xprv(network.into())
-                .expect("should be possible to get an extended private key");
-            let xprv: Xpriv = master_xprv
-                .derive_priv(&Secp256k1_30::new(), &ChildNumber::Hardened { index: 535 })
-                .unwrap();
-            xprv.private_key.secret_bytes()
-        };
-        let internal_keys_manager = Arc::new(KeysManager::new(
-            &ldk_seed,
-            cur.as_secs(),
-            cur.subsec_nanos(),
-            true,
-            ldk_data_dir_path.clone(),
-            Arc::clone(&kv_store) as Arc<dyn KVStoreSync + Send + Sync>,
-        ));
-        Arc::new(DynRlnSigner::from_internal(internal_keys_manager))
-    };
-    // `entropy_source` (app APIs) and `ldk_entropy_source` (LDK wiring) always use OsRng.
-    // When LDK passes `keys_manager` as `EntropySource`, external `DynRlnSigner` delegates to
-    // `ExternalSigner` which uses the same system RNG — never the host `GetSecureRandomBytes` RPC.
     let entropy_source: Arc<dyn crate::signer::RlnEntropySource> = Arc::new(SystemEntropySource);
     let ldk_entropy_source = Arc::new(LightningEntropySource::new(Arc::clone(&entropy_source)));
 
@@ -4053,8 +5668,8 @@ pub(crate) async fn start_ldk(
             1000,
             Arc::clone(&keys_manager),
             Arc::clone(&keys_manager),
-            Arc::clone(&chain_backend),
-            Arc::clone(&chain_backend),
+            Arc::clone(&broadcaster),
+            Arc::clone(&fee_estimator),
         );
         // Read before moving the persister into the ChainMonitor.
         let channelmonitors = persister
@@ -4062,7 +5677,7 @@ pub(crate) async fn start_ldk(
             .await
             .unwrap();
         let chain_monitor = Arc::new(chainmonitor::ChainMonitor::new_async_beta(
-            chain_source.clone(),
+            chain_filter.clone(),
             Arc::clone(&broadcaster),
             Arc::clone(&logger),
             Arc::clone(&fee_estimator),
@@ -4084,12 +5699,12 @@ pub(crate) async fn start_ldk(
             1000,
             Arc::clone(&keys_manager),
             Arc::clone(&keys_manager),
-            Arc::clone(&chain_backend),
-            Arc::clone(&chain_backend),
+            Arc::clone(&broadcaster),
+            Arc::clone(&fee_estimator),
         ));
         let peer_storage_signer = Arc::clone(&keys_manager);
         let chain_monitor = Arc::new(chainmonitor::ChainMonitor::new_with_peer_storage_encryptor(
-            chain_source.clone(),
+            chain_filter.clone(),
             Arc::clone(&broadcaster),
             Arc::clone(&logger),
             Arc::clone(&fee_estimator),
@@ -4133,22 +5748,40 @@ pub(crate) async fn start_ldk(
     ));
 
     // Initialize the ChannelManager
+    let channels_config = &static_state.config.channels;
     let mut user_config = UserConfig::default();
     user_config
         .channel_handshake_limits
         .force_announced_channel_preference = false;
+    user_config.channel_handshake_limits.their_to_self_delay = channels_config.their_to_self_delay;
+    user_config.channel_handshake_limits.max_minimum_depth = channels_config.max_minimum_depth;
     user_config
         .channel_handshake_config
         .negotiate_anchors_zero_fee_htlc_tx = true;
-    user_config.accept_forwards_to_priv_channels = static_state.enable_virtual_channels_v0;
+    user_config.channel_handshake_config.our_to_self_delay = channels_config.our_to_self_delay;
+    user_config
+        .channel_handshake_config
+        .max_inbound_htlc_value_in_flight_percent_of_channel =
+        channels_config.max_inbound_htlc_value_in_flight_percent;
+    user_config.channel_handshake_config.our_max_accepted_htlcs =
+        channels_config.our_max_accepted_htlcs;
+    user_config.channel_config = channels_config.channel_config();
+    // virtual channels are unannounced, so they require private forwarding
+    user_config.accept_forwards_to_priv_channels =
+        channels_config.accept_forwards_to_priv_channels || static_state.enable_virtual_channels_v0;
     user_config.manually_accept_inbound_channels = true;
-    let mut restarting_node = true;
+    let persisted_manager = kv_store.read(
+        CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+        CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+        CHANNEL_MANAGER_PERSISTENCE_KEY,
+    );
+    // `restarting_node` and `channel_manager_blockhash` are only consumed by the block-sync
+    // restart path
+    #[cfg_attr(not(feature = "block-sync"), allow(unused_variables))]
+    let restarting_node = persisted_manager.is_ok();
+    #[cfg_attr(not(feature = "block-sync"), allow(unused_variables))]
     let (channel_manager_blockhash, channel_manager) = {
-        match kv_store.read(
-            CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
-            CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
-            CHANNEL_MANAGER_PERSISTENCE_KEY,
-        ) {
+        match persisted_manager {
             Ok(bytes) => {
                 let mut channel_monitor_references = Vec::new();
                 for (_, channel_monitor) in channelmonitors.iter() {
@@ -4169,13 +5802,20 @@ pub(crate) async fn start_ldk(
                     ldk_data_dir_path.clone(),
                     Arc::clone(&kv_store) as Arc<dyn KVStoreSync + Send + Sync>,
                 );
-                <(BlockHash, ChannelManager)>::read(&mut &bytes[..], read_args).unwrap()
+                match <(BlockHash, ChannelManager)>::read(&mut &bytes[..], read_args) {
+                    Ok(read) => read,
+                    Err(e) => {
+                        return Err(APIError::FailedLoadingChannelState(format!(
+                            "cannot deserialize the channel manager ({e:?}); the persisted \
+                             channel state is incomplete or incompatible, a missing channel \
+                             monitor is the most common cause (see the LDK logs)"
+                        )))
+                    }
+                }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 // We're starting a fresh node.
-                restarting_node = false;
-
-                let polled_best_block = seed_best_block;
+                let polled_best_block = initial_best_block;
                 let polled_best_block_hash = polled_best_block.block_hash;
                 let chain_params = ChainParameters {
                     network,
@@ -4205,168 +5845,59 @@ pub(crate) async fn start_ldk(
         }
     };
 
-    // Prepare the RGB wallet
-    let (account_xpub_vanilla, account_xpub_colored, master_fingerprint, rgb_wallet_mnemonic) =
-        if external_signer_mode {
-            let bootstrap = external_bootstrap.clone().ok_or_else(|| {
-                APIError::ExternalSignerProtocolError(
-                    "missing external bootstrap in external mode".to_string(),
-                )
-            })?;
-            (
-                bootstrap.identity.account_xpub_vanilla,
-                bootstrap.identity.account_xpub_colored,
-                bootstrap.identity.master_fingerprint,
-                None,
-            )
-        } else {
-            let mnemonic_str = internal_mnemonic
-                .as_ref()
-                .ok_or_else(|| {
-                    APIError::ExternalSignerProtocolError(
-                        "missing internal mnemonic in internal mode".to_string(),
-                    )
-                })?
-                .to_string();
-            let (_, account_xpub_vanilla, _) = get_account_data(
-                &bitcoin_network,
-                &mnemonic_str,
-                false,
-                WitnessVersion::Taproot,
-            )
-            .unwrap();
-            let (_, account_xpub_colored, master_fingerprint) = get_account_data(
-                &bitcoin_network,
-                &mnemonic_str,
-                true,
-                WitnessVersion::Taproot,
-            )
-            .unwrap();
-            (
-                account_xpub_vanilla.to_string(),
-                account_xpub_colored.to_string(),
-                master_fingerprint.to_string(),
-                Some(mnemonic_str.clone()),
-            )
-        };
-    let data_dir = static_state
-        .storage_dir_path
-        .clone()
-        .to_string_lossy()
-        .to_string();
-
-    // Pull the RGB wallet down from VSS before constructing it locally, when
-    // VSS is configured and the local wallet directory for this mnemonic's
-    // fingerprint is absent. Mirrors the KV-side auto-restore at the top of
-    // this function — together they make `unlock` recover the full node
-    // state (channels + assets + on-chain) on a fresh device.
+    // A restored manager lagging a still-open monitor (it reports
+    // `Balance::ClaimableOnChannelClose`) would force-close on load; refuse
+    // before anything watches monitors or broadcasts.
     #[cfg(feature = "vss")]
-    if let (Some(ref vss_url), Some(ref identity)) = (&static_state.vss_url, &vss_identity) {
-        let rgb_store_id = format!("{}_rgb", identity.pubkey_hex);
-        maybe_restore_rgb_from_vss(
-            vss_url,
-            rgb_store_id,
-            identity.signing_key,
-            &static_state.storage_dir_path,
-            &master_fingerprint.to_string(),
-            static_state.vss_allow_empty_restore,
-        )
-        .await?;
+    if vss_restored_keys > 0 {
+        use lightning::chain::channelmonitor::Balance;
+        let manager_channel_ids: HashSet<ChannelId> = channel_manager
+            .list_channels()
+            .iter()
+            .map(|c| c.channel_id)
+            .collect();
+        let lost_channels: Vec<String> = channelmonitors
+            .iter()
+            .filter(|(_, m)| !manager_channel_ids.contains(&m.channel_id()))
+            .filter(|(_, m)| {
+                m.get_claimable_balances()
+                    .iter()
+                    .any(|b| matches!(b, Balance::ClaimableOnChannelClose { .. }))
+            })
+            .map(|(_, m)| m.channel_id().to_string())
+            .collect();
+        if !lost_channels.is_empty() {
+            if static_state.vss_allow_empty_restore {
+                tracing::warn!(
+                    channels = ?lost_channels,
+                    "restored channel manager lags the restored monitors; proceeding due to \
+                     --vss-allow-empty-restore — these channels WILL be force-closed"
+                );
+            } else {
+                // Drop the restored manager so the next unlock re-runs restore + guard.
+                if let Err(e) = kv_store.remove_local_only(
+                    CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+                    CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+                    CHANNEL_MANAGER_PERSISTENCE_KEY,
+                ) {
+                    tracing::warn!(error = %e, "failed to drop restored channel manager key");
+                }
+                return Err(APIError::FailedVssInit(format!(
+                    "VSS restore is inconsistent: the restored channel manager does not know \
+                     channel(s) {lost_channels:?} that the restored channel monitors consider \
+                     open. Unlocking would force-close them. Pass --vss-allow-empty-restore \
+                     to proceed anyway and accept the force-close."
+                )));
+            }
+        }
     }
 
-    let keys = SinglesigKeys {
-        account_xpub_vanilla: account_xpub_vanilla.clone(),
-        account_xpub_colored: account_xpub_colored.clone(),
-        vanilla_keychain: None,
-        master_fingerprint: master_fingerprint.clone(),
-        mnemonic: rgb_wallet_mnemonic,
-        witness_version: WitnessVersion::Taproot,
-    };
-    let reuse_addresses = static_state.reuse_addresses;
-    let indexer_url_owned = indexer_url.to_string();
-    #[cfg(feature = "vss")]
-    let rgb_vss_backup = match (&static_state.vss_url, &vss_identity) {
-        (Some(vss_url), Some(identity)) => Some((
-            vss_url.clone(),
-            format!("{}_rgb", identity.pubkey_hex),
-            identity.signing_key,
-        )),
-        _ => None,
-    };
-    // go_online and configure_vss_backup drive blocking rgb-lib HTTP clients;
-    // run them off the async runtime so they don't fail on a single-vCPU host.
-    let (rgb_wallet, rgb_online) = tokio::task::spawn_blocking(move || {
-        let mut rgb_wallet = RgbLibWallet::new(
-            WalletData {
-                data_dir,
-                bitcoin_network,
-                database_type: DatabaseType::Sqlite,
-                max_allocations_per_utxo: 1,
-                supported_schemas: supported_asset_schemas(bitcoin_network),
-                reuse_addresses,
-            },
-            keys,
-        )
-        .expect("valid rgb-lib wallet");
-        let rgb_online = rgb_wallet.go_online(OnlineOptions {
-            indexer_url: indexer_url_owned,
-            skip_consistency_check: false,
-            vanilla_sync_lookback: 20,
-        })?;
-        #[cfg(feature = "vss")]
-        if let Some((vss_url, rgb_store_id, signing_key)) = rgb_vss_backup {
-            let vss_config =
-                rgb_lib::wallet::vss::VssBackupConfig::new(vss_url, rgb_store_id, signing_key)
-                    .with_encryption(true)
-                    .with_auto_backup(true)
-                    .with_backup_mode(rgb_lib::wallet::vss::VssBackupMode::Blocking);
-            // Fail closed: a misconfigured backup must not silently run local-only.
-            rgb_wallet.configure_vss_backup(vss_config).map_err(|e| {
-                APIError::FailedVssInit(format!(
-                    "Failed to configure VSS backup for RGB wallet: {e}"
-                ))
-            })?;
-            tracing::info!("VSS auto-backup (blocking) enabled for RGB wallet");
-        }
-        Ok::<_, APIError>((rgb_wallet, rgb_online))
-    })
-    .await
-    .map_err(|e| APIError::Unexpected(format!("rgb-lib wallet setup task failed: {e}")))??;
-    save_config(
-        &static_state.db(),
-        kv_store.as_ref(),
-        CONFIG_WALLET_FINGERPRINT,
-        &master_fingerprint,
-    )?;
-    save_config(
-        &static_state.db(),
-        kv_store.as_ref(),
-        CONFIG_WALLET_ACCOUNT_XPUB_COLORED,
-        &account_xpub_colored,
-    )?;
-    save_config(
-        &static_state.db(),
-        kv_store.as_ref(),
-        CONFIG_WALLET_ACCOUNT_XPUB_VANILLA,
-        &account_xpub_vanilla,
-    )?;
-    save_config(
-        &static_state.db(),
-        kv_store.as_ref(),
-        CONFIG_WALLET_MASTER_FINGERPRINT,
-        &master_fingerprint,
-    )?;
+    let common = setup
+        .create_common_state(keys_manager.clone(), entropy_source)
+        .await?;
+    let rgb_wallet_wrapper = Arc::clone(&common.rgb_wallet_wrapper);
 
-    // No second VssBackupClient is constructed here: the manual /vssbackup
-    // and /vssbackupinfo routes use the wallet's own client, retrievable via
-    // `wallet.vss_client()` (R-lib.1 in rgb-lib's PR #31). Keeping a single
-    // client per stream avoids running two tokio runtimes for the same
-    // backups and removes the race between the two clients writing
-    // overlapping state.
-    let rgb_wallet_wrapper = Arc::new(RgbLibWalletWrapper::new(
-        Arc::new(Mutex::new(rgb_wallet)),
-        rgb_online,
-    ));
+    reimport_funding_consignments(&rgb_wallet_wrapper, &kv_store, &ldk_data_dir).await;
 
     // Initialize the OutputSweeper.
     let txes: OutputSpenderTxes = match kv_store.read("", "", OUTPUT_SPENDER_TXES_KEY) {
@@ -4383,8 +5914,10 @@ pub(crate) async fn start_ldk(
         signer: signer_for_output_spender,
         kv_store: kv_store.clone(),
         txes,
-        proxy_endpoint: proxy_endpoint.to_string(),
+        sweep_recipients: Arc::new(Mutex::new(HashMap::new())),
     });
+    // `sweeper_best_block` is only used by the block-sync restart path.
+    #[cfg_attr(not(feature = "block-sync"), allow(unused_variables))]
     let (sweeper_best_block, output_sweeper) = match kv_store.read(
         OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE,
         OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE,
@@ -4395,10 +5928,10 @@ pub(crate) async fn start_ldk(
                 channel_manager.current_best_block(),
                 broadcaster.clone(),
                 fee_estimator.clone(),
-                chain_source.clone(),
+                chain_filter.clone(),
                 rgb_output_spender,
                 rgb_wallet_wrapper.clone(),
-                KVStoreSyncWrapper(kv_store.clone()),
+                Clone::clone(&bp_kv_store),
                 logger.clone(),
             );
             (channel_manager.current_best_block(), sweeper)
@@ -4407,10 +5940,10 @@ pub(crate) async fn start_ldk(
             let read_args = (
                 broadcaster.clone(),
                 fee_estimator.clone(),
-                chain_source.clone(),
+                chain_filter.clone(),
                 rgb_output_spender.clone(),
                 rgb_wallet_wrapper.clone(),
-                KVStoreSyncWrapper(kv_store.clone()),
+                Clone::clone(&bp_kv_store),
                 logger.clone(),
             );
             let mut reader = io::Cursor::new(&mut bytes);
@@ -4421,10 +5954,16 @@ pub(crate) async fn start_ldk(
     };
 
     // Sync ChannelMonitors, ChannelManager and OutputSweeper to chain tip.
-    // For bitcoind we drive Listen via synchronize_listeners + SpvClient. For
-    // esplora we'll drive Confirm via EsploraSyncClient::sync below.
+    // block-sync replays blocks from bitcoind before the SPV client takes over, while
+    // transaction-sync relies on the indexer via the `Confirm` interface.
     let mut chain_listener_channel_monitors = Vec::new();
-    let mut cache = UnboundedCache::new();
+    #[cfg(feature = "block-sync")]
+    let mut block_sync_cache = UnboundedCache::new();
+    // with only block-sync built this is always set below, hence the allow
+    #[cfg(feature = "block-sync")]
+    #[cfg_attr(not(feature = "transaction-sync"), allow(unused_assignments))]
+    let mut block_sync_chain_tip: Option<lightning_block_sync::poll::ValidatedBlockHeader> = None;
+
     for (blockhash, channel_monitor) in channelmonitors.drain(..) {
         let outpoint = channel_monitor.get_funding_txo();
         chain_listener_channel_monitors.push((
@@ -4438,10 +5977,13 @@ pub(crate) async fn start_ldk(
             outpoint,
         ));
     }
-    let chain_tip_opt: Option<lightning_block_sync::poll::ValidatedBlockHeader> =
-        if let Some(bc) = bitcoind_client_opt.as_ref() {
-            let polled_chain_tip =
-                polled_chain_tip_opt.expect("bitcoind branch populates polled_chain_tip_opt");
+
+    match &backend {
+        #[cfg(feature = "block-sync")]
+        ChainBackend::BlockSync {
+            client,
+            polled_chain_tip,
+        } => {
             let chain_tip = if restarting_node {
                 let mut chain_listeners = vec![
                     (
@@ -4462,9 +6004,9 @@ pub(crate) async fn start_ldk(
                 let mut attempts = 3;
                 loop {
                     match init::synchronize_listeners(
-                        bc.as_ref(),
+                        client.as_ref(),
                         network,
-                        &mut cache,
+                        &mut block_sync_cache,
                         chain_listeners.clone(),
                     )
                     .await
@@ -4483,12 +6025,13 @@ pub(crate) async fn start_ldk(
                     }
                 }
             } else {
-                polled_chain_tip
+                *polled_chain_tip
             };
-            Some(chain_tip)
-        } else {
-            None
-        };
+            block_sync_chain_tip = Some(chain_tip);
+        }
+        #[cfg(feature = "transaction-sync")]
+        ChainBackend::TransactionSync { .. } => {}
+    }
 
     // Give ChannelMonitors to ChainMonitor
     for (_, (channel_monitor, _, _, _), _) in chain_listener_channel_monitors {
@@ -4513,6 +6056,14 @@ pub(crate) async fn start_ldk(
                 latest_sync_timestamp,
                 Arc::clone(&network_graph),
                 Arc::clone(&logger),
+                crate::gossip::RgsTuning {
+                    connect_timeout_secs: static_state.config.gossip.rgs_connect_timeout_secs,
+                    sync_timeout_secs: static_state.config.gossip.rgs_sync_timeout_secs,
+                    snapshot_max_size: (static_state.config.gossip.rgs_snapshot_max_size_mb
+                        as usize)
+                        * 1024
+                        * 1024,
+                },
             )
         }
     });
@@ -4567,13 +6118,31 @@ pub(crate) async fn start_ldk(
     let live_channel_access = Arc::new(LiveChannelAccess::new(channel_manager.clone()));
     let async_order_handler = match static_state.lsp_base_url.as_ref() {
         Some(lsp_base_url) => Arc::new(AsyncOrderMessageHandler::new_with_lsp_client(
-            live_channel_access,
+            live_channel_access.clone(),
             lsp_base_url.clone(),
             static_state.lsp_bearer_token.clone(),
             Handle::current(),
+            static_state.config.lsp.request_timeout_secs,
         )),
-        None => Arc::new(AsyncOrderMessageHandler::new(live_channel_access)),
+        None => Arc::new(AsyncOrderMessageHandler::new(live_channel_access.clone())),
     };
+    let asset_link_handler = Arc::new(AssetLinkMessageHandler::new(live_channel_access));
+    let max_aggregated_media_size_per_channel_mb =
+        static_state.max_aggregated_media_size_per_channel_mb as usize * 1024 * 1024;
+    let rgb_file_transfer_handler: Arc<RgbFileTransferHandler> =
+        Arc::new(RgbFileTransferHandler::new(
+            ldk_data_dir_path.clone(),
+            Arc::clone(&channel_manager) as Arc<dyn PeerChannelGate>,
+            static_state.max_pending_consignments,
+            max_aggregated_media_size_per_channel_mb,
+            static_state.max_media_files_per_channel,
+        ));
+    rgb_file_transfer_handler.cleanup_orphans_from_previous_run();
+    let custom_messenger = Arc::new(CustomMessenger {
+        async_order: Arc::clone(&async_order_handler),
+        asset_link: Arc::clone(&asset_link_handler),
+        rgb_file_transfer: Arc::clone(&rgb_file_transfer_handler),
+    });
     let async_payments_preimage_root = Arc::new(
         match internal_mnemonic.as_ref() {
             Some(mnemonic) => AsyncPaymentsPreimageRoot::build_from_mnemonic(
@@ -4600,7 +6169,7 @@ pub(crate) async fn start_ldk(
         chan_handler: channel_manager.clone(),
         route_handler: Arc::clone(&route_handler),
         onion_message_handler: onion_messenger.clone(),
-        custom_message_handler: Arc::clone(&async_order_handler),
+        custom_message_handler: Arc::clone(&custom_messenger),
         send_only_message_handler: Arc::clone(&chain_monitor),
     };
     let peer_manager: Arc<PeerManager> = Arc::new(PeerManager::new(
@@ -4611,17 +6180,29 @@ pub(crate) async fn start_ldk(
         Arc::clone(&keys_manager),
     ));
 
-    // GossipVerifier needs both bitcoind (UtxoSource) and P2P gossip mode.
-    // On esplora/electrum or RGS modes the UtxoLookup stays unset — gossip
-    // routing still works but channel-announcement UTXOs aren't verified P2P.
-    if let (Some(bc), Some(p2p)) = (bitcoind_client_opt.as_ref(), &p2p_gossip_sync_for_verifier) {
-        let utxo_lookup = GossipVerifier::new(
-            Arc::clone(&bc.bitcoind_rpc_client),
-            TokioSpawner,
-            Arc::clone(p2p),
-            Arc::clone(&peer_manager),
-        );
-        p2p.add_utxo_lookup(Some(Arc::new(utxo_lookup)));
+    // The UTXO lookup can only attach to a P2P sync; RGS mode skips it. Both chain backends
+    // provide a verifier, so announcements are checked whatever the sync mode is.
+    if let Some(p2p) = &p2p_gossip_sync_for_verifier {
+        let peer_manager_wake = Arc::new({
+            let peer_manager = Arc::clone(&peer_manager);
+            move || peer_manager.process_events()
+        });
+        let utxo_lookup: Arc<dyn UtxoLookup + Send + Sync> = match &backend {
+            #[cfg(feature = "block-sync")]
+            ChainBackend::BlockSync { client, .. } => Arc::new(BlockSyncGossipVerifier::new(
+                Arc::clone(&client.bitcoind_rpc_client),
+                Arc::clone(p2p),
+                peer_manager_wake,
+                handle.clone(),
+            )),
+            #[cfg(feature = "transaction-sync")]
+            ChainBackend::TransactionSync { client, .. } => Arc::new(IndexerGossipVerifier::new(
+                Arc::clone(client),
+                Arc::clone(p2p),
+                peer_manager_wake,
+            )),
+        };
+        p2p.add_utxo_lookup(Some(utxo_lookup));
     }
 
     // ## Running LDK
@@ -4632,9 +6213,13 @@ pub(crate) async fn start_ldk(
     let stop_processing = Arc::new(AtomicBool::new(false));
     let stop_listen = Arc::clone(&stop_processing);
     tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind(format!("[::]:{listening_port}"))
-            .await
-            .expect("Failed to bind to listen port - is something else already listening on it?");
+        // Dual-stack when available; hosts with IPv6 disabled fall back to IPv4.
+        let listener = crate::utils::bind_first_available(&[
+            format!("[::]:{listening_port}"),
+            format!("0.0.0.0:{listening_port}"),
+        ])
+        .await
+        .expect("Failed to bind to listen port - is something else already listening on it?");
         loop {
             let peer_mgr = peer_manager_connection_handler.clone();
             let tcp_stream = listener.accept().await.unwrap().0;
@@ -4654,75 +6239,57 @@ pub(crate) async fn start_ldk(
     // Connect and Disconnect Blocks
     let output_sweeper: Arc<OutputSweeper> = Arc::new(output_sweeper);
     let stop_listen = Arc::clone(&stop_processing);
-    if let Some(bitcoind_client) = bitcoind_client_opt.clone() {
-        let chain_tip = chain_tip_opt.expect("bitcoind branch populates chain_tip_opt");
-        let channel_manager_listener = channel_manager.clone();
-        let chain_monitor_listener = chain_monitor.clone();
-        let output_sweeper_listener = output_sweeper.clone();
-        let bitcoind_block_source = bitcoind_client.clone();
-        tokio::spawn(async move {
-            let chain_poller = poll::ChainPoller::new(bitcoind_block_source.as_ref(), network);
-            let chain_listener = (
-                chain_monitor_listener,
-                &(channel_manager_listener, output_sweeper_listener),
-            );
-            let mut spv_client =
-                SpvClient::new(chain_tip, chain_poller, &mut cache, &chain_listener);
-            loop {
-                if stop_listen.load(Ordering::Acquire) {
-                    return;
+    match backend {
+        #[cfg(feature = "block-sync")]
+        ChainBackend::BlockSync { client, .. } => {
+            let channel_manager_listener = channel_manager.clone();
+            let chain_monitor_listener = chain_monitor.clone();
+            let output_sweeper_listener = output_sweeper.clone();
+            let chain_tip =
+                block_sync_chain_tip.expect("block-sync chain tip is set while syncing listeners");
+            let mut cache = block_sync_cache;
+            tokio::spawn(async move {
+                let chain_poller = poll::ChainPoller::new(client.as_ref(), network);
+                let chain_listener = (
+                    chain_monitor_listener,
+                    &(channel_manager_listener, output_sweeper_listener),
+                );
+                let mut spv_client =
+                    SpvClient::new(chain_tip, chain_poller, &mut cache, &chain_listener);
+                loop {
+                    if stop_listen.load(Ordering::Acquire) {
+                        return;
+                    }
+                    if let Err(e) = spv_client.poll_best_tip().await {
+                        tracing::error!("Error while polling best tip: {:?}", e);
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
-                if let Err(e) = spv_client.poll_best_tip().await {
-                    tracing::error!("Error while polling best tip: {:?}", e);
+            });
+        }
+        #[cfg(feature = "transaction-sync")]
+        ChainBackend::TransactionSync { tx_sync, .. } => {
+            let confirmables: Vec<Arc<dyn Confirm + Send + Sync>> = vec![
+                channel_manager.clone(),
+                chain_monitor.clone(),
+                output_sweeper.clone(),
+            ];
+            // bring everything up to the current tip before starting to serve
+            sync_chain_data(tx_sync.clone(), confirmables.clone())
+                .await
+                .map_err(|e| APIError::InvalidIndexer(e.to_string()))?;
+            tokio::spawn(async move {
+                loop {
+                    if stop_listen.load(Ordering::Acquire) {
+                        return;
+                    }
+                    if let Err(e) = sync_chain_data(tx_sync.clone(), confirmables.clone()).await {
+                        tracing::error!("Error while syncing via indexer: {:?}", e);
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        });
-    } else if let Some(tx_sync) = tx_sync_opt.clone() {
-        let confirmables: Vec<Arc<dyn Confirm + Send + Sync>> = vec![
-            channel_manager.clone(),
-            chain_monitor.clone(),
-            output_sweeper.clone(),
-        ];
-        sync_chain_data(tx_sync.clone(), confirmables.clone())
-            .await
-            .map_err(|e| APIError::InvalidIndexer(e.to_string()))?;
-        tokio::spawn(async move {
-            loop {
-                if stop_listen.load(Ordering::Acquire) {
-                    return;
-                }
-                if let Err(e) = sync_chain_data(tx_sync.clone(), confirmables.clone()).await {
-                    tracing::error!("Error while syncing via esplora: {:?}", e);
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        });
-    } else {
-        let tx_sync = electrum_tx_sync_opt
-            .clone()
-            .expect("electrum branch populates electrum_tx_sync_opt");
-        let confirmables: Vec<Arc<dyn Confirm + Send + Sync>> = vec![
-            channel_manager.clone(),
-            chain_monitor.clone(),
-            output_sweeper.clone(),
-        ];
-        sync_chain_data_electrum(tx_sync.clone(), confirmables.clone())
-            .await
-            .map_err(|e| APIError::InvalidIndexer(e.to_string()))?;
-        tokio::spawn(async move {
-            loop {
-                if stop_listen.load(Ordering::Acquire) {
-                    return;
-                }
-                if let Err(e) =
-                    sync_chain_data_electrum(tx_sync.clone(), confirmables.clone()).await
-                {
-                    tracing::error!("Error while syncing via electrum: {:?}", e);
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        });
+            });
+        }
     }
 
     // Read payment info from KVStore
@@ -4827,8 +6394,8 @@ pub(crate) async fn start_ldk(
         Arc::clone(&logger),
     ));
 
-    // Persist ChannelManager and NetworkGraph
-    let persister = KVStoreSyncWrapper(Arc::clone(&kv_store));
+    // Persist ChannelManager (remote-first with VSS), NetworkGraph and scorer.
+    let persister = Clone::clone(&bp_kv_store);
 
     // Read swaps info from KVStore
     let maker_swaps = Arc::new(Mutex::new({
@@ -4908,6 +6475,7 @@ pub(crate) async fn start_ldk(
     }
 
     async_order_handler.set_invoice_provider(Arc::new(AsyncOrderRecipientInvoiceProvider {
+        config: static_state.config.clone(),
         channel_manager: Arc::clone(&channel_manager),
         inbound_payments: Arc::clone(&inbound_payments),
         async_payments_preimage_root: Arc::clone(&async_payments_preimage_root),
@@ -4917,35 +6485,39 @@ pub(crate) async fn start_ldk(
         external_signer: external_signer.clone(),
     }));
 
-    let unlocked_state = Arc::new(UnlockedAppState {
+    let unlocked_state = Arc::new(LightningState {
+        common: Arc::clone(&common),
         channel_manager: Arc::clone(&channel_manager),
         gossip_source: Arc::clone(&gossip_source),
         inbound_payments,
-        signer: keys_manager,
-        entropy_source,
         network_graph,
         chain_monitor: chain_monitor.clone(),
         onion_messenger: onion_messenger.clone(),
         outbound_payments,
         peer_manager: Arc::clone(&peer_manager),
         async_order_handler,
+        asset_link_handler: Arc::clone(&asset_link_handler),
         async_payments_preimage_root,
-        kv_store: Arc::clone(&kv_store),
+        #[cfg(feature = "vss")]
+        monitor_kv_store: Arc::clone(&monitor_kv_store),
+        rgb_file_transfer_handler: Arc::clone(&rgb_file_transfer_handler),
         bump_tx_event_handler,
-        rgb_wallet_wrapper,
         maker_swaps,
-        taker_swaps,
+        taker_swaps: Arc::clone(&taker_swaps),
         router: Arc::clone(&router),
         output_sweeper: Arc::clone(&output_sweeper),
         channel_ids_map,
-        proxy_endpoint: proxy_endpoint.to_string(),
-        external_signer_mode,
-        external_signer,
-        external_node_id,
         virtual_channel_draft_store,
         virtual_channel_session_store,
         next_payment_idx,
     });
+
+    asset_link_handler.set_authorizer(Arc::new(NodeAssetLinkAuthorizer {
+        unlocked_state_weak: Arc::downgrade(&unlocked_state),
+        channel_manager: Arc::clone(&channel_manager),
+        kv_store: Arc::clone(&kv_store),
+        taker_swaps: Arc::clone(&taker_swaps),
+    }));
 
     // Refresh the RGS snapshot on a fixed interval (RGS mode only). The first
     // tick fires immediately, so a freshly unlocked node syncs right away.
@@ -4954,7 +6526,7 @@ pub(crate) async fn start_ldk(
         tokio::spawn(crate::gossip::run_rgs_sync_loop(
             Arc::clone(&unlocked_state.gossip_source),
             Arc::clone(&gossip_shutdown),
-            crate::gossip::RGS_SYNC_INTERVAL,
+            Duration::from_secs(static_state.config.gossip.rgs_sync_interval_secs),
         ));
     }
 
@@ -4981,7 +6553,7 @@ pub(crate) async fn start_ldk(
 
     // Background Processing
     let (bp_exit, bp_exit_check) = tokio::sync::watch::channel(());
-    let background_processor = tokio::spawn(process_events_async(
+    let bp_future = process_events_async(
         persister,
         event_handler,
         chain_monitor.clone(),
@@ -5010,6 +6582,12 @@ pub(crate) async fn start_ldk(
                     .unwrap(),
             )
         },
+    );
+
+    let background_processor = tokio::spawn(supervise_background_processor(
+        bp_future,
+        Arc::clone(&stop_processing),
+        app_state.cancel_token.clone(),
     ));
 
     // Regularly reconnect to channel peers.
@@ -5017,11 +6595,18 @@ pub(crate) async fn start_ldk(
     let connect_pm = Arc::clone(&peer_manager);
     let connect_db = static_state.db();
     let stop_connect = Arc::clone(&stop_processing);
+    let reconnect_interval_secs = static_state.config.node.peer_reconnect_interval_secs;
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        let mut interval = tokio::time::interval(Duration::from_secs(reconnect_interval_secs));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
+            // checked here and not only per peer: with no channels to reconnect, or once the read
+            // below starts failing, the inner check is unreachable and the task would outlive the
+            // node it belongs to, polling its database by path forever
+            if stop_connect.load(Ordering::Acquire) {
+                return;
+            }
             let db = RlnDatabase::new((*connect_db).clone());
             match db.read_channel_peer_data() {
                 Ok(info) => {
@@ -5051,6 +6636,72 @@ pub(crate) async fn start_ldk(
         }
     });
 
+    // Remote external signer force-close resilience. When the signer daemon is briefly unreachable, a
+    // channel signing call returns LDK's async-unavailable sentinel (`Err(())`) and the operation parks
+    // instead of failing the channel. While an outage is outstanding, periodically drive
+    // `signer_unblocked` so parked operations retry — which is what makes the transport actually
+    // attempt to reconnect, since nothing else calls it while everything is parked.
+    //
+    // Only spawned when the transport can genuinely go unreachable and recover
+    // (`external_signer_link_watch` is `Some` only for the remote-signer daemon link — an in-process
+    // uniffi signer can never be unreachable), and only ticking while the link is actually down:
+    // `signer_unblocked(None)` is NOT a cheap no-op — it walks every peer's channel map under
+    // `total_consistency_lock` and unconditionally forces a `ChannelManager` re-persist — so a
+    // healthy node must not pay it every few seconds forever.
+    //
+    // The link watch is state-based (see `SignerLinkWatch`): every wake-up re-checks `is_connected`
+    // rather than trusting the wake-up itself, so buffered/spurious signals only ever cost one extra
+    // `signer_unblocked` pass, never a stuck loop.
+    if let Some(link) = external_signer_link_watch {
+        let su_channel_manager = Arc::clone(&channel_manager);
+        let su_chain_monitor = Arc::clone(&chain_monitor);
+        let su_stop = Arc::clone(&stop_processing);
+        tokio::spawn(async move {
+            loop {
+                // Healthy: idle until the link reports a change (with a coarse timer only to notice
+                // node shutdown — it drives no signer work).
+                let link_event = tokio::select! {
+                    _ = link.changed() => true,
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => false,
+                };
+                if su_stop.load(Ordering::Acquire) {
+                    return;
+                }
+                if link_event && link.is_connected() {
+                    // The link dropped and recovered while we slept: one pass covers anything that
+                    // parked in between.
+                    su_chain_monitor.signer_unblocked(None);
+                    su_channel_manager.signer_unblocked(None);
+                    continue;
+                }
+                if link.is_connected() {
+                    continue;
+                }
+                // Outage: drive retries until the transport reports the link is back, then one final
+                // pass for anything that parked right around the transition. Reacts immediately to
+                // the reconnect signal instead of waiting out the tick interval; the interval is the
+                // backstop that drives the reconnect attempts in the first place (its first tick
+                // completes immediately).
+                let mut interval = tokio::time::interval(Duration::from_secs(5));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {}
+                        _ = link.changed() => {}
+                    }
+                    if su_stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    su_chain_monitor.signer_unblocked(None);
+                    su_channel_manager.signer_unblocked(None);
+                    if link.is_connected() {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
     // Regularly broadcast our node_announcement. This is only required (or possible) if we have
     // some public channels.
     let mut ldk_announced_listen_addr = Vec::new();
@@ -5079,14 +6730,33 @@ pub(crate) async fn start_ldk(
         }
         None => [0; 32],
     };
+
+    // cleanup the buffers of RGB file transfers a peer started and never finished
+    let sweep_handler = Arc::clone(&rgb_file_transfer_handler);
+    let stop_sweep = Arc::clone(&stop_processing);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(REASSEMBLY_SWEEP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if stop_sweep.load(Ordering::Acquire) {
+                return;
+            }
+            sweep_handler.sweep_stale_state();
+        }
+    });
+
     let peer_man = Arc::clone(&peer_manager);
     let chan_man = Arc::clone(&channel_manager);
+    let announce_initial_delay_secs = static_state.config.node.announce_initial_delay_secs;
+    let announce_refresh_interval_secs = static_state.config.node.announce_refresh_interval_secs;
     tokio::spawn(async move {
-        // First wait a minute until we have some peers and maybe have opened a channel.
-        tokio::time::sleep(Duration::from_secs(60)).await;
-        // Then, update our announcement once an hour to keep it fresh but avoid unnecessary churn
+        // First wait until we have some peers and maybe have opened a channel.
+        tokio::time::sleep(Duration::from_secs(announce_initial_delay_secs)).await;
+        // Then, update our announcement periodically to keep it fresh but avoid unnecessary churn
         // in the global gossip network.
-        let mut interval = tokio::time::interval(Duration::from_secs(3600));
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(announce_refresh_interval_secs));
         loop {
             interval.tick().await;
             // Don't bother trying to announce if we don't have any public channls, though our
@@ -5110,19 +6780,22 @@ pub(crate) async fn start_ldk(
     tracing::info!("Local Node ID is {}", channel_manager.get_our_node_id());
 
     #[cfg(feature = "vss")]
-    if let Some(guard) = fence_guard.as_mut() {
+    if let Some(guard) = setup.fence_guard.as_mut() {
         guard.disarm();
     }
 
     Ok((
-        LdkBackgroundServices {
+        Some(LdkBackgroundServices {
             stop_processing,
             gossip_shutdown,
             peer_manager: peer_manager.clone(),
             bp_exit,
             background_processor: Some(background_processor),
-        },
-        unlocked_state,
+        }),
+        Arc::new(UnlockedAppState {
+            common,
+            lightning: Some(unlocked_state),
+        }),
     ))
 }
 
@@ -5146,37 +6819,11 @@ pub(crate) fn attach_external_signer_transport(
     })
 }
 
-async fn sync_chain_data(
-    tx_sync: Arc<EsploraSyncClient<Arc<FilesystemLogger>>>,
-    confirmables: Vec<Arc<dyn Confirm + Send + Sync>>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tokio::task::spawn_blocking(move || tx_sync.sync(confirmables))
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
-}
-
-async fn sync_chain_data_electrum(
-    tx_sync: Arc<ElectrumSyncClient<Arc<FilesystemLogger>>>,
-    confirmables: Vec<Arc<dyn Confirm + Send + Sync>>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tokio::task::spawn_blocking(move || tx_sync.sync(confirmables))
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
-}
-
 impl AppState {
-    fn stop_ldk(&self) -> Option<JoinHandle<Result<(), io::Error>>> {
+    fn stop_lightning(&self) -> Option<LdkBackgroundServices> {
         let mut ldk_background_services = self.get_ldk_background_services();
 
-        if ldk_background_services.is_none() {
-            // node is locked
-            tracing::info!("LDK is not running");
-            return None;
-        }
-
-        let ldk_background_services = ldk_background_services.as_mut().unwrap();
+        let ldk_background_services = ldk_background_services.take()?;
 
         // Disconnect our peers and stop accepting new connections. This ensures we don't continue
         // updating our channel data after we've stopped the background processor.
@@ -5186,61 +6833,292 @@ impl AppState {
         ldk_background_services.gossip_shutdown.notify_one();
         ldk_background_services.peer_manager.disconnect_all_peers();
 
-        // Stop the background processor.
+        // Stop the background processor. Its `bp_exit` receiver lives inside the
+        // `process_events_async` future, so nothing to signal if the background processor is
+        // already gone. Also, send can find no receiver during a panic (racy).
         if !ldk_background_services.bp_exit.is_closed() {
-            ldk_background_services.bp_exit.send(()).unwrap();
-            ldk_background_services.background_processor.take()
-        } else {
-            None
+            let _ = ldk_background_services.bp_exit.send(());
         }
+        Some(ldk_background_services)
     }
 }
 
-pub(crate) async fn stop_ldk(app_state: Arc<AppState>) {
-    tracing::info!("Stopping LDK");
+#[cfg(feature = "vss")]
+const BP_SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
 
-    if let Some(join_handle) = app_state.stop_ldk() {
-        join_handle.await.unwrap().unwrap();
+/// Budget for draining and stopping the VSS-backed stores at teardown. Same order as the
+/// background-processor join above: it covers the flush window plus a stuck remote request being
+/// given up on, and keeps a shutdown terminating even when VSS never answers.
+#[cfg(feature = "vss")]
+const VSS_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Window for the final drain of queued replications, inside the teardown budget.
+#[cfg(feature = "vss")]
+const VSS_TEARDOWN_FLUSH_WINDOW: Duration = Duration::from_secs(10);
+
+/// Budget for the single VSS round-trip that hands the fence over.
+#[cfg(feature = "vss")]
+const VSS_FENCE_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(feature = "vss")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VssTeardown {
+    /// Flush and stops finished: no further remote mutation can begin.
+    Complete,
+    /// A step was abandoned at the deadline: an in-flight write may still land.
+    Abandoned,
+}
+
+/// Drains queued replications and stops both stores, bounding every step by what is left of
+/// `deadline`. `SyncedKvStore::stop` waits on the drain gate, so a hung remote write would
+/// otherwise block the shutdown forever.
+#[cfg(feature = "vss")]
+async fn stop_vss_stores(
+    kv_store: &Arc<SyncedKvStore>,
+    monitor_kv_store: Option<&Arc<RemoteFirstKvStore>>,
+    deadline: Instant,
+) -> VssTeardown {
+    let remaining = || deadline.saturating_duration_since(Instant::now());
+    let stop_monitors = || {
+        if let Some(store) = monitor_kv_store {
+            store.stop();
+        }
+    };
+
+    let flush_store = Arc::clone(kv_store);
+    let flush_deadline = std::cmp::min(deadline, Instant::now() + VSS_TEARDOWN_FLUSH_WINDOW);
+    let flush =
+        tokio::task::spawn_blocking(move || flush_store.flush_pending_until(flush_deadline));
+    match tokio::time::timeout(remaining(), flush).await {
+        Ok(Ok(0)) => {}
+        Ok(Ok(n)) => tracing::error!(
+            pending = n,
+            "VSS replications still queued at shutdown; they persist locally and \
+             will retry on next unlock"
+        ),
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "pending-queue flush task failed");
+            stop_monitors();
+            return VssTeardown::Abandoned;
+        }
+        Err(_) => {
+            tracing::error!("pending-queue flush did not finish within the teardown budget");
+            stop_monitors();
+            return VssTeardown::Abandoned;
+        }
     }
 
-    // Graceful teardown (lock, shutdown, signal): release the VSS fence so
-    // the next unlock — a fresh instance id — takes over without an explicit
-    // /vssclearfence. Hard kills still leave the fence behind by design.
+    // Stop drains and abort outage-pending writes: once both stores are stopped no remote
+    // mutation can begin, which is what makes giving up the fence safe.
+    let stop_store = Arc::clone(kv_store);
+    let stop = tokio::task::spawn_blocking(move || stop_store.stop());
+    match tokio::time::timeout(remaining(), stop).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "pending-queue stop task failed");
+            stop_monitors();
+            return VssTeardown::Abandoned;
+        }
+        Err(_) => {
+            tracing::error!("pending-queue stop did not finish within the teardown budget");
+            stop_monitors();
+            return VssTeardown::Abandoned;
+        }
+    }
+    // Only signals the retry loops to abort, so it cannot block. Idempotent: the abandoned
+    // paths above may have already called it.
+    stop_monitors();
+    VssTeardown::Complete
+}
+
+/// Releases the VSS fence, but only after a complete teardown: a write still in flight could
+/// otherwise land on a store another instance has already taken over. Returns whether the
+/// release was attempted.
+#[cfg(feature = "vss")]
+async fn release_vss_fence(kv_store: Arc<SyncedKvStore>, teardown: VssTeardown) -> bool {
+    if teardown != VssTeardown::Complete {
+        tracing::error!(
+            "VSS teardown did not complete within {:?}; keeping the fence, the next \
+             instance needs an explicit fence clear to take over",
+            VSS_TEARDOWN_TIMEOUT
+        );
+        return false;
+    }
+    let release = tokio::task::spawn_blocking(move || kv_store.release_vss_fence_if_owned());
+    match tokio::time::timeout(VSS_FENCE_RELEASE_TIMEOUT, release).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => tracing::warn!(error = %e, "failed to release VSS fence during shutdown"),
+        Ok(Err(e)) => tracing::warn!(error = %e, "VSS fence release task failed"),
+        Err(_) => tracing::warn!(
+            "VSS fence release did not finish within {:?}",
+            VSS_FENCE_RELEASE_TIMEOUT
+        ),
+    }
+    true
+}
+
+// Runs while shutting down, possibly because the background processor itself
+// died, so its outcome is reported instead of unwrapped.
+fn log_bp_shutdown_result(res: Result<Result<(), io::Error>, tokio::task::JoinError>) {
+    match res {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "background processor exited with error during shutdown")
+        }
+        Err(e) => tracing::error!(error = %e, "background processor task join failed"),
+    }
+}
+
+#[cfg(all(test, feature = "vss"))]
+mod vss_teardown_tests {
+    use super::*;
+    use crate::kv_store::SeaOrmKvStore;
+
+    fn local_stores() -> (Arc<SyncedKvStore>, Arc<RemoteFirstKvStore>) {
+        let connection = crate::runtime::block_on(sea_orm::Database::connect("sqlite::memory:"))
+            .expect("in-memory database");
+        let local = Arc::new(SeaOrmKvStore::from_connection(Arc::new(connection)));
+        (
+            Arc::new(SyncedKvStore::local_only(Arc::clone(&local))),
+            Arc::new(RemoteFirstKvStore::new(local, None)),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_teardown_releases_the_fence() {
+        let (kv_store, monitor_kv_store) = local_stores();
+
+        let teardown = stop_vss_stores(
+            &kv_store,
+            Some(&monitor_kv_store),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(teardown, VssTeardown::Complete);
+        assert!(release_vss_fence(kv_store, teardown).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wallet_only_teardown_does_not_require_monitor_store() {
+        let (kv_store, _) = local_stores();
+        let teardown =
+            stop_vss_stores(&kv_store, None, Instant::now() + Duration::from_secs(5)).await;
+        assert_eq!(teardown, VssTeardown::Complete);
+        assert!(release_vss_fence(kv_store, teardown).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandoned_teardown_keeps_the_fence() {
+        let (kv_store, monitor_kv_store) = local_stores();
+        // `stop` blocks on the drain gate; a hung remote write must not hold the shutdown.
+        kv_store.set_before_stop_gate_hook(Arc::new(|| std::thread::sleep(Duration::from_secs(1))));
+        // Stand in for a live retry loop so the shutdown signal has a receiver to observe.
+        let shutdown_rx = monitor_kv_store.subscribe_shutdown();
+
+        let teardown = stop_vss_stores(
+            &kv_store,
+            Some(&monitor_kv_store),
+            Instant::now() + Duration::from_millis(100),
+        )
+        .await;
+
+        assert_eq!(teardown, VssTeardown::Abandoned);
+        // The abandoned path must still abort the monitor retries before giving up.
+        assert!(*shutdown_rx.borrow());
+        assert!(!release_vss_fence(kv_store, teardown).await);
+    }
+}
+
+/// Stop the resources owned by the unlocked session, including wallet-only persistence.
+pub(crate) async fn stop_node(app_state: Arc<AppState>) {
+    tracing::info!("Stopping node services");
+    // Wait for wallet operations holding the API mutex, then remove both session owners together.
+    // New callers cannot use a wallet after its VSS fence has been handed over; concurrent stops
+    // cannot release the fence while another stop is still flushing the background processor.
+    let mut unlocked_guard = app_state.get_unlocked_app_state().await;
+    let unlocked = unlocked_guard.take();
+    let mut lightning = app_state.stop_lightning();
+    drop(unlocked_guard);
+
     #[cfg(feature = "vss")]
+    let common_and_monitor = unlocked.as_ref().map(|unlocked| {
+        unlocked.common.persistence_shutdown.cancel();
+        (
+            Arc::clone(&unlocked.common),
+            unlocked
+                .lightning
+                .as_ref()
+                .map(|lightning| Arc::clone(&lightning.monitor_kv_store)),
+        )
+    });
+
+    #[cfg(feature = "vss")]
+    if let Some(mut join_handle) = lightning
+        .as_mut()
+        .and_then(|services| services.background_processor.take())
     {
-        let kv_store = app_state
-            .get_unlocked_app_state()
-            .await
-            .as_ref()
-            .map(|unlocked| Arc::clone(&unlocked.kv_store));
-        if let Some(kv_store) = kv_store {
-            match tokio::task::spawn_blocking(move || kv_store.release_vss_fence_if_owned()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, "failed to release VSS fence during shutdown")
+        match tokio::time::timeout(BP_SHUTDOWN_FLUSH_TIMEOUT, &mut join_handle).await {
+            Ok(res) => log_bp_shutdown_result(res),
+            Err(_) => {
+                tracing::error!("final VSS flush did not complete in {:?}; aborting pending retries — last channel-manager state may not have replicated", BP_SHUTDOWN_FLUSH_TIMEOUT);
+                if let Some((_, Some(ref monitor_store))) = common_and_monitor {
+                    monitor_store.stop();
                 }
-                Err(e) => tracing::warn!(error = %e, "VSS fence release task failed"),
+                log_bp_shutdown_result(join_handle.await);
             }
         }
     }
-
-    // connect to the peer port so it can be released
-    let peer_port = app_state.static_state.ldk_peer_listening_port;
-    let sock_addr = SocketAddr::from(([127, 0, 0, 1], peer_port));
-    let _ = check_port_is_available(peer_port);
-    // check the peer port has been released
-    let t_0 = OffsetDateTime::now_utc();
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        if TcpListener::bind(sock_addr).is_ok() {
-            break;
-        }
-        if (OffsetDateTime::now_utc() - t_0).as_seconds_f32() > 10.0 {
-            panic!("LDK peer port not being released")
-        }
+    #[cfg(not(feature = "vss"))]
+    if let Some(join_handle) = lightning
+        .as_mut()
+        .and_then(|services| services.background_processor.take())
+    {
+        log_bp_shutdown_result(join_handle.await);
     }
 
-    tracing::info!("Stopped LDK");
+    #[cfg(feature = "vss")]
+    if let Some((common, monitor_store)) = common_and_monitor {
+        let deadline = Instant::now() + VSS_TEARDOWN_TIMEOUT;
+        let teardown = stop_vss_stores(&common.kv_store, monitor_store.as_ref(), deadline).await;
+        let worker = common.persistence_worker.lock().unwrap().take();
+        if let Some(mut worker) = worker {
+            if tokio::time::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                &mut worker,
+            )
+            .await
+            .is_err()
+            {
+                worker.abort();
+                tracing::warn!("common persistence worker did not exit within teardown budget");
+            }
+        }
+        release_vss_fence(Arc::clone(&common.kv_store), teardown).await;
+    }
+
+    // Only an owned Lightning listener needs the baseline wakeup and port-release wait.
+    // A wallet-only or already-stopped session must not contact an unused peer port.
+    if lightning.is_some() {
+        // connect to the peer port so it can be released
+        let peer_port = app_state.static_state.ldk_peer_listening_port;
+        let sock_addr = SocketAddr::from(([127, 0, 0, 1], peer_port));
+        let _ = check_port_is_available(peer_port);
+        // check the peer port has been released
+        let t_0 = OffsetDateTime::now_utc();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if TcpListener::bind(sock_addr).is_ok() {
+                break;
+            }
+            if (OffsetDateTime::now_utc() - t_0).as_seconds_f32() > 10.0 {
+                tracing::error!("LDK peer port {peer_port} was not released within 10s");
+                break;
+            }
+        }
+    }
+    drop(unlocked);
+    tracing::info!("Stopped node services");
 }
 
 pub(crate) fn write_rgb_payment_info_file(
@@ -5292,9 +7170,176 @@ pub(crate) fn clear_rgb_payment_pending(
     }
 }
 
+// Exercise the real signer, rgb-lib batch lookup and duplicate-consignment path on a closed
+// regtest channel, before wallet refresh consumes/removes the prepared receipt.
+#[cfg(test)]
+pub(crate) async fn test_retry_prepared_rgb_sweep(state: Arc<AppState>) -> String {
+    let unlocked = state.get_unlocked_app_state().await.clone().unwrap();
+    let lightning = unlocked.lightning().unwrap().clone();
+    for _ in 0..30 {
+        // Drive the public sweeper entry point instead of waiting for the background timer.
+        lightning
+            .output_sweeper
+            .regenerate_and_broadcast_spend_if_necessary()
+            .await
+            .unwrap();
+        let state = state.clone();
+        let lightning = lightning.clone();
+        if let Some(txid) = tokio::task::spawn_blocking(move || {
+            let tracked = lightning.output_sweeper.tracked_spendable_outputs();
+            let store = lightning.kv_store.as_ref();
+            let mut txes = match store.read("", "", OUTPUT_SPENDER_TXES_KEY) {
+                Ok(bytes) => OutputSpenderTxes::read(&mut &bytes[..]).unwrap(),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+                Err(e) => panic!("cannot inspect sweep tx cache: {e}"),
+            };
+            for key in store.list("rgb_sweeps", "").unwrap() {
+                let raw = store.read("rgb_sweeps", "", &key).unwrap();
+                let prepared: crate::rgb_sweep::PreparedRgbSweep =
+                    bincode::deserialize(&raw).unwrap();
+                let txid = prepared.txid().unwrap();
+                let Some(original) = txes
+                    .values()
+                    .find(|tx| tx.compute_txid().to_string() == txid)
+                    .cloned()
+                else {
+                    continue;
+                };
+                let mut descriptors: Vec<_> = tracked
+                    .iter()
+                    .filter(|o| {
+                        original.input.iter().any(|i| {
+                            i.previous_output
+                                == o.descriptor.spendable_outpoint().into_bitcoin_outpoint()
+                        })
+                    })
+                    .map(|o| &o.descriptor)
+                    .collect();
+                assert_eq!(descriptors.len(), original.input.len());
+                descriptors.reverse();
+                let spender = RgbOutputSpender {
+                    static_state: state.static_state.clone(),
+                    rgb_wallet_wrapper: lightning.rgb_wallet_wrapper.clone(),
+                    signer: lightning.signer.clone(),
+                    kv_store: lightning.kv_store.clone(),
+                    txes: Arc::new(Mutex::new(txes.clone())),
+                    sweep_recipients: Arc::new(Mutex::new(HashMap::new())),
+                };
+                let lookup = || {
+                    lightning
+                        .rgb_wallet_wrapper
+                        .list_transfers(rgb_lib::wallet::AssetFilter::AnyOrNone, Some(txid.clone()))
+                        .unwrap()
+                };
+                let before = lookup();
+                let retried = spender
+                    .finish_prepared_rgb_sweep(
+                        &descriptors,
+                        key.parse().unwrap(),
+                        &mut txes,
+                        &Secp256k1::new(),
+                        prepared,
+                    )
+                    .unwrap();
+                assert_eq!(retried.compute_txid(), original.compute_txid());
+                assert_eq!(
+                    lookup().len(),
+                    before.len(),
+                    "retry must not create another receive"
+                );
+                let mut missing_batch: crate::rgb_sweep::PreparedRgbSweep =
+                    bincode::deserialize(&raw).unwrap();
+                missing_batch.batch_transfer_idx = i32::MAX;
+                assert!(spender
+                    .finish_prepared_rgb_sweep(
+                        &descriptors,
+                        key.parse().unwrap(),
+                        &mut txes,
+                        &Secp256k1::new(),
+                        missing_batch
+                    )
+                    .unwrap_err()
+                    .contains("no longer active"));
+                return Some(txid);
+            }
+            None
+        })
+        .await
+        .unwrap()
+        {
+            return txid;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    panic!("no completed RGB sweep preparation available to retry");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn channel_ready_acknowledges_refresh_errors_and_join_errors() {
+        for fail_at in [false, true] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let seen = calls.clone();
+            let result = refresh_after_channel_ready(ChannelId([1; 32]), move |skip_sync| {
+                seen.lock().unwrap().push(skip_sync);
+                if skip_sync == fail_at {
+                    Err("indexer offline".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .await;
+            assert!(
+                result.is_ok(),
+                "refresh errors must not replay ChannelReady"
+            );
+            assert_eq!(
+                *calls.lock().unwrap(),
+                if fail_at {
+                    vec![false, true]
+                } else {
+                    vec![false]
+                }
+            );
+        }
+        // A worker panic becomes JoinError. The handler must not unwrap it or request replay.
+        // The daemon's separate global panic policy is intentionally unchanged.
+        assert!(
+            refresh_after_channel_ready(ChannelId([1; 32]), |_| panic!("worker failed"))
+                .await
+                .is_ok()
+        );
+    }
+
+    // `chain.indexer_url` is the whole reason the unlock request keeps `indexer_url` optional
+    // instead of adopting upstream's mandatory field, so the layering itself is pinned here.
+    #[test]
+    fn indexer_url_falls_back_to_the_config_file() {
+        assert_eq!(
+            resolve_indexer_url(None, Some("127.0.0.1:50001")).unwrap(),
+            "127.0.0.1:50001"
+        );
+    }
+
+    #[test]
+    fn indexer_url_from_the_request_wins_over_the_config_file() {
+        assert_eq!(
+            resolve_indexer_url(Some("from-request:50001"), Some("from-config:50001")).unwrap(),
+            "from-request:50001"
+        );
+    }
+
+    // the per-network default indexer is gone: neither source means the unlock fails outright
+    #[test]
+    fn indexer_url_missing_from_both_sources_errors() {
+        assert!(matches!(
+            resolve_indexer_url(None, None),
+            Err(APIError::MissingIndexerUrl)
+        ));
+    }
     use crate::kv_store::SeaOrmKvStore;
     use lightning::rgb_utils::RgbInfo;
     use rln_migration::{Migrator, MigratorTrait};
@@ -5376,6 +7421,7 @@ mod tests {
             local_rgb_amount,
             remote_rgb_amount,
             batch_transfer_idx: None,
+            counterparty_knows_asset: false,
         };
         kv_store.write_rgb_channel_info(channel_id, &info, false);
     }
@@ -5572,7 +7618,9 @@ mod tests {
 
     #[test]
     fn ifa_supported_on_all_networks_but_mainnet() {
-        assert!(!supported_asset_schemas(BitcoinNetwork::Mainnet).contains(&AssetSchema::Ifa));
+        assert!(
+            !supported_asset_schemas(BitcoinNetwork::Mainnet, false).contains(&AssetSchema::Ifa)
+        );
         for network in [
             BitcoinNetwork::Testnet,
             BitcoinNetwork::Testnet4,
@@ -5580,11 +7628,80 @@ mod tests {
             BitcoinNetwork::SignetCustom,
             BitcoinNetwork::Regtest,
         ] {
-            let schemas = supported_asset_schemas(network);
+            let schemas = supported_asset_schemas(network, false);
             assert!(schemas.contains(&AssetSchema::Ifa));
             assert!(schemas.contains(&AssetSchema::Nia));
             assert!(schemas.contains(&AssetSchema::Cfa));
             assert!(schemas.contains(&AssetSchema::Uda));
         }
+    }
+
+    #[test]
+    fn bfa_supported_only_with_an_eth_rpc_url() {
+        assert!(
+            !supported_asset_schemas(BitcoinNetwork::Regtest, false).contains(&AssetSchema::Bfa)
+        );
+        assert!(supported_asset_schemas(BitcoinNetwork::Regtest, true).contains(&AssetSchema::Bfa));
+        assert!(supported_asset_schemas(BitcoinNetwork::Mainnet, true).contains(&AssetSchema::Bfa));
+    }
+
+    #[test]
+    fn sweep_receive_reuse_margin_is_smaller_under_address_reuse() {
+        let now = 1_000_000;
+        let expiration = now + RGB_TRANSFER_CHAN_EXPIRATION_SECS;
+
+        // at t+23h the 1h margin has been reached, but the reuse margin has not
+        let late = expiration - RGB_RECEIVE_REUSE_MARGIN_SECS;
+        assert!(!sweep_receive_is_reusable(late, expiration, false));
+        assert!(sweep_receive_is_reusable(late, expiration, true));
+    }
+
+    #[test]
+    fn sweep_receive_reuse_respects_both_margin_boundaries() {
+        let expiration = 1_000_000;
+
+        for (reuse, margin) in [
+            (false, RGB_RECEIVE_REUSE_MARGIN_SECS),
+            (true, RGB_RECEIVE_REUSE_MARGIN_ADDR_REUSE_SECS),
+        ] {
+            // strictly inside the margin is reusable, the boundary itself is not
+            assert!(sweep_receive_is_reusable(
+                expiration - margin - 1,
+                expiration,
+                reuse
+            ));
+            assert!(!sweep_receive_is_reusable(
+                expiration - margin,
+                expiration,
+                reuse
+            ));
+        }
+    }
+
+    #[test]
+    fn sweep_receive_past_expiry_is_never_reusable() {
+        let expiration = 1_000_000;
+        for reuse in [false, true] {
+            assert!(!sweep_receive_is_reusable(expiration, expiration, reuse));
+            assert!(!sweep_receive_is_reusable(
+                expiration + 1,
+                expiration,
+                reuse
+            ));
+        }
+        // pins the reuse margin itself: a receive with a minute of life must never be handed out,
+        // otherwise it can expire mid-sweep. Asserted without reference to the constant, so
+        // shrinking it back towards zero fails here.
+        assert!(!sweep_receive_is_reusable(
+            expiration - 60,
+            expiration,
+            true
+        ));
+        // same for the non-reuse margin, which must stay far larger than a sweep's duration
+        assert!(!sweep_receive_is_reusable(
+            expiration - 1800,
+            expiration,
+            false
+        ));
     }
 }

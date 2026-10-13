@@ -276,6 +276,26 @@ async fn by_txid() {
         .iter()
         .all(|t| t.txid.as_deref() == Some(rcv_txid.as_str())));
 
+    // asset_id + txid combine as an intersection
+    let (txid_1, expected_1) = idx_by_txid.iter().next().unwrap();
+    let mut expected_1 = expected_1.clone();
+    expected_1.sort_unstable();
+    let mut both: Vec<i32> = list_transfers_by_asset_and_txid(node1_addr, &asset_id, txid_1)
+        .await
+        .iter()
+        .map(|t| t.idx)
+        .collect();
+    both.sort_unstable();
+    assert_eq!(both, expected_1, "asset+txid intersection mismatch");
+
+    // an asset with no transfers in that tx yields empty
+    let other_asset_id = issue_asset_cfa(node1_addr, None).await.asset_id;
+    assert!(
+        list_transfers_by_asset_and_txid(node1_addr, &other_asset_id, txid_1)
+            .await
+            .is_empty()
+    );
+
     // unknown txid yields empty results on both endpoints
     let unknown = "0".repeat(64);
     assert!(list_transfers_by_txid(node1_addr, &unknown)
@@ -285,9 +305,18 @@ async fn by_txid() {
         .await
         .is_empty());
 
-    // neither asset_id nor txid is a bad request
+    // an asset-less filter returns only transfers not tied to an asset. A blind receive naming no
+    // asset stays untied, so the filter has something to find and the check below is not vacuous
+    let untied = rgb_invoice(node1_addr, None, false).await;
+    let no_asset = list_transfers_no_asset(node1_addr).await;
+    assert!(no_asset
+        .iter()
+        .any(|t| t.recipient_id.as_deref() == Some(untied.recipient_id.as_str())));
+    assert!(no_asset.iter().all(|t| !all.iter().any(|a| a.idx == t.idx)));
+
+    // an unnarrowed filter with no txid is a bad request
     let payload = ListTransfersRequest {
-        asset_id: None,
+        asset_filter: AssetFilter::AnyOrNone,
         txid: None,
         index_offset: None,
         max_transfers: None,
@@ -304,7 +333,7 @@ async fn by_txid() {
     check_response_is_nok(
         res,
         reqwest::StatusCode::BAD_REQUEST,
-        "either asset_id or txid",
+        "either a narrowing asset_filter",
         "InvalidRequest",
     )
     .await;

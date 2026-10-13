@@ -29,7 +29,7 @@ fn lock_uniffi_state_slot() -> Result<std::sync::MutexGuard<'static, Option<Node
 {
     uniffi_state_slot().lock().map_err(|_| {
         tracing::error!("UniFFI global state mutex is poisoned");
-        RlnError::Internal
+        RlnError::Internal("UniFFI global state mutex is poisoned".to_string())
     })
 }
 
@@ -69,7 +69,7 @@ pub(super) fn get_uniffi_app_state() -> Result<Arc<AppState>, RlnError> {
     lock_uniffi_state_slot()?
         .clone()
         .map(|h| h.app_state())
-        .ok_or(RlnError::NotInitialized)
+        .ok_or_else(|| RlnError::NotInitialized("node is not initialized".to_string()))
 }
 
 pub(super) fn block_on_sdk<F, T>(fut: F) -> Result<T, RlnError>
@@ -126,16 +126,18 @@ fn shared_uniffi_runtime() -> &'static tokio::runtime::Runtime {
 }
 
 pub(crate) fn map_api_error(err: APIError) -> RlnError {
-    stash_api_error_detail(format!("{err}"));
+    let msg = err.to_string();
+    stash_api_error_detail(msg.clone());
     match err {
-        APIError::LockedNode | APIError::NotInitialized => RlnError::NotInitialized,
+        APIError::LightningUnsupportedOnMainnet => RlnError::LightningUnsupportedOnMainnet(msg),
+        APIError::LockedNode | APIError::NotInitialized => RlnError::NotInitialized(msg),
         APIError::PaymentNotFound(_)
         | APIError::SwapNotFound(_)
         | APIError::BatchTransferNotFound
         | APIError::UnknownChannelId
         | APIError::UnknownContractId
         | APIError::UnknownLNInvoice
-        | APIError::UnknownTemporaryChannelId => RlnError::NotFound,
+        | APIError::UnknownTemporaryChannelId => RlnError::NotFound(msg),
         APIError::AllocationsAlreadyAvailable
         | APIError::AlreadyInitialized
         | APIError::AlreadyUnlocked
@@ -146,7 +148,6 @@ pub(crate) fn map_api_error(err: APIError) -> RlnError {
         | APIError::ChangingState
         | APIError::InsufficientAssets
         | APIError::InvalidIndexer(_)
-        | APIError::InvalidProxyEndpoint
         | APIError::InvalidProxyProtocol(_)
         | APIError::MaxFeeExceeded(_)
         | APIError::MinFeeNotMet(_)
@@ -156,18 +157,20 @@ pub(crate) fn map_api_error(err: APIError) -> RlnError {
         | APIError::TemporaryChannelIdAlreadyUsed
         | APIError::UnsupportedLayer1(_)
         | APIError::UnsupportedTransportType
-        | APIError::CannotFailBatchTransfer => RlnError::Conflict,
-        APIError::FailedBdkSync(_) => RlnError::FailedBdkSync,
-        APIError::FailedBitcoindConnection(_) => RlnError::FailedBitcoindConnection,
-        APIError::FailedBroadcast(_) => RlnError::FailedBroadcast,
-        APIError::FailedPeerConnection => RlnError::FailedPeerConnection,
-        APIError::InsufficientCapacity(_) => RlnError::InsufficientCapacity,
-        APIError::InsufficientFunds(_) => RlnError::InsufficientFunds,
-        APIError::NoAvailableUtxos => RlnError::NoAvailableUtxos,
-        APIError::NoRoute => RlnError::NoRoute,
-        APIError::ExternalSignerRequired => RlnError::ExternalSignerRequired,
-        APIError::ExternalSignerMismatch => RlnError::ExternalSignerMismatch,
-        APIError::UnsupportedInExternalSignerMode(_) => RlnError::UnsupportedInExternalSignerMode,
+        | APIError::CannotFailBatchTransfer => RlnError::Conflict(msg),
+        APIError::FailedBdkSync(_) => RlnError::FailedBdkSync(msg),
+        APIError::FailedBitcoindConnection(_) => RlnError::FailedBitcoindConnection(msg),
+        APIError::FailedBroadcast(_) => RlnError::FailedBroadcast(msg),
+        APIError::FailedPeerConnection => RlnError::FailedPeerConnection(msg),
+        APIError::InsufficientCapacity(_) => RlnError::InsufficientCapacity(msg),
+        APIError::InsufficientFunds(_) => RlnError::InsufficientFunds(msg),
+        APIError::NoAvailableUtxos => RlnError::NoAvailableUtxos(msg),
+        APIError::NoRoute => RlnError::NoRoute(msg),
+        APIError::ExternalSignerRequired => RlnError::ExternalSignerRequired(msg),
+        APIError::ExternalSignerMismatch => RlnError::ExternalSignerMismatch(msg),
+        APIError::UnsupportedInExternalSignerMode(_) => {
+            RlnError::UnsupportedInExternalSignerMode(msg)
+        }
         APIError::AnchorsRequired
         | APIError::ExpiredSwapOffer
         | APIError::IncompleteRGBInfo
@@ -180,12 +183,19 @@ pub(crate) fn map_api_error(err: APIError) -> RlnError {
         | APIError::InvalidAttachments(_)
         | APIError::InvalidBackupPath
         | APIError::InvalidBiscuitToken
+        | APIError::InvalidBurnRecipient(_)
         | APIError::InvalidChannelID
+        | APIError::InvalidContractLink(_)
+        | APIError::InvalidRightOutpoint(_)
+        | APIError::InvalidDescription(_)
         | APIError::InvalidDescriptionHash(_)
         | APIError::InvalidDetails(_)
         | APIError::InvalidEstimationBlocks
+        | APIError::InvalidEthRpcUrl(_)
         | APIError::InvalidFeeRate(_)
         | APIError::InvalidInvoice(_)
+        | APIError::InvalidRgbContract(_)
+        | APIError::InvalidRgbConsignment(_)
         | APIError::InvalidMediaDigest
         | APIError::InvalidMnemonic(_)
         | APIError::InvalidName(_)
@@ -211,27 +221,34 @@ pub(crate) fn map_api_error(err: APIError) -> RlnError {
         | APIError::MediaFileNotProvided
         | APIError::MissingSwapPaymentPreimage
         | APIError::OutputBelowDustLimit
+        | APIError::UnsupportedBurn(_)
+        | APIError::UnsupportedSchema(_)
         | APIError::WrongPassword
-        | APIError::UnsupportedBackupVersion { .. } => RlnError::InvalidRequest,
-        APIError::Network(_) | APIError::NoValidTransportEndpoint => RlnError::Conflict,
-        APIError::ExternalSignerUnavailable(_) => RlnError::ExternalSignerUnavailable,
-        APIError::ExternalSignerProtocolError(_) => RlnError::ExternalSignerProtocolError,
+        | APIError::UnsupportedBackupVersion { .. } => RlnError::InvalidRequest(msg),
+        APIError::ConsignmentNotFound => RlnError::NotFound(msg),
+        APIError::RestoredBackupInconsistent(_) => RlnError::Internal(msg),
+        APIError::Network(_) | APIError::NoValidTransportEndpoint => RlnError::Conflict(msg),
+        APIError::ExternalSignerUnavailable(_) => RlnError::ExternalSignerUnavailable(msg),
+        APIError::ExternalSignerProtocolError(_) => RlnError::ExternalSignerProtocolError(msg),
+        #[cfg(feature = "vss")]
+        APIError::FailedVssInit(_) => RlnError::FailedVssInit(msg),
         other => {
             tracing::error!("UniFFI API error mapped to internal: {:?}", other);
-            RlnError::Internal
+            RlnError::Internal(msg)
         }
     }
 }
 
 pub(super) fn map_app_error(err: AppError) -> RlnError {
-    stash_api_error_detail(format!("{err}"));
+    let msg = err.to_string();
+    stash_api_error_detail(msg.clone());
     match err {
         AppError::UnavailablePort(_) | AppError::InvalidAuthenticationArgs => {
-            RlnError::InvalidRequest
+            RlnError::InvalidRequest(msg)
         }
         other => {
             tracing::error!("UniFFI app error mapped to internal: {:?}", other);
-            RlnError::Internal
+            RlnError::Internal(msg)
         }
     }
 }

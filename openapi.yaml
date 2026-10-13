@@ -4,6 +4,22 @@ info:
   description: |-
     This is the OpenAPI specification for the
     [RGB Lightning Node](https://github.com/RGB-Tools/rgb-lightning-node) APIs.
+
+    On mainnet, Lightning APIs return HTTP 403 with name
+    LightningUnsupportedOnMainnet and the message: "RLN on mainnet currently
+    supports only on-chain methods. Lightning APIs are not supported."
+    This includes channel/peer operations, Lightning invoices and decoding,
+    payments, async payments, swaps and swap-string decoding, and onion messages.
+    The configured node network controls the restriction, including while locked.
+    Authentication and request extraction still apply before handler execution.
+    Bitcoin/RGB on-chain APIs (including RGB invoices, transfers and asset linking)
+    and shared administration/identity APIs retain their existing requirements.
+    Mainnet unlock starts the wallet and signer without a Lightning runtime.
+    Historical Lightning records remain inactive and do not prevent unlock. They
+    are not decoded, replayed or recovered. The supported mainnet rollout assumes
+    no unresolved historical Lightning obligations; unlock does not verify that
+    assumption or monitor old channels. Lightning APIs on supported non-mainnet
+    networks are unchanged.
   license:
     name: MIT
     url: https://mit-license.org/
@@ -57,6 +73,8 @@ paths:
             schema:
               $ref: '#/components/schemas/AsyncOrderNewRequest'
       responses:
+        '403':
+          $ref: '#/components/responses/LightningUnsupportedOnMainnet'
         '200':
           description: Host accepted the async order request and returned order state
           content:
@@ -75,6 +93,8 @@ paths:
             schema:
               $ref: '#/components/schemas/AsyncOrderOutboundInvoiceRequest'
       responses:
+        '403':
+          $ref: '#/components/responses/LightningUnsupportedOnMainnet'
         '200':
           description: Recipient peer returned an outbound invoice
           content:
@@ -99,6 +119,24 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AssetBalanceResponse'
+  /assetlink:
+    post:
+      tags:
+        - RGB
+      summary: Create a contract link
+      description: Link a parent IFA contract to a child IFA contract using a link-right UTXO
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssetLinkRequest'
+      responses:
+        '200':
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssetLinkResponse'
   /assetmetadata:
     post:
       tags:
@@ -165,6 +203,8 @@ paths:
             schema:
               $ref: '#/components/schemas/InvoiceCancelRequest'
       responses:
+        '403':
+          $ref: '#/components/responses/LightningUnsupportedOnMainnet'
         '200':
           description: Successful operation
           content:
@@ -237,6 +277,8 @@ paths:
             schema:
               $ref: '#/components/schemas/ClaimHodlInvoiceRequest'
       responses:
+        '403':
+          $ref: '#/components/responses/LightningUnsupportedOnMainnet'
         '200':
           description: Successful operation
           content:
@@ -255,6 +297,8 @@ paths:
             schema:
               $ref: '#/components/schemas/CloseChannelRequest'
       responses:
+        '403':
+          $ref: '#/components/responses/LightningUnsupportedOnMainnet'
         '200':
           description: Successful operation
           content:
@@ -273,6 +317,8 @@ paths:
             schema:
               $ref: '#/components/schemas/ConnectPeerRequest'
       responses:
+        '403':
+          $ref: '#/components/responses/LightningUnsupportedOnMainnet'
         '200':
           description: Successful operation
           content:
@@ -309,6 +355,8 @@ paths:
             schema:
               $ref: '#/components/schemas/DecodeLNInvoiceRequest'
       responses:
+        '403':
+          $ref: '#/components/responses/LightningUnsupportedOnMainnet'
         '200':
           description: Successful operation
           content:
@@ -345,6 +393,8 @@ paths:
             schema:
               $ref: '#/components/schemas/DecodeSwapstringRequest'
       responses:
+        '403':
+          $ref: '#/components/responses/LightningUnsupportedOnMainnet'
         '200':
           description: Successful operation
           content:
@@ -363,6 +413,8 @@ paths:
             schema:
               $ref: '#/components/schemas/DisconnectPeerRequest'
       responses:
+        '403':
+          $ref: '#/components/responses/LightningUnsupportedOnMainnet'
         '200':
           description: Successful operation
           content:
@@ -436,12 +488,36 @@ paths:
             schema:
               $ref: '#/components/schemas/GetChannelIdRequest'
       responses:
+        '403':
+          $ref: '#/components/responses/LightningUnsupportedOnMainnet'
         '200':
           description: Successful operation
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/GetChannelIdResponse'
+  /getconsignment:
+    post:
+      tags:
+        - RGB
+      summary: Get a send consignment
+      description: Get the hex string of the consignment bytes for a send transfer,
+        identified by its asset ID and txid (it also covers burns, where the
+        consignment is the proof of the burn). Useful to hand the consignment to
+        the counterparty out-of-band when the node filesystem is not accessible
+        from the API caller.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GetConsignmentRequest'
+      responses:
+        '200':
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetConsignmentResponse'
   /getpayment:
     post:
       tags:
@@ -454,6 +530,8 @@ paths:
             schema:
               $ref: '#/components/schemas/GetPaymentRequest'
       responses:
+        '403':
+          $ref: '#/components/responses/LightningUnsupportedOnMainnet'
         '200':
           description: Successful operation
           content:
@@ -472,12 +550,35 @@ paths:
             schema:
               $ref: '#/components/schemas/GetSwapRequest'
       responses:
+        '403':
+          $ref: '#/components/responses/LightningUnsupportedOnMainnet'
         '200':
           description: Successful operation
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/GetSwapResponse'
+  /burn:
+    post:
+      tags:
+        - RGB
+      summary: Burn RGB assets
+      description: Burn RGB assets on-chain. For BFA assets a 32-byte burn_recipient
+        (hex) is required, telling where the burned amount is released. The burn
+        consignment, which proves the burn, can then be retrieved with
+        /getconsignment using the asset ID and the returned txid.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BurnRequest'
+      responses:
+        '200':
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BurnResponse'
   /inflate:
     post:
       tags:
@@ -528,6 +629,8 @@ paths:
             schema:
               $ref: '#/components/schemas/InvoiceStatusRequest'
       responses:
+        '403':
+          $ref: '#/components/responses/LightningUnsupportedOnMainnet'
         '200':
           description: Successful operation
           content:
@@ -618,6 +721,8 @@ paths:
             schema:
               $ref: '#/components/schemas/KeysendRequest'
       responses:
+        '403':
+          $ref: '#/components/responses/LightningUnsupportedOnMainnet'
         '200':
           description: Successful operation
           content:
@@ -649,6 +754,8 @@ paths:
       summary: List channels
       description: List the node's LN channels
       responses:
+        '403':
+          $ref: '#/components/responses/LightningUnsupportedOnMainnet'
         '200':
           description: Successful operation
           content:
@@ -726,6 +833,8 @@ paths:
             Return only payments created at or before this Unix timestamp
             (seconds).
       responses:
+        '403':
+          $ref: '#/components/responses/LightningUnsupportedOnMainnet'
         '200':
           description: Successful operation
           content:
@@ -739,6 +848,8 @@ paths:
       summary: List peers
       description: List the node's LN peers
       responses:
+        '403':
+          $ref: '#/components/responses/LightningUnsupportedOnMainnet'
         '200':
           description: Successful operation
           content:
@@ -752,6 +863,8 @@ paths:
       summary: List swaps
       description: List the node's swaps
       responses:
+        '403':
+          $ref: '#/components/responses/LightningUnsupportedOnMainnet'
         '200':
           description: Successful operation
           content:
@@ -785,9 +898,10 @@ paths:
         - RGB
       summary: List transfers
       description: >-
-        List the node's RGB transfers for an asset, ordered most-recent first.
-        Supports index-based cursor pagination (idx) and optional filtering by
-        status and creation time interval.
+        List the node's RGB transfers, ordered most-recent first, scoped by an
+        asset filter and optionally by txid. Supports index-based cursor
+        pagination (idx) and optional filtering by status and creation time
+        interval.
       requestBody:
         content:
           application/json:
@@ -841,7 +955,8 @@ paths:
       summary: Get a LN invoice
       description: >-
         Get a LN invoice to receive a payment. Provide `payment_hash` to create a HODL invoice.
-        Provide `description_hash` to include an out-of-band BOLT11 description hash.
+        Provide `description` to include a BOLT11 description, or `description_hash` to include
+        an out-of-band BOLT11 description hash (mutually exclusive).
         Provide `min_final_cltv_expiry_delta` to request an explicit inbound final CLTV policy.
       requestBody:
         content:
@@ -849,6 +964,8 @@ paths:
             schema:
               $ref: '#/components/schemas/LNInvoiceRequest'
       responses:
+        '403':
+          $ref: '#/components/responses/LightningUnsupportedOnMainnet'
         '200':
           description: Successful operation
           content:
@@ -867,6 +984,8 @@ paths:
             schema:
               $ref: '#/components/schemas/MakerExecuteRequest'
       responses:
+        '403':
+          $ref: '#/components/responses/LightningUnsupportedOnMainnet'
         '200':
           description: Successful operation
           content:
@@ -885,6 +1004,8 @@ paths:
             schema:
               $ref: '#/components/schemas/MakerInitRequest'
       responses:
+        '403':
+          $ref: '#/components/responses/LightningUnsupportedOnMainnet'
         '200':
           description: Successful operation
           content:
@@ -896,7 +1017,10 @@ paths:
       tags:
         - Other
       summary: Get network info
-      description: Get info on the Bitcoin network where the LN is running
+      description: >-
+        Get the configured Bitcoin network and height. On mainnet the height is
+        read from the wallet indexer on demand; an unavailable or wrong-network
+        indexer returns an error. Other networks report the LDK best-block height.
       responses:
         '200':
           description: Successful operation
@@ -909,7 +1033,10 @@ paths:
       tags:
         - Other
       summary: Get node info
-      description: Get the LN node's info
+      description: >-
+        Get node identity, wallet account keys and Lightning information. On mainnet,
+        active Lightning counts and amounts are zero and the RGS timestamp is null.
+        Lightning amounts do not represent the on-chain BTC wallet balance.
       responses:
         '200':
           description: Successful operation
@@ -930,6 +1057,8 @@ paths:
             schema:
               $ref: '#/components/schemas/OpenChannelRequest'
       responses:
+        '403':
+          $ref: '#/components/responses/LightningUnsupportedOnMainnet'
         '200':
           description: Successful operation
           content:
@@ -954,6 +1083,44 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PostAssetMediaResponse'
+  /provideoutofbandack:
+    post:
+      tags:
+        - RGB
+      summary: Provide an out-of-band ACK
+      description: Record the out-of-band ACK received from a recipient of an outgoing transfer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProvideOutOfBandAckRequest'
+      responses:
+        '200':
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProvideOutOfBandAckResponse'
+  /provideoutofbandconsignment:
+    post:
+      tags:
+        - RGB
+      summary: Provide an out-of-band consignment
+      description: Provide a consignment received out-of-band, as a binary upload,
+        along with any media files it references (one `media` field per file)
+        The consignment is validated and the matching incoming transfer(s) are processed.
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/ProvideOutOfBandConsignmentRequest'
+      responses:
+        '200':
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProvideOutOfBandConsignmentResponse'
   /refreshtransfers:
     post:
       tags:
@@ -971,7 +1138,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/EmptyResponse'
+                $ref: '#/components/schemas/RefreshResponse'
   /restore:
     post:
       tags:
@@ -1069,6 +1236,8 @@ paths:
             schema:
               $ref: '#/components/schemas/SendOnionMessageRequest'
       responses:
+        '403':
+          $ref: '#/components/responses/LightningUnsupportedOnMainnet'
         '200':
           description: Successful operation
           content:
@@ -1087,6 +1256,8 @@ paths:
             schema:
               $ref: '#/components/schemas/SendPaymentRequest'
       responses:
+        '403':
+          $ref: '#/components/responses/LightningUnsupportedOnMainnet'
         '200':
           description: Successful operation
           content:
@@ -1172,6 +1343,8 @@ paths:
             schema:
               $ref: '#/components/schemas/TakerRequest'
       responses:
+        '403':
+          $ref: '#/components/responses/LightningUnsupportedOnMainnet'
         '200':
           description: Successful operation
           content:
@@ -1183,7 +1356,16 @@ paths:
       tags:
         - Other
       summary: Unlock the node
-      description: Unlock a locked node
+      description: >-
+        Unlock a locked node. Mainnet starts wallet, signer and configured RGB backup
+        services without constructing or starting LDK. The required ldk_chain_sync
+        payload is parsed but its backend and gossip settings are unused on mainnet.
+        Existing Lightning records remain inactive without preventing wallet unlock.
+        Node-store persistence updates only common configuration; historical Lightning
+        records and their pending replication are preserved. RGB wallet backup and
+        restore retain their separate store. The supported rollout assumes no unresolved
+        historical mainnet Lightning obligations. Unlock does not verify that assumption,
+        inspect other devices or remote histories, or monitor old channels.
       requestBody:
         content:
           application/json:
@@ -1204,8 +1386,9 @@ paths:
       description: >
         Builds a zip of the current RGB wallet directory and uploads it to the
         configured VSS server. Only available when the node was started with
-        --vss-url. The node's KV state is replicated automatically on every
-        persistence event and is not affected by this endpoint.
+        --vss-url. The node's active KV state is replicated automatically on every
+        persistence event and is not affected by this endpoint. On mainnet only
+        common configuration is replicated; historical Lightning state remains inactive.
       responses:
         '200':
           description: Successful operation
@@ -1231,7 +1414,9 @@ paths:
         Returns whether a backup exists on the server, its server-side version,
         whether the local wallet has changes since the last backup, and how
         many KV-stream writes are queued for retry after a replication
-        failure. Read-only; callable by tokens with the read-only role.
+        failure. On mainnet this counts common configuration retries only, excluding
+        preserved historical Lightning intents. Read-only; callable by tokens with
+        the read-only role.
       responses:
         '200':
           description: Successful operation
@@ -1257,12 +1442,18 @@ paths:
                     description: >
                       True if the local wallet has changes since the last
                       successful upload (i.e. a manual backup is needed).
+                  last_auto_backup_error:
+                    type:
+                      - string
+                      - 'null'
+                    description: Most recent automatic VSS backup error, if any.
                   pending_kv_writes:
                     type: integer
                     description: >
                       Number of KV writes that failed to replicate and are
                       queued for retry. A persistently non-zero value
-                      indicates VSS replication is degraded.
+                      indicates VSS replication is degraded. On mainnet this excludes
+                      inactive historical Lightning intents.
         '503':
           description: VSS is not configured or unreachable
   /vssclearfence:
@@ -1304,6 +1495,25 @@ paths:
         '503':
           description: VSS is not configured or unreachable
 components:
+  responses:
+    LightningUnsupportedOnMainnet:
+      description: Lightning APIs are unavailable on a node configured for mainnet.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [name, code, error]
+            properties:
+              name:
+                type: string
+              code:
+                type: integer
+              error:
+                type: string
+          example:
+            name: LightningUnsupportedOnMainnet
+            code: 403
+            error: RLN on mainnet currently supports only on-chain methods. Lightning APIs are not supported.
   schemas:
     AddressResponse:
       type: object
@@ -1536,6 +1746,48 @@ components:
           oneOf:
             - $ref: '#/components/schemas/Media'
             - type: 'null'
+    AssetFilter:
+      oneOf:
+        - $ref: '#/components/schemas/AssetFilterAnyOrNone'
+        - $ref: '#/components/schemas/AssetFilterNone'
+        - $ref: '#/components/schemas/AssetFilterId'
+      discriminator:
+        propertyName: type
+        mapping:
+          AnyOrNone: '#/components/schemas/AssetFilterAnyOrNone'
+          None: '#/components/schemas/AssetFilterNone'
+          Id: '#/components/schemas/AssetFilterId'
+    AssetFilterAnyOrNone:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          enum: [AnyOrNone]
+    AssetFilterId:
+      type: object
+      required:
+        - type
+        - value
+      properties:
+        type:
+          type: string
+          enum: [Id]
+        value:
+          type: string
+          example: rgb:CJkb4YZw-jRiz2sk-~PARPio-wtVYI1c-XAEYCqO-wTfvRZ8
+      example:
+        type: Id
+        value: rgb:CJkb4YZw-jRiz2sk-~PARPio-wtVYI1c-XAEYCqO-wTfvRZ8
+    AssetFilterNone:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          enum: [None]
     AssetIFA:
       type: object
       required:
@@ -1593,6 +1845,109 @@ components:
             - string
             - 'null'
           example: https://some.domain/someasset/rejectlist
+        issuance_link_right_outpoint:
+          oneOf:
+            - $ref: '#/components/schemas/Outpoint'
+            - type: 'null'
+        linked_from_asset_id:
+          type:
+            - string
+            - 'null'
+        linked_to_asset_id:
+          type:
+            - string
+            - 'null'
+    AssetBFA:
+      type: object
+      required:
+        - asset_id
+        - ticker
+        - name
+        - precision
+        - initial_supply
+        - timestamp
+        - added_at
+        - balance
+      properties:
+        asset_id:
+          type: string
+          example: rgb:CJkb4YZw-jRiz2sk-~PARPio-wtVYI1c-XAEYCqO-wTfvRZ8
+        ticker:
+          type: string
+          example: USDT
+        name:
+          type: string
+          example: Tether
+        details:
+          type:
+            - string
+            - 'null'
+          example: asset details
+        precision:
+          type: integer
+          example: 6
+        initial_supply:
+          type: integer
+          example: 777
+        timestamp:
+          type: integer
+          example: 1691160565
+        added_at:
+          type: integer
+          example: 1691161979
+        balance:
+          $ref: '#/components/schemas/AssetBalanceResponse'
+        media:
+          oneOf:
+            - $ref: '#/components/schemas/Media'
+            - type: 'null'
+        reject_list_url:
+          type:
+            - string
+            - 'null'
+          example: https://some.domain/someasset/rejectlist
+    AssetLinkRequest:
+      type: object
+      required:
+        - parent_asset_id
+        - child_asset_id
+        - min_confirmations
+      properties:
+        parent_asset_id:
+          type: string
+          example: rgb:CJkb4YZw-jRiz2sk-~PARPio-wtVYI1c-XAEYCqO-wTfvRZ8
+        child_asset_id:
+          type: string
+          example: rgb:CJkb4YZw-jRiz2sk-~PARPio-wtVYI1c-XAEYCqO-wTfvRZ9
+        min_confirmations:
+          type: integer
+          example: 1
+    AssetLinkResponse:
+      type: object
+      required:
+        - parent_asset_id
+        - child_asset_id
+        - created_at
+        - txid
+      properties:
+        parent_asset_id:
+          type: string
+          example: rgb:CJkb4YZw-jRiz2sk-~PARPio-wtVYI1c-XAEYCqO-wTfvRZ8
+        child_asset_id:
+          type:
+            - string
+            - 'null'
+          example: rgb:CJkb4YZw-jRiz2sk-~PARPio-wtVYI1c-XAEYCqO-wTfvRZ9
+        created_at:
+          type:
+            - integer
+            - 'null'
+          example: 1691160565
+        txid:
+          type:
+            - string
+            - 'null'
+          example: 4b0d1f2c0d8a4e8d7e5e3f8f5a6b7c8d9e0f102132435465768798a9b0c1d2e3
     AssetMetadataRequest:
       type: object
       required:
@@ -1646,6 +2001,18 @@ components:
           oneOf:
             - $ref: '#/components/schemas/Token'
             - type: 'null'
+        linked_from_asset_id:
+          type:
+            - string
+            - 'null'
+        linked_to_asset_id:
+          type:
+            - string
+            - 'null'
+        unspent_link_right_outpoint:
+          oneOf:
+            - $ref: '#/components/schemas/Outpoint'
+            - type: 'null'
     AssetNIA:
       type: object
       required:
@@ -1697,6 +2064,7 @@ components:
         - Uda
         - Cfa
         - Ifa
+        - Bfa
     AssetUDA:
       type: object
       required:
@@ -1743,6 +2111,7 @@ components:
         - $ref: '#/components/schemas/AssignmentNonFungible'
         - $ref: '#/components/schemas/AssignmentInflationRight'
         - $ref: '#/components/schemas/AssignmentAny'
+        - $ref: '#/components/schemas/AssignmentBridgeRight'
       discriminator:
         propertyName: type
         mapping:
@@ -1750,6 +2119,7 @@ components:
           NonFungible: '#/components/schemas/AssignmentNonFungible'
           InflationRight: '#/components/schemas/AssignmentInflationRight'
           Any: '#/components/schemas/AssignmentAny'
+          BridgeRight: '#/components/schemas/AssignmentBridgeRight'
     AssignmentAny:
       type: object
       required:
@@ -1758,6 +2128,14 @@ components:
         type:
           type: string
           enum: [Any]
+    AssignmentBridgeRight:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          enum: [BridgeRight]
     AssignmentFungible:
       type: object
       required:
@@ -1815,6 +2193,19 @@ components:
         - Signet
         - SignetCustom
         - Regtest
+    Outpoint:
+      type: object
+      required:
+        - txid
+        - vout
+      properties:
+        txid:
+          type: string
+          example: 4b0d1f2c0d8a4e8d7e5e3f8f5a6b7c8d9e0f102132435465768798a9b0c1d2e3
+        vout:
+          type: integer
+          format: int32
+          example: 0
     BlockTime:
       type: object
       required:
@@ -2101,6 +2492,11 @@ components:
             - integer
             - 'null'
           example: 42
+        description:
+          type:
+            - string
+            - 'null'
+          example: 1 cup of coffee
         description_hash:
           type:
             - string
@@ -2134,14 +2530,19 @@ components:
       type: object
       required:
         - recipient_id
+        - proxy_recipient_id
         - recipient_type
         - assignment
         - network
         - transport_endpoints
+        - unknown_query_params
       properties:
         recipient_id:
           type: string
           example: bcrt:utxob:cbgHUJ4e-7QyKY4U-Jsj5AZw-oI0gxZh-7fxQY2_-tFFUAZN-4CgpX
+        proxy_recipient_id:
+          type: string
+          example: bcrt:utxob:cbgHUJ4e-7QyKY4U-Jsj5AZw-oI0gxZh-7fxQY2_-tFFUAZN-4CgpY
         recipient_type:
           $ref: '#/components/schemas/RecipientType'
         asset_schema:
@@ -2167,6 +2568,11 @@ components:
           items:
             type: string
             example: rpcs://proxy.iriswallet.com/0.2/json-rpc
+        unknown_query_params:
+          type: object
+          additionalProperties:
+            type: string
+          example: {}
     DecodeSwapstringRequest:
       type: object
       required:
@@ -2302,6 +2708,26 @@ components:
         channel_id:
           type: string
           example: 8129afe1b1d7cf60d5e1bf4c04b09bec925ed4df5417ceee0484e24f816a105a
+    GetConsignmentRequest:
+      type: object
+      required:
+        - asset_id
+        - txid
+      properties:
+        asset_id:
+          type: string
+          example: rgb:2dkSTbr-jFhznbPmo-TQafzswCN-av4gTsJjX-ttx6CNou5-M98k8Zt
+        txid:
+          type: string
+          example: 33cf3e42fb1c6faa0d47e6a498a9d4e5c56e8a06ea0d295c6d90e2b6c85f7a1e
+    GetConsignmentResponse:
+      type: object
+      required:
+        - bytes_hex
+      properties:
+        bytes_hex:
+          type: string
+          example: 52474200
     GetPaymentRequest:
       type: object
       required:
@@ -2353,6 +2779,44 @@ components:
       enum:
         - Electrum
         - Esplora
+    BurnRequest:
+      type: object
+      required:
+        - asset_id
+        - amount
+        - fee_rate
+        - min_confirmations
+      properties:
+        asset_id:
+          type: string
+          example: rgb:CJkb4YZw-jRiz2sk-~PARPio-wtVYI1c-XAEYCqO-wTfvRZ8
+        amount:
+          type: integer
+          example: 100
+        burn_recipient:
+          type:
+            - string
+            - 'null'
+          description: Hex-encoded 32-byte recipient of the burned amount, required for BFA assets
+          example: 000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266
+        fee_rate:
+          type: integer
+          example: 5
+        min_confirmations:
+          type: integer
+          example: 1
+    BurnResponse:
+      type: object
+      required:
+        - txid
+        - batch_transfer_idx
+      properties:
+        txid:
+          type: string
+          example: 7c2c95b9c2aa0a7d140495b664de7973b76561de833f0dd84def3efa08941664
+        batch_transfer_idx:
+          type: integer
+          example: 1
     InflateRequest:
       type: object
       required:
@@ -2499,6 +2963,10 @@ components:
             - string
             - 'null'
           example: https://some.domain/someasset/rejectlist
+        issuance_type:
+          oneOf:
+            - $ref: '#/components/schemas/IfaIssuanceType'
+            - type: 'null'
     IssueAssetIFAResponse:
       type: object
       required:
@@ -2506,6 +2974,33 @@ components:
       properties:
         asset:
           $ref: '#/components/schemas/AssetIFA'
+    IfaIssuanceType:
+      oneOf:
+        - $ref: '#/components/schemas/IfaIssuanceTypeLegacy'
+        - $ref: '#/components/schemas/IfaIssuanceTypeLinkRightOnly'
+        - $ref: '#/components/schemas/IfaIssuanceTypeLinkedFromParent'
+    IfaIssuanceTypeLegacy:
+      type: string
+      enum: [legacy]
+    IfaIssuanceTypeLinkRightOnly:
+      type: string
+      enum: [linkRightOnly]
+    IfaIssuanceTypeLinkedFromParent:
+      type: object
+      required:
+        - linkedFromParent
+      properties:
+        linkedFromParent:
+          type: object
+          required:
+            - contractId
+          properties:
+            contractId:
+              type: string
+              example: rgb:CJkb4YZw-jRiz2sk-~PARPio-wtVYI1c-XAEYCqO-wTfvRZ8
+            requestLinkRight:
+              type: boolean
+              example: true
     IssueAssetNIARequest:
       type: object
       required:
@@ -2611,6 +3106,61 @@ components:
           example: 89d28bd306aa9bb906fd0ac31092d04c37c919a171b343083167e2a3cdc60578
         status:
           $ref: '#/components/schemas/HTLCStatus'
+    LdkChainSync:
+      oneOf:
+        - $ref: '#/components/schemas/LdkChainSyncBlockSync'
+        - $ref: '#/components/schemas/LdkChainSyncTransactionSync'
+      discriminator:
+        propertyName: mode
+        mapping:
+          BlockSync: '#/components/schemas/LdkChainSyncBlockSync'
+          TransactionSync: '#/components/schemas/LdkChainSyncTransactionSync'
+    LdkChainSyncBlockSync:
+      type: object
+      required:
+        - mode
+        - config
+      properties:
+        mode:
+          type: string
+          enum: [BlockSync]
+        config:
+          type: object
+          required:
+            - bitcoind_rpc_username
+            - bitcoind_rpc_password
+            - bitcoind_rpc_host
+            - bitcoind_rpc_port
+          properties:
+            bitcoind_rpc_username:
+              type: string
+              example: user
+            bitcoind_rpc_password:
+              type: string
+              example: password
+            bitcoind_rpc_host:
+              type: string
+              example: localhost
+            bitcoind_rpc_port:
+              type: integer
+              example: 18443
+    LdkChainSyncTransactionSync:
+      type: object
+      required:
+        - mode
+        - config
+      properties:
+        mode:
+          type: string
+          enum: [TransactionSync]
+        config:
+          type: object
+          required:
+            - indexer_url
+          properties:
+            indexer_url:
+              type: string
+              example: 127.0.0.1:50001
     ListAssetsRequest:
       type: object
       required:
@@ -2628,6 +3178,7 @@ components:
         - uda
         - cfa
         - ifa
+        - bfa
       properties:
         nia:
           type:
@@ -2653,6 +3204,12 @@ components:
             - 'null'
           items:
             $ref: '#/components/schemas/AssetIFA'
+        bfa:
+          type:
+            - array
+            - 'null'
+          items:
+            $ref: '#/components/schemas/AssetBFA'
     ListChannelsResponse:
       type: object
       required:
@@ -2762,21 +3319,25 @@ components:
     ListTransfersRequest:
       type: object
       description: >-
-        Provide either asset_id (list that asset's transfers) or txid (list the
-        transfers committed by that on-chain transaction, across all assets).
+        asset_filter selects the asset scope: Id (that asset's transfers), None
+        (only transfers not tied to an asset) or AnyOrNone (no asset
+        restriction). txid further restricts the result to the transfers
+        committed by that on-chain transaction, across all assets; combined
+        with an Id filter it acts as an intersection. AnyOrNone without a txid
+        is rejected, so narrow by asset_filter, by txid, or by both.
+      required:
+        - asset_filter
       properties:
-        asset_id:
-          type:
-            - string
-            - 'null'
-          example: rgb:CJkb4YZw-jRiz2sk-~PARPio-wtVYI1c-XAEYCqO-wTfvRZ8
+        asset_filter:
+          $ref: '#/components/schemas/AssetFilter'
         txid:
           type:
             - string
             - 'null'
+          example: 47ee0f5b7bd5b0dd7f10ce54a94fee1b5cd54e5241b0f70f9f373d10e7a3c3e2
           description: >-
             Return the transfers committed by the on-chain transaction with this
-            txid. Takes precedence over asset_id when both are given.
+            txid. Combined with an Id asset_filter it acts as an intersection.
         index_offset:
           type:
             - integer
@@ -2915,9 +3476,13 @@ components:
           type: string
           description: Optional. When provided, the invoice is created as HODL.
           example: 3febfae1e68b190c15461f4c2a3290f9af1dae63fd7d620d2bd61601869026cd
+        description:
+          type: string
+          description: Optional. When provided, the invoice includes a BOLT11 description. Mutually exclusive with description_hash.
+          example: 1 cup of coffee
         description_hash:
           type: string
-          description: Optional. When provided, the invoice includes a BOLT11 description hash.
+          description: Optional. When provided, the invoice includes a BOLT11 description hash. Mutually exclusive with description.
           example: 5ca5d81b482b4015e7b14df7a27fe0a38c226273604ffd3b008b752571811938
         min_final_cltv_expiry_delta:
           type: integer
@@ -3164,6 +3729,23 @@ components:
         temporary_channel_id:
           type: string
           example: a8b60c8ce3067b5fc881d4831323e24751daec3b64353c8df3205ec5d838f1c5
+    OperationResult:
+      type: object
+      required:
+        - txid
+        - batch_transfer_idx
+        - entropy
+      properties:
+        txid:
+          type: string
+          example: 33cf3e42fb1c6faa0d47e6a498a9d4e5c56e8a06ea0d295c6d90e2b6c85f7a1e
+        batch_transfer_idx:
+          type: integer
+          example: 3
+        entropy:
+          type: integer
+          format: int64
+          example: 12345678901234567890
     PaymentType:
       type: string
       enum:
@@ -3214,6 +3796,12 @@ components:
         preimage:
           type: string
           example: 89d28bd306aa9bb906fd0ac31092d04c37c919a171b343083167e2a3cdc60578
+        description:
+          type:
+            - string
+            - 'null'
+          description: BOLT11 description (the d tag), if present
+          example: 1 cup of coffee
         description_hash:
           type:
             - string
@@ -3258,6 +3846,43 @@ components:
           items:
             type: integer
           example: [6, 36, 87, 13, 5, 17]
+    ProvideOutOfBandAckRequest:
+      type: object
+      required:
+        - recipient_id
+      properties:
+        recipient_id:
+          type: string
+          example: utxob:2Bwv2Vx-t7VD8XjTh-9EMbpBFKh-J5HDFY4pj-eywu4tKKk-hjTvzJa
+    ProvideOutOfBandAckResponse:
+      type: object
+      properties:
+        operation:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/OperationResult'
+    ProvideOutOfBandConsignmentRequest:
+      type: object
+      required:
+        - file
+      properties:
+        file:
+          type: string
+          format: binary
+        media:
+          type: array
+          items:
+            type: string
+            format: binary
+    ProvideOutOfBandConsignmentResponse:
+      type: object
+      required:
+        - transfers
+      properties:
+        transfers:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/RefreshedTransfer'
     Recipient:
       type: object
       required:
@@ -3284,6 +3909,37 @@ components:
       enum:
         - Blind
         - Witness
+    RefreshedTransfer:
+      type: object
+      properties:
+        updated_status:
+          nullable: true
+          type: string
+          enum:
+            - Initiated
+            - WaitingCounterparty
+            - WaitingSafeHeight
+            - WaitingConfirmations
+            - WaitingBroadcast
+            - Settled
+            - Failed
+          example: WaitingBroadcast
+        failure:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/RefreshFailure'
+    RefreshFailure:
+      type: object
+      required:
+        - name
+        - message
+      properties:
+        name:
+          type: string
+          example: InvalidConsignment
+        message:
+          type: string
+          example: Invalid consignment
     RefreshFilter:
       type: object
       required:
@@ -3312,6 +3968,15 @@ components:
         skip_sync:
           type: boolean
           example: false
+    RefreshResponse:
+      type: object
+      required:
+        - transfers
+      properties:
+        transfers:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/RefreshedTransfer'
     RefreshTransferStatus:
       type: string
       enum:
@@ -3358,6 +4023,7 @@ components:
       required:
         - min_confirmations
         - witness
+        - transport_endpoints
       properties:
         min_confirmations:
           type: integer
@@ -3373,19 +4039,24 @@ components:
             - type: 'null'
           example: null
         expiration_timestamp:
-          type:
-            - integer
-            - 'null'
-          example: null
+          type: integer
+          example: 1695811760
         witness:
           type: boolean
           example: false
+        transport_endpoints:
+          type: array
+          items:
+            type: string
+          example:
+            - rpc://127.0.0.1:3000/json-rpc
     RgbInvoiceResponse:
       type: object
       required:
         - recipient_id
         - invoice
         - batch_transfer_idx
+        - expiration_timestamp
       properties:
         recipient_id:
           type: string
@@ -3394,9 +4065,7 @@ components:
           type: string
           example: rgb:~/~/~/bcrt:utxob:cbgHUJ4e-7QyKY4U-Jsj5AZw-oI0gxZh-7fxQY2_-tFFUAZN-4CgpX?expiry=1695811760&endpoints=rpc://127.0.0.1:3000/json-rpc
         expiration_timestamp:
-          type:
-            - integer
-            - 'null'
+          type: integer
           example: 1695811760
         batch_transfer_idx:
           type: integer
@@ -3509,10 +4178,8 @@ components:
           type: integer
           example: 1
         expiration_timestamp:
-          type:
-            - integer
-            - 'null'
-          example: null
+          type: integer
+          example: 1695811760
         recipient_map:
           type: object
           additionalProperties:
@@ -3833,6 +4500,11 @@ components:
             - string
             - 'null'
           example: 61qsVbWtkNmU54F2i6qtB9uSmEGsPoaeypCi5uC5uctZ
+        proxy_recipient_id:
+          type:
+            - string
+            - 'null'
+          example: 61qsVbWtkNmU54F2i6qtB9uSmEGsPoaeypCi5uC5ucX
         receive_utxo:
           type:
             - string
@@ -3869,6 +4541,7 @@ components:
         - WaitingCounterparty
         - WaitingSafeHeight
         - WaitingConfirmations
+        - WaitingBroadcast
         - Settled
         - Failed
     TransferTransportEndpoint:
@@ -3894,36 +4567,26 @@ components:
       type: object
       required:
         - password
+        - ldk_chain_sync
         - announce_addresses
       properties:
         password:
           type: string
           example: nodepassword
-        bitcoind_rpc_username:
-          type:
-            - string
-            - 'null'
-          example: user
-        bitcoind_rpc_password:
-          type:
-            - string
-            - 'null'
-          example: password
-        bitcoind_rpc_host:
-          type:
-            - string
-            - 'null'
-          example: localhost
-        bitcoind_rpc_port:
-          type:
-            - integer
-            - 'null'
-          example: 18443
+        ldk_chain_sync:
+          $ref: '#/components/schemas/LdkChainSync'
         indexer_url:
           type:
             - string
             - 'null'
           example: 127.0.0.1:50001
+        eth_rpc_url:
+          type:
+            - string
+            - 'null'
+          description: Ethereum RPC used to validate BFA consignments. When set (here
+            or via the config file) the node supports BFA assets, otherwise BFA is disabled
+          example: http://127.0.0.1:8545
         proxy_endpoint:
           type:
             - string
@@ -3995,6 +4658,8 @@ components:
         - outpoint
         - btc_amount
         - colorable
+        - exists
+        - derivation_index
       properties:
         outpoint:
           type: string
@@ -4005,6 +4670,14 @@ components:
         colorable:
           type: boolean
           example: true
+        exists:
+          type: boolean
+          example: true
+        derivation_index:
+          type:
+            - integer
+            - 'null'
+          example: 42
     WitnessData:
       type: object
       required:

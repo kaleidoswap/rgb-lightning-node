@@ -47,30 +47,12 @@ cd bindings/wasm-sdk
 wasm-pack build --target web --dev --out-dir pkg
 ```
 
-The `rgb-native-phase5-node` harness binary must be available at the path the driver
-expects (`run_multihop_flow.mjs` resolves it under
-`../rust-lightning/contrib/rgb-cross-variant-harness/target/debug/`). A headless Chrome
-and a `puppeteer-core` install are also required (see env vars below).
-
-> **Virtual-channel full flow (`run_e2e_full_flow.mjs`):** the native LSP node
-> (LN peer `127.0.0.1:9802`, REST `127.0.0.1:3101`) must be started with
-> `--enable-virtual-channels-v0`. In this flow the LSP is the channel opener/funder **and** the RGB
-> asset issuer — it opens both virtual channels to the wasm node and pushes BTC + RGB liquidity; the
-> wasm node only accepts. The LSP wallet is funded on-chain by the flow itself via the gateway
-> regtest faucet, so it just needs to be unlocked and online.
-
 ## Run
 
 ```sh
 PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome \
 E2E_PUPPETEER=/tmp/e2e-driver/node_modules/puppeteer-core \
 node bindings/wasm-sdk/examples/wasm-interop/run_e2e_full_flow.mjs
-```
-
-```sh
-PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome \
-E2E_PUPPETEER=/tmp/e2e-driver/node_modules/puppeteer-core \
-node bindings/wasm-sdk/examples/wasm-interop/run_multihop_flow.mjs
 ```
 
 A successful run ends with `✅✅✅ ... PASSED` and exit code 0.

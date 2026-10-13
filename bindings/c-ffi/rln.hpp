@@ -39,9 +39,13 @@ CResultString rln_address(const COpaqueStruct *node);
 
 CResultString rln_asset_balance(const COpaqueStruct *node, const char *asset_id);
 
+CResultString rln_asset_link_create(const COpaqueStruct *node, const char *request_json);
+
 CResultString rln_asset_metadata(const COpaqueStruct *node, const char *asset_id);
 
 CResultString rln_btc_balance(const COpaqueStruct *node, bool skip_sync);
+
+CResultString rln_burn(const COpaqueStruct *node, const char *request_json);
 
 CResultString rln_cancel_hodl_invoice(const COpaqueStruct *node, const char *request_json);
 
@@ -74,11 +78,28 @@ CResultString rln_get_asset_media(const COpaqueStruct *node, const char *digest)
 
 CResultString rln_get_channel_id(const COpaqueStruct *node, const char *temporary_channel_id_hex);
 
+/// Returns `{"bytes_hex": ...}` with the consignment of an outgoing transfer (send, burn,
+/// inflation, link), e.g. the proof of a burn to hand to whoever releases the burned amount.
+CResultString rln_get_consignment(const COpaqueStruct *node,
+                                  const char *asset_id,
+                                  const char *txid);
+
+/// Returns `{"path": ...}`: the local path of the same consignment [`rln_get_consignment`]
+/// returns, to read or share the file without copying it through the FFI.
+CResultString rln_get_consignment_path(const COpaqueStruct *node,
+                                       const char *asset_id,
+                                       const char *txid);
+
 CResultString rln_get_payment(const COpaqueStruct *node,
                               const char *payment_hash_hex,
                               const char *payment_type);
 
 CResultString rln_get_swap(const COpaqueStruct *node, const char *payment_hash, bool taker_flag);
+
+CResultString rln_import_rgb_contract(const COpaqueStruct *node, const char *request_json);
+
+CResultString rln_import_rgb_transfer_consignment(const COpaqueStruct *node,
+                                                  const char *request_json);
 
 CResultString rln_inflate(const COpaqueStruct *node, const char *request_json);
 
@@ -104,15 +125,13 @@ CResultString rln_list_peers(const COpaqueStruct *node);
 
 CResultString rln_list_swaps(const COpaqueStruct *node);
 
-CResultString rln_list_transactions(const COpaqueStruct *node, bool skip_sync);
+CResultString rln_list_transactions(const COpaqueStruct *node,
+                                    bool skip_sync,
+                                    const char *txid_opt);
 
-CResultString rln_list_transactions_by_txid(const COpaqueStruct *node,
-                                            const char *txid,
-                                            bool skip_sync);
-
-CResultString rln_list_transfers(const COpaqueStruct *node, const char *asset_id);
-
-CResultString rln_list_transfers_by_txid(const COpaqueStruct *node, const char *txid);
+CResultString rln_list_transfers(const COpaqueStruct *node,
+                                 const char *asset_id_opt,
+                                 const char *txid_opt);
 
 CResultString rln_list_unspents(const COpaqueStruct *node, bool skip_sync);
 
@@ -216,5 +235,9 @@ CResultString rln_taker(const COpaqueStruct *node, const char *request_json);
 CResultString rln_uniffi_healthcheck();
 
 CResultString rln_uniffi_is_initialized();
+
+CResultString rln_verify_message(const COpaqueStruct *node,
+                                 const char *message,
+                                 const char *signature);
 
 }  // extern "C"

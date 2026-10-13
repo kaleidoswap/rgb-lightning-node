@@ -2,7 +2,7 @@
 name = "rgb-lightning-node"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.88.0"
+rust-version = "1.94.0"
 
 [lib]
 name = "rgb_lightning_node"
@@ -25,10 +25,40 @@ exclude = [
 unexpected_cfgs = "allow"
 
 [features]
-default = []
+# every fork gate (build/lint/test) runs without `--no-default-features`, so the chain-backend
+# features are all on by default and the previously unconditional code keeps compiling
+default = [
+    "block-sync",
+    "transaction-sync",
+    "electrum",
+    "esplora",
+]
 test-utils = []
-vls = ["signer-external/with-vls"]
+vls = ["signer-external/with-vls", "dep:vls-persist"]
 vss = ["rgb-lib/vss", "dep:vss-client"]
+remote-signer = ["dep:vls-persist", "dep:tokio-rustls", "dep:rustls-pemfile", "vls"]
+# sync LDK from a bitcoind instance, consuming full blocks over JSON-RPC
+block-sync = [
+    "dep:lightning-block-sync",
+]
+# sync LDK from the indexer, without requiring a bitcoind instance
+transaction-sync = [
+    "dep:lightning-transaction-sync",
+]
+# support indexers implementing the electrum protocol
+electrum = [
+    "rgb-lib/electrum",
+    "lightning/electrum",
+    "lightning-transaction-sync?/electrum",
+    "dep:electrum-client",
+]
+# support indexers implementing the esplora protocol
+esplora = [
+    "rgb-lib/esplora",
+    "lightning/esplora",
+    "lightning-transaction-sync?/esplora-blocking",
+    "dep:esplora-client",
+]
 
 [dependencies]
 amplify = { version = "=4.8.1", default-features = false }
@@ -47,33 +77,32 @@ chacha20 = "0.9.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = "4.5.20"
 dirs = "5.0.1"
-electrum-client = "0.20.0"
-esplora-client = { version = "0.12", default-features = false, features = ["blocking-https-rustls"] }
+# kept on default features (adds `proxy`) so socks5 electrum URLs keep working
+electrum-client = { version = "0.24.0", optional = true }
+esplora-client = { version = "0.12", default-features = false, features = ["blocking-https-rustls"], optional = true }
 futures = "0.3"
 hex = { package = "hex-conservative", version = "0.3.0", default-features = false }
 lightning = { version = "0.2.0", features = ["dnssec"] }
 lightning-background-processor = { version = "0.2.0" }
-lightning-block-sync = { version = "0.2.0", features = ["rpc-client", "tokio"] }
+lightning-block-sync = { version = "0.2.0", features = ["rpc-client", "tokio"], optional = true }
 lightning-dns-resolver = { version = "0.3.0" }
 lightning-invoice = { version = "0.34.0", features = ["std"] }
 lightning-macros = { version = "0.2.0" }
 lightning-net-tokio = { version = "0.2.0" }
 lightning-persister = { version = "0.2.0", features = ["tokio"] }
 lightning-rapid-gossip-sync = { version = "0.2.0" }
-lightning-transaction-sync = { version = "0.2.0", features = ["esplora-blocking", "electrum"] }
-magic-crypt = "4.0.1"
+lightning-transaction-sync = { version = "0.2.0", optional = true }
 rand = "0.8.5"
 regex = { version = "1.11", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
-rgb-lib = { git = "https://github.com/UTEXO-Protocol/rgb-lib.git", tag = "v0.3.0-beta.27", features = [
-    "electrum",
-    "esplora",
-] }
-psrgbt = { package = "rgb-psbt-utils", version = "=0.11.1-rc.10", default-features = false }
+rgb-lib = { git = "https://github.com/UTEXO-Protocol/rgb-lib.git", tag = "v0.3.0-beta.47-bfa", default-features = false }
+psrgbt = { package = "rgb-psbt-utils", version = "=0.11.1-rc.11", default-features = false }
 rln-migration = { path = "migration" }
 # Pinned fork/branch for RGB compatibility work; CI and clones do not require a sibling checkout.
 signer-external = { git = "https://github.com/UTEXO-Protocol/rln-external-signer.git", branch = "main", default-features = false }
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
 sea-orm = { version = "1.1.19", default-features = false, features = [
     "macros",
     "runtime-tokio-rustls",
@@ -83,6 +112,7 @@ sea-orm = { version = "1.1.19", default-features = false, features = [
 scrypt = "0.11.0"
 serde = { version = "^1.0", features = ["derive"] }
 serde_json = "1.0"
+toml = "0.8"
 prost = "0.13"
 tempfile = "3.14.0"
 thiserror = "2.0"
@@ -93,7 +123,6 @@ tower-http = { version = "0.6.1", features = ["cors", "limit", "trace"] }
 tracing = "0.1"
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-typenum = "1.17.0"
 uuid = { version = "1.11.0", default-features = false, features = ["v4"] }
 # `vls-protocol` remains on crates.io; only `vls-core` and
 # `vls-protocol-signer` need the RGB compatibility forks.
@@ -102,17 +131,29 @@ vls-protocol-client = "0.14.0"
 vls-protocol-signer = "0.14.0"
 # Use the remote RGB compatibility fork for `vls-core`.
 lightning-signer = { package = "vls-core", version = "0.14.0", features = ["rgb-commitment-compat"] }
+# Disk-backed persistence for the remote-signer daemon's VLS node (channel state + dbid high-water
+# mark), so a daemon process restart never reissues a dbid already bound to an existing channel's
+# revocable keys. Same backend the reference `vlsd` signer daemon uses in production.
+vls-persist = { version = "0.14.0", default-features = false, features = ["std", "kvv", "redb-kvv"], optional = true }
 walkdir = "2.5.0"
 uniffi = { version = "0.28.3", features = ["build"], optional = true }
 vss-client = { package = "vss-client-ng", git = "https://github.com/lightningdevkit/vss-client", rev = "ad63805047561dcf3117cd992ad6d8bc3881adef", default-features = false, features = ["sigs-auth"], optional = true }
 zip = { version = "2.2.0", default-features = false, features = ["time", "zstd"] }
 
+[target.'cfg(unix)'.dependencies]
+# Only for `geteuid()` in the signer-state file/dir ownership checks (`signer::key_source`).
+libc = "0.2"
+
 [dev-dependencies]
 dircmp = "0.2.0"
-electrum-client = "0.20.0"
+rcgen = "0.13"
+electrum-client = "0.24.0"
 http = "1.4.0"
 lazy_static = { version = "1.5.0", default-features = false }
 lightning = { version = "0.2.0", features = ["_rln_test_hooks"] }
+# Additive: unifies with the main `tokio` dependency's features for test builds only, enabling
+# `#[tokio::test(start_paused = true)]` virtual-time tests (e.g. retry/backoff timing).
+tokio = { version = "1", features = ["test-util"] }
 once_cell = "1.20.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "native-tls", "stream"] }
 serial_test = "3.1.1"
@@ -134,13 +175,24 @@ lightning-transaction-sync = { path = "./rust-lightning/lightning-transaction-sy
 # Use the UTEXO RGB compatibility branches; no sibling local checkout required.
 vls-core = { git = "https://github.com/UTEXO-Protocol/vls-core.git", branch = "feat/rgb-compatibility" }
 vls-protocol-signer = { git = "https://github.com/UTEXO-Protocol/vls-protocol-signer.git", branch = "feat/rgb-compatibility" }
-
+# rgb-lib `-bfa` tags build against the BFA-enabled RGB crates; `[patch]` is not inherited from
+# dependencies, so these must mirror the ones in rgb-lib's own Cargo.toml.
+rgb-consensus = { git = "https://github.com/UTEXO-Protocol/rgb-consensus-s-bfa", rev = "2faf6118b2f5fe30dd90dd5244d5a7dc32bcd757" }
+rgb-ops = { git = "https://github.com/UTEXO-Protocol/rgb-ops-s-bfa", rev = "773766b5ca7a9e705ec68c2f9ed0917f505cd6e3" }
+rgb-invoicing = { git = "https://github.com/UTEXO-Protocol/rgb-ops-s-bfa", rev = "773766b5ca7a9e705ec68c2f9ed0917f505cd6e3" }
+rgb-schemas = { git = "https://github.com/UTEXO-Protocol/rgb-schemas-s-bfa", rev = "238dfe7a89db998107fd87d919bf2757a2746d7f" }
 [lints.rust.unexpected_cfgs]
 level = "allow"
 
 [profile.reldebug]
 inherits = "release"
 debug = 1
+
+# Remote external signer daemon (Option A): holds the seed and answers all signing over framed TCP.
+[[bin]]
+name = "rln-signer-daemon"
+path = "src/bin/rln-signer-daemon.rs"
+required-features = ["remote-signer"]
 
 [[test]]
 name = "lib_core"

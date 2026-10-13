@@ -1,4 +1,7 @@
 use crate::ldk::write_rgb_payment_info_file;
+use crate::rgb_import::{
+    self, ImportRgbContractRequestData, ImportRgbTransferConsignmentRequestData,
+};
 use amplify::{map, s};
 use axum::{
     extract::{Multipart, State},
@@ -11,14 +14,12 @@ use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Network, ScriptBuf};
 use hex::DisplayHex;
-use lightning::chain::channelmonitor::Balance;
 use lightning::ln::{channelmanager::OptionalOfferPaymentParams, types::ChannelId};
 use lightning::offers::offer::{self, Offer};
 use lightning::onion_message::messenger::Destination;
 use lightning::rgb_utils::{RgbInfo, RgbKvStoreExt, STATIC_BLINDING};
 use lightning::routing::gossip::RoutingFees;
 use lightning::routing::router::{Path as LnPath, Route, RouteHint, RouteHintHop};
-use lightning::util::config::ChannelConfig;
 use lightning::{
     ln::channel_state::ChannelShutdownState, onion_message::messenger::MessageSendInstructions,
 };
@@ -36,7 +37,7 @@ use lightning::{
     util::config::{ChannelHandshakeConfig, ChannelHandshakeLimits, UserConfig},
     util::{errors::APIError as LDKAPIError, IS_SWAP_SCID},
 };
-use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description, PaymentSecret};
+use lightning_invoice::{Bolt11Invoice, PaymentSecret};
 use regex::Regex;
 use rgb_lib::utils::recipient_id_from_script_buf;
 use rgb_lib::{
@@ -47,22 +48,26 @@ use rgb_lib::{
             check_indexer_url as rgb_lib_check_indexer_url,
             IndexerProtocol as RgbLibIndexerProtocol,
         },
-        AssetCFA as RgbLibAssetCFA, AssetIFA as RgbLibAssetIFA, AssetNIA as RgbLibAssetNIA,
-        AssetUDA as RgbLibAssetUDA, Balance as RgbLibBalance, EmbeddedMedia as RgbLibEmbeddedMedia,
-        Invoice as RgbLibInvoice, Media as RgbLibMedia, ProofOfReserves as RgbLibProofOfReserves,
+        AssetBFA as RgbLibAssetBFA, AssetCFA as RgbLibAssetCFA, AssetFilter as RgbLibAssetFilter,
+        AssetIFA as RgbLibAssetIFA, AssetNIA as RgbLibAssetNIA, AssetUDA as RgbLibAssetUDA,
+        Balance as RgbLibBalance, EmbeddedMedia as RgbLibEmbeddedMedia,
+        IfaIssuanceType as RgbLibIfaIssuanceType, Invoice as RgbLibInvoice, Media as RgbLibMedia,
+        Metadata as RgbLibMetadata, OperationResult as RgbLibOperationResult,
+        Outpoint as RgbLibOutpoint, ProofOfReserves as RgbLibProofOfReserves,
         Recipient as RgbLibRecipient, RecipientInfo, RecipientType as RgbLibRecipientType,
         RefreshFilter as RgbLibRefreshFilter, RefreshTransferStatus as RgbLibRefreshTransferStatus,
-        SyncKeychain as RgbLibSyncKeychain, SyncOptions as RgbLibSyncOptions,
-        SyncStrategy as RgbLibSyncStrategy, Token as RgbLibToken, TokenLight as RgbLibTokenLight,
-        WitnessData as RgbLibWitnessData,
+        RefreshedTransfer as RgbLibRefreshedTransfer, SyncKeychain as RgbLibSyncKeychain,
+        SyncOptions as RgbLibSyncOptions, SyncStrategy as RgbLibSyncStrategy, Token as RgbLibToken,
+        TokenLight as RgbLibTokenLight, WitnessData as RgbLibWitnessData,
     },
     AssetSchema as RgbLibAssetSchema, Assignment as RgbLibAssignment,
-    BitcoinNetwork as RgbLibNetwork, ContractId, RgbTransport,
+    BitcoinNetwork as RgbLibNetwork, ContractId, Error as RgbLibError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::HashMap, net::ToSocketAddrs, path::Path, str::FromStr, sync::Arc, time::Duration,
+    collections::HashMap, io::Write, net::ToSocketAddrs, path::Path, str::FromStr, sync::Arc,
+    time::Duration,
 };
 use tokio::{
     fs::File,
@@ -71,37 +76,44 @@ use tokio::{
     time::timeout,
 };
 
+use crate::asset_link::{
+    create_asset_link, find_linked_asset_channel, has_sufficient_asset_channel,
+    send_linked_asset_payment,
+};
 use crate::async_order::{
     write_async_payments_next_hash_index, AsyncOrderNewResultWire,
-    AsyncOrderOutboundInvoiceResultWire, ASYNC_ORDER_RESPONSE_TIMEOUT_SECS,
+    AsyncOrderOutboundInvoiceResultWire,
 };
+use crate::core_types::asset_link::{AssetLinkRequest, AssetLinkResponse};
 use crate::core_types::async_order::{
     AsyncOrderNewRequest, AsyncOrderNewResponse, AsyncOrderOutboundInvoiceRequest,
     AsyncOrderOutboundInvoiceResponse,
 };
+use crate::error::error_name;
 use crate::ldk::{
-    clear_rgb_payment_pending, peer_has_live_channel, start_ldk, stop_ldk, LdkBackgroundServices,
+    clear_rgb_payment_pending, peer_has_live_channel, start_node, stop_node, LdkBackgroundServices,
     VirtualChannelSessionStatus,
 };
 #[cfg(feature = "vss")]
 use crate::ldk::{derive_vss_identity, derive_vss_identity_from_key_source};
+#[cfg(test)]
+use crate::ldk::{node_override_matches, FORCE_PUSH_ASSET_AMOUNT_ON_NODE};
 #[cfg(feature = "vss")]
 use crate::signer::read_key_source_file;
 use crate::swap::{SwapData, SwapInfo, SwapString};
 use crate::utils::{
     check_already_initialized, check_channel_id, check_password_strength, check_password_validity,
-    encrypt_and_save_mnemonic, get_max_local_rgb_amount, get_route, hex_str,
-    hex_str_to_compressed_pubkey, hex_str_to_vec, is_external_signer_mode_configured,
-    new_jsonrpc_request_id, open_database_pool, validate_and_parse_description_hash,
-    validate_and_parse_payment_hash, validate_and_parse_payment_preimage, UnlockedAppState,
-    UserOnionMessageContents,
+    description_from_invoice, description_hash_from_invoice, encrypt_and_save_mnemonic,
+    get_max_local_rgb_amount, get_route, hex_str, hex_str_to_compressed_pubkey, hex_str_to_vec,
+    invoice_description_from_request, is_external_signer_mode_configured, new_jsonrpc_request_id,
+    open_database_pool, validate_and_parse_payment_hash, validate_and_parse_payment_preimage,
+    UnlockedAppState, UserOnionMessageContents,
 };
 use crate::{
-    backup::{do_backup, restore_backup},
+    backup::{do_backup, install_backup, unpack_backup},
     core_types::{
-        HTLCStatus, SwapStatus, UnlockRequest as CoreUnlockRequest,
-        DEFAULT_FINAL_CLTV_EXPIRY_DELTA, DUST_LIMIT_MSAT, FEE_RATE, HTLC_MIN_MSAT,
-        MAX_SWAP_FEE_MSAT, MIN_CHANNEL_CONFIRMATIONS, UTXO_SIZE_SAT, VIRTUAL_HTLC_MIN_MSAT,
+        HTLCStatus, LdkChainSync, SwapStatus, UnlockRequest as CoreUnlockRequest,
+        PENDING_SWAP_TIMEOUT_SECS,
     },
     rgb::{check_rgb_proxy_endpoint, get_rgb_channel_info_optional},
 };
@@ -113,13 +125,13 @@ use crate::{
     },
 };
 
-const UTXO_NUM: u8 = 4;
-
-const OPENRGBCHANNEL_MIN_SAT: u64 = HTLC_MIN_MSAT / 1000 * 10 + 10;
-const OPENCHANNEL_MIN_SAT: u64 = 5506;
-const OPENCHANNEL_MAX_SAT: u64 = 16777215;
-const OPENCHANNEL_MIN_RGB_AMT: u64 = 1;
 const VIRTUAL_OPEN_MODE_TRUSTED_NO_BROADCAST: &str = "trusted_no_broadcast";
+/// Expiry applied when the caller does not specify one (rgb-lib no longer accepts "no expiry").
+pub(crate) const DEFAULT_RGB_TRANSFER_EXPIRATION_SECS: u64 = 86400;
+
+fn default_expiration_timestamp() -> u64 {
+    get_current_timestamp() + DEFAULT_RGB_TRANSFER_EXPIRATION_SECS
+}
 
 #[derive(Deserialize, Serialize)]
 pub(crate) struct AddressResponse {
@@ -182,6 +194,57 @@ impl From<RgbLibAssetCFA> for AssetCFA {
 }
 
 #[derive(Deserialize, Serialize)]
+pub(crate) struct AssetBFA {
+    pub(crate) asset_id: String,
+    pub(crate) ticker: String,
+    pub(crate) name: String,
+    pub(crate) details: Option<String>,
+    pub(crate) precision: u8,
+    pub(crate) initial_supply: u64,
+    pub(crate) timestamp: i64,
+    pub(crate) added_at: i64,
+    pub(crate) balance: AssetBalanceResponse,
+    pub(crate) media: Option<Media>,
+    pub(crate) reject_list_url: Option<String>,
+}
+
+impl From<RgbLibAssetBFA> for AssetBFA {
+    fn from(value: RgbLibAssetBFA) -> Self {
+        Self {
+            asset_id: value.asset_id,
+            ticker: value.ticker,
+            name: value.name,
+            details: value.details,
+            precision: value.precision,
+            initial_supply: value.initial_supply,
+            timestamp: value.timestamp,
+            added_at: value.added_at,
+            balance: value.balance.into(),
+            media: value.media.map(|m| m.into()),
+            reject_list_url: value.reject_list_url,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "type", content = "value")]
+pub(crate) enum AssetFilter {
+    AnyOrNone,
+    None,
+    Id(String),
+}
+
+impl From<AssetFilter> for RgbLibAssetFilter {
+    fn from(x: AssetFilter) -> Self {
+        match x {
+            AssetFilter::AnyOrNone => Self::AnyOrNone,
+            AssetFilter::None => Self::None,
+            AssetFilter::Id(asset_id) => Self::Id(asset_id),
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
 pub(crate) struct AssetIFA {
     pub(crate) asset_id: String,
     pub(crate) ticker: String,
@@ -196,6 +259,9 @@ pub(crate) struct AssetIFA {
     pub(crate) balance: AssetBalanceResponse,
     pub(crate) media: Option<Media>,
     pub(crate) reject_list_url: Option<String>,
+    pub(crate) issuance_link_right_outpoint: Option<RgbLibOutpoint>,
+    pub(crate) linked_from_asset_id: Option<String>,
+    pub(crate) linked_to_asset_id: Option<String>,
 }
 
 impl From<RgbLibAssetIFA> for AssetIFA {
@@ -214,6 +280,9 @@ impl From<RgbLibAssetIFA> for AssetIFA {
             balance: value.balance.into(),
             media: value.media.map(|m| m.into()),
             reject_list_url: value.reject_list_url,
+            issuance_link_right_outpoint: value.issuance_link_right_outpoint,
+            linked_from_asset_id: value.linked_from_asset_id,
+            linked_to_asset_id: value.linked_to_asset_id,
         }
     }
 }
@@ -235,6 +304,36 @@ pub(crate) struct AssetMetadataResponse {
     pub(crate) ticker: Option<String>,
     pub(crate) details: Option<String>,
     pub(crate) token: Option<Token>,
+    pub(crate) unspent_link_right_outpoint: Option<RgbLibOutpoint>,
+    pub(crate) linked_from_asset_id: Option<String>,
+    pub(crate) linked_to_asset_id: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct ImportRgbTransferConsignmentRequest {
+    pub(crate) consignment_base64: String,
+    pub(crate) offchain_txid: String,
+    pub(crate) expected_asset_id: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct ImportRgbTransferConsignmentResponse {
+    pub(crate) asset_id: String,
+    pub(crate) already_imported: bool,
+    pub(crate) metadata: AssetMetadataResponse,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct ImportRgbContractRequest {
+    pub(crate) contract_base64: String,
+    pub(crate) expected_asset_id: String,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct ImportRgbContractResponse {
+    pub(crate) asset_id: String,
+    pub(crate) already_imported: bool,
+    pub(crate) metadata: AssetMetadataResponse,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -274,6 +373,7 @@ pub(crate) enum AssetSchema {
     Uda,
     Cfa,
     Ifa,
+    Bfa,
 }
 
 impl From<AssetSchema> for RgbLibAssetSchema {
@@ -283,6 +383,7 @@ impl From<AssetSchema> for RgbLibAssetSchema {
             AssetSchema::Uda => Self::Uda,
             AssetSchema::Cfa => Self::Cfa,
             AssetSchema::Ifa => Self::Ifa,
+            AssetSchema::Bfa => Self::Bfa,
         }
     }
 }
@@ -294,6 +395,7 @@ impl From<RgbLibAssetSchema> for AssetSchema {
             RgbLibAssetSchema::Uda => Self::Uda,
             RgbLibAssetSchema::Cfa => Self::Cfa,
             RgbLibAssetSchema::Ifa => Self::Ifa,
+            RgbLibAssetSchema::Bfa => Self::Bfa,
         }
     }
 }
@@ -334,6 +436,8 @@ pub(crate) enum Assignment {
     NonFungible,
     InflationRight(u64),
     Any,
+    LinkRight,
+    BridgeRight,
 }
 
 impl From<RgbLibAssignment> for Assignment {
@@ -343,6 +447,8 @@ impl From<RgbLibAssignment> for Assignment {
             RgbLibAssignment::NonFungible => Self::NonFungible,
             RgbLibAssignment::InflationRight(amt) => Self::InflationRight(amt),
             RgbLibAssignment::Any => Self::Any,
+            RgbLibAssignment::LinkRight => Self::LinkRight,
+            RgbLibAssignment::BridgeRight => Self::BridgeRight,
         }
     }
 }
@@ -354,6 +460,8 @@ impl From<Assignment> for RgbLibAssignment {
             Assignment::NonFungible => Self::NonFungible,
             Assignment::InflationRight(amt) => Self::InflationRight(amt),
             Assignment::Any => Self::Any,
+            Assignment::LinkRight => Self::LinkRight,
+            Assignment::BridgeRight => Self::BridgeRight,
         }
     }
 }
@@ -524,6 +632,7 @@ pub(crate) struct DecodeLNInvoiceResponse {
     pub(crate) timestamp: u64,
     pub(crate) asset_id: Option<String>,
     pub(crate) asset_amount: Option<u64>,
+    pub(crate) description: Option<String>,
     pub(crate) description_hash: Option<String>,
     pub(crate) payment_hash: String,
     pub(crate) payment_secret: String,
@@ -540,6 +649,7 @@ pub(crate) struct DecodeRGBInvoiceRequest {
 #[derive(Deserialize, Serialize)]
 pub(crate) struct DecodeRGBInvoiceResponse {
     pub(crate) recipient_id: String,
+    pub(crate) proxy_recipient_id: String,
     pub(crate) recipient_type: RecipientType,
     pub(crate) asset_schema: Option<AssetSchema>,
     pub(crate) asset_id: Option<String>,
@@ -547,6 +657,7 @@ pub(crate) struct DecodeRGBInvoiceResponse {
     pub(crate) network: BitcoinNetwork,
     pub(crate) expiration_timestamp: Option<u64>,
     pub(crate) transport_endpoints: Vec<String>,
+    pub(crate) unknown_query_params: HashMap<String, String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -630,6 +741,17 @@ pub(crate) struct GetChannelIdResponse {
 }
 
 #[derive(Deserialize, Serialize)]
+pub(crate) struct GetConsignmentRequest {
+    pub(crate) asset_id: String,
+    pub(crate) txid: String,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct GetConsignmentResponse {
+    pub(crate) bytes_hex: String,
+}
+
+#[derive(Deserialize, Serialize)]
 pub(crate) struct GetPaymentRequest {
     pub(crate) payment_hash: String,
     pub(crate) payment_type: PaymentType,
@@ -664,6 +786,22 @@ impl From<RgbLibIndexerProtocol> for IndexerProtocol {
             RgbLibIndexerProtocol::Esplora => Self::Esplora,
         }
     }
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct BurnRequest {
+    pub(crate) asset_id: String,
+    pub(crate) amount: u64,
+    /// hex-encoded, required for BFA assets (32 bytes: where the burned amount is released)
+    pub(crate) burn_recipient: Option<String>,
+    pub(crate) fee_rate: u64,
+    pub(crate) min_confirmations: u8,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct BurnResponse {
+    pub(crate) txid: String,
+    pub(crate) batch_transfer_idx: i32,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -733,6 +871,8 @@ pub(crate) struct IssueAssetIFARequest {
     pub(crate) name: String,
     pub(crate) precision: u8,
     pub(crate) reject_list_url: Option<String>,
+    #[serde(default)]
+    pub(crate) issuance_type: Option<RgbLibIfaIssuanceType>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -794,6 +934,7 @@ pub(crate) struct ListAssetsResponse {
     pub(crate) uda: Option<Vec<AssetUDA>>,
     pub(crate) cfa: Option<Vec<AssetCFA>>,
     pub(crate) ifa: Option<Vec<AssetIFA>>,
+    pub(crate) bfa: Option<Vec<AssetBFA>>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -817,11 +958,6 @@ pub(crate) struct ListPaymentsResponse {
     pub(crate) first_index_offset: u64,
     pub(crate) last_index_offset: u64,
 }
-
-const DEFAULT_MAX_PAYMENTS: u64 = 100;
-const DEFAULT_MAX_TRANSFERS: u64 = 100;
-const DEFAULT_MAX_UNSPENTS: u64 = 100;
-const DEFAULT_MAX_TRANSACTIONS: u64 = 100;
 
 /// Resolve a caller-supplied page size, treating absent or zero as the default.
 fn resolve_page_size(max: Option<u64>, default: u64) -> u64 {
@@ -883,7 +1019,7 @@ pub(crate) struct ListTransactionsResponse {
 
 #[derive(Deserialize, Serialize)]
 pub(crate) struct ListTransfersRequest {
-    pub(crate) asset_id: Option<String>,
+    pub(crate) asset_filter: AssetFilter,
     pub(crate) txid: Option<String>,
     pub(crate) index_offset: Option<u64>,
     pub(crate) max_transfers: Option<u64>,
@@ -921,6 +1057,7 @@ pub(crate) struct LNInvoiceRequest {
     pub(crate) asset_id: Option<String>,
     pub(crate) asset_amount: Option<u64>,
     pub(crate) payment_hash: Option<String>,
+    pub(crate) description: Option<String>,
     pub(crate) description_hash: Option<String>,
     pub(crate) min_final_cltv_expiry_delta: Option<u16>,
 }
@@ -1024,6 +1161,23 @@ pub(crate) struct OpenChannelResponse {
     pub(crate) temporary_channel_id: String,
 }
 
+#[derive(Deserialize, Serialize)]
+pub(crate) struct OperationResult {
+    pub(crate) txid: String,
+    pub(crate) batch_transfer_idx: i32,
+    pub(crate) entropy: u64,
+}
+
+impl From<RgbLibOperationResult> for OperationResult {
+    fn from(value: RgbLibOperationResult) -> Self {
+        Self {
+            txid: value.txid,
+            batch_transfer_idx: value.batch_transfer_idx,
+            entropy: value.entropy,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) enum PaymentType {
     Outbound,
@@ -1058,14 +1212,8 @@ pub(crate) struct Payment {
     pub(crate) updated_at: u64,
     pub(crate) payee_pubkey: String,
     pub(crate) preimage: Option<String>,
+    pub(crate) description: Option<String>,
     pub(crate) description_hash: Option<String>,
-}
-
-pub(crate) fn description_hash_from_invoice(invoice: &Bolt11Invoice) -> Option<[u8; 32]> {
-    match invoice.description() {
-        lightning_invoice::Bolt11InvoiceDescriptionRef::Hash(hash) => Some(hash.0.to_byte_array()),
-        _ => None,
-    }
 }
 
 fn payment_type_from_invoice(invoice_type: Option<InvoiceType>) -> PaymentType {
@@ -1098,6 +1246,21 @@ impl From<RgbLibProofOfReserves> for ProofOfReserves {
             proof: value.proof,
         }
     }
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct ProvideOutOfBandAckRequest {
+    pub(crate) recipient_id: String,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct ProvideOutOfBandAckResponse {
+    pub(crate) operation: Option<OperationResult>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct ProvideOutOfBandConsignmentResponse {
+    pub(crate) transfers: HashMap<i32, RefreshedTransfer>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1134,6 +1297,36 @@ impl From<RgbLibRecipientType> for RecipientType {
     }
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct RefreshedTransfer {
+    pub(crate) updated_status: Option<TransferStatus>,
+    pub(crate) failure: Option<RefreshFailure>,
+}
+
+impl From<RgbLibRefreshedTransfer> for RefreshedTransfer {
+    fn from(value: RgbLibRefreshedTransfer) -> Self {
+        Self {
+            updated_status: value.updated_status.map(|s| s.into()),
+            failure: value.failure.map(Into::into),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct RefreshFailure {
+    pub(crate) name: String,
+    pub(crate) message: String,
+}
+
+impl From<RgbLibError> for RefreshFailure {
+    fn from(error: RgbLibError) -> Self {
+        Self {
+            name: error_name(&error),
+            message: error.to_string(),
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 pub(crate) struct RefreshFilter {
     pub(crate) status: RefreshTransferStatus,
@@ -1150,6 +1343,18 @@ impl From<RefreshFilter> for RgbLibRefreshFilter {
 }
 
 #[derive(Deserialize, Serialize)]
+pub(crate) struct RefreshRequest {
+    pub(crate) asset_id: Option<String>,
+    pub(crate) filter: Vec<RefreshFilter>,
+    pub(crate) skip_sync: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct RefreshResponse {
+    pub(crate) transfers: HashMap<i32, RefreshedTransfer>,
+}
+
+#[derive(Deserialize, Serialize)]
 pub(crate) enum RefreshTransferStatus {
     WaitingCounterparty,
     WaitingConfirmations,
@@ -1162,13 +1367,6 @@ impl From<RefreshTransferStatus> for RgbLibRefreshTransferStatus {
             RefreshTransferStatus::WaitingConfirmations => Self::WaitingConfirmations,
         }
     }
-}
-
-#[derive(Deserialize, Serialize)]
-pub(crate) struct RefreshRequest {
-    pub(crate) asset_id: Option<String>,
-    pub(crate) filter: Vec<RefreshFilter>,
-    pub(crate) skip_sync: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1193,16 +1391,18 @@ pub(crate) struct RgbAllocation {
 pub(crate) struct RgbInvoiceRequest {
     pub(crate) asset_id: Option<String>,
     pub(crate) assignment: Option<Assignment>,
-    pub(crate) expiration_timestamp: Option<u64>,
+    #[serde(default = "default_expiration_timestamp")]
+    pub(crate) expiration_timestamp: u64,
     pub(crate) min_confirmations: u8,
     pub(crate) witness: bool,
+    pub(crate) transport_endpoints: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize)]
 pub(crate) struct RgbInvoiceResponse {
     pub(crate) recipient_id: String,
     pub(crate) invoice: String,
-    pub(crate) expiration_timestamp: Option<u64>,
+    pub(crate) expiration_timestamp: u64,
     pub(crate) batch_transfer_idx: i32,
 }
 
@@ -1247,7 +1447,8 @@ pub(crate) struct SendRgbRequest {
     pub(crate) donation: bool,
     pub(crate) fee_rate: u64,
     pub(crate) min_confirmations: u8,
-    pub(crate) expiration_timestamp: Option<u64>,
+    #[serde(default = "default_expiration_timestamp")]
+    pub(crate) expiration_timestamp: u64,
     pub(crate) recipient_map: HashMap<String, Vec<Recipient>>,
 }
 
@@ -1429,6 +1630,7 @@ pub(crate) struct Transfer {
     pub(crate) kind: TransferKind,
     pub(crate) txid: Option<String>,
     pub(crate) recipient_id: Option<String>,
+    pub(crate) proxy_recipient_id: Option<String>,
     pub(crate) receive_utxo: Option<String>,
     pub(crate) change_utxo: Option<String>,
     pub(crate) expiration_timestamp: Option<u64>,
@@ -1443,6 +1645,7 @@ pub(crate) enum TransferKind {
     Send,
     Inflation,
     Burn,
+    Link,
 }
 
 #[derive(Debug, PartialEq, Deserialize, Serialize)]
@@ -1451,8 +1654,23 @@ pub(crate) enum TransferStatus {
     WaitingCounterparty,
     WaitingSafeHeight,
     WaitingConfirmations,
+    WaitingBroadcast,
     Settled,
     Failed,
+}
+
+impl From<rgb_lib::TransferStatus> for TransferStatus {
+    fn from(value: rgb_lib::TransferStatus) -> Self {
+        match value {
+            rgb_lib::TransferStatus::Initiated => TransferStatus::Initiated,
+            rgb_lib::TransferStatus::WaitingCounterparty => TransferStatus::WaitingCounterparty,
+            rgb_lib::TransferStatus::WaitingSafeHeight => TransferStatus::WaitingSafeHeight,
+            rgb_lib::TransferStatus::WaitingConfirmations => TransferStatus::WaitingConfirmations,
+            rgb_lib::TransferStatus::WaitingBroadcast => TransferStatus::WaitingBroadcast,
+            rgb_lib::TransferStatus::Settled => TransferStatus::Settled,
+            rgb_lib::TransferStatus::Failed => TransferStatus::Failed,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1470,15 +1688,12 @@ pub(crate) enum TransportType {
 #[derive(Deserialize, Serialize)]
 pub(crate) struct UnlockRequest {
     pub(crate) password: String,
-    #[serde(default)]
-    pub(crate) bitcoind_rpc_username: Option<String>,
-    #[serde(default)]
-    pub(crate) bitcoind_rpc_password: Option<String>,
-    #[serde(default)]
-    pub(crate) bitcoind_rpc_host: Option<String>,
-    #[serde(default)]
-    pub(crate) bitcoind_rpc_port: Option<u16>,
+    pub(crate) ldk_chain_sync: LdkChainSync,
+    // both fall back to the `[chain]` config section when omitted
     pub(crate) indexer_url: Option<String>,
+    // falls back to the `[chain]` config section too; when set, the node supports BFA assets
+    #[serde(default)]
+    pub(crate) eth_rpc_url: Option<String>,
     pub(crate) proxy_endpoint: Option<String>,
     pub(crate) announce_addresses: Vec<String>,
     pub(crate) announce_alias: Option<String>,
@@ -1495,11 +1710,9 @@ pub(crate) struct VssClearFenceRequest {
 impl From<UnlockRequest> for CoreUnlockRequest {
     fn from(value: UnlockRequest) -> Self {
         Self {
-            bitcoind_rpc_username: value.bitcoind_rpc_username,
-            bitcoind_rpc_password: value.bitcoind_rpc_password,
-            bitcoind_rpc_host: value.bitcoind_rpc_host,
-            bitcoind_rpc_port: value.bitcoind_rpc_port,
+            ldk_chain_sync: value.ldk_chain_sync,
             indexer_url: value.indexer_url,
+            eth_rpc_url: value.eth_rpc_url,
             proxy_endpoint: value.proxy_endpoint,
             announce_addresses: value.announce_addresses,
             announce_alias: value.announce_alias,
@@ -1523,6 +1736,8 @@ pub(crate) struct Utxo {
     pub(crate) outpoint: String,
     pub(crate) btc_amount: u64,
     pub(crate) colorable: bool,
+    pub(crate) exists: bool,
+    pub(crate) derivation_index: Option<u32>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1553,6 +1768,7 @@ impl AppState {
     ) -> Result<TokioMutexGuard<'_, Option<Arc<UnlockedAppState>>>, APIError> {
         self.check_changing_state()?;
         let unlocked_app_state = self.get_unlocked_app_state().await;
+        self.check_changing_state()?;
         if unlocked_app_state.is_some() {
             Err(APIError::UnlockedNode)
         } else {
@@ -1565,6 +1781,7 @@ impl AppState {
     ) -> Result<TokioMutexGuard<'_, Option<Arc<UnlockedAppState>>>, APIError> {
         self.check_changing_state()?;
         let unlocked_app_state = self.get_unlocked_app_state().await;
+        self.check_changing_state()?;
         if unlocked_app_state.is_none() {
             Err(APIError::LockedNode)
         } else {
@@ -1585,6 +1802,26 @@ impl AppState {
     async fn update_unlocked_app_state(&self, updated: Option<Arc<UnlockedAppState>>) {
         let mut unlocked_app_state = self.get_unlocked_app_state().await;
         *unlocked_app_state = updated;
+    }
+}
+
+/// Marks the node as changing state for as long as it is alive.
+///
+/// The flag has to be cleared on every exit path, including an unwind: shutdown waits for the
+/// state change to complete, so a flag left set by a panic would hang the shutdown instead of
+/// letting the node exit.
+struct ChangingStateGuard(Arc<AppState>);
+
+impl ChangingStateGuard {
+    fn new(app_state: Arc<AppState>) -> Self {
+        app_state.update_changing_state(true);
+        Self(app_state)
+    }
+}
+
+impl Drop for ChangingStateGuard {
+    fn drop(&mut self) {
+        self.0.update_changing_state(false);
     }
 }
 
@@ -1614,8 +1851,9 @@ pub(crate) async fn async_order_new(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<AsyncOrderNewRequest>, APIError>,
 ) -> Result<Json<AsyncOrderNewResponse>, APIError> {
+    state.check_lightning_supported()?;
     let guard = state.check_unlocked().await?;
-    let unlocked_state = Arc::clone(guard.as_ref().unwrap());
+    let unlocked_state = Arc::clone(guard.as_ref().unwrap().lightning()?);
     drop(guard);
 
     let host_node_id =
@@ -1662,7 +1900,7 @@ pub(crate) async fn async_order_new(
         .map_err(|err| APIError::InvalidRequest(err.message))?;
     unlocked_state.peer_manager.process_events();
     let order_state_value = match timeout(
-        Duration::from_secs(ASYNC_ORDER_RESPONSE_TIMEOUT_SECS),
+        Duration::from_secs(unlocked_state.config.lsp.order_response_timeout_secs),
         response_rx,
     )
     .await
@@ -1723,8 +1961,9 @@ pub(crate) async fn async_order_outbound_invoice(
         APIError,
     >,
 ) -> Result<Json<AsyncOrderOutboundInvoiceResponse>, APIError> {
+    state.check_lightning_supported()?;
     let guard = state.check_unlocked().await?;
-    let unlocked_state = Arc::clone(guard.as_ref().unwrap());
+    let unlocked_state = Arc::clone(guard.as_ref().unwrap().lightning()?);
     drop(guard);
 
     let peer_node_id =
@@ -1756,7 +1995,7 @@ pub(crate) async fn async_order_outbound_invoice(
     unlocked_state.peer_manager.process_events();
 
     let response_value = match timeout(
-        Duration::from_secs(ASYNC_ORDER_RESPONSE_TIMEOUT_SECS),
+        Duration::from_secs(unlocked_state.config.lsp.order_response_timeout_secs),
         response_rx,
     )
     .await
@@ -1808,7 +2047,11 @@ pub(crate) async fn asset_balance(
 
     let mut offchain_outbound = 0;
     let mut offchain_inbound = 0;
-    for chan_info in unlocked_state.channel_manager.list_channels() {
+    for chan_info in unlocked_state
+        .lightning
+        .iter()
+        .flat_map(|lightning| lightning.channel_manager.list_channels())
+    {
         let channel_id_str = chan_info.channel_id.0.as_hex().to_string();
 
         let rgb_info = match unlocked_state
@@ -1834,6 +2077,20 @@ pub(crate) async fn asset_balance(
     }))
 }
 
+pub(crate) async fn asset_link(
+    State(state): State<Arc<AppState>>,
+    WithRejection(Json(payload), _): WithRejection<Json<AssetLinkRequest>, APIError>,
+) -> Result<Json<AssetLinkResponse>, APIError> {
+    no_cancel(async move {
+        let guard = state.check_unlocked().await?;
+        let unlocked_state = guard.as_ref().unwrap();
+        let asset_link = create_asset_link(unlocked_state, payload)?;
+
+        Ok(Json(asset_link))
+    })
+    .await
+}
+
 pub(crate) async fn asset_metadata(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<AssetMetadataRequest>, APIError>,
@@ -1848,7 +2105,11 @@ pub(crate) async fn asset_metadata(
         .unwrap()
         .rgb_get_asset_metadata(contract_id)?;
 
-    Ok(Json(AssetMetadataResponse {
+    Ok(Json(asset_metadata_response_from_metadata(metadata)))
+}
+
+fn asset_metadata_response_from_metadata(metadata: RgbLibMetadata) -> AssetMetadataResponse {
+    AssetMetadataResponse {
         asset_schema: metadata.asset_schema.into(),
         initial_supply: metadata.initial_supply,
         max_supply: metadata.max_supply,
@@ -1859,6 +2120,52 @@ pub(crate) async fn asset_metadata(
         ticker: metadata.ticker,
         details: metadata.details,
         token: metadata.token.map(|t| t.into()),
+        unspent_link_right_outpoint: metadata.unspent_link_right_outpoint,
+        linked_from_asset_id: metadata.linked_from_asset_id,
+        linked_to_asset_id: metadata.linked_to_asset_id,
+    }
+}
+
+pub(crate) async fn import_rgb_transfer_consignment(
+    State(state): State<Arc<AppState>>,
+    WithRejection(Json(payload), _): WithRejection<
+        Json<ImportRgbTransferConsignmentRequest>,
+        APIError,
+    >,
+) -> Result<Json<ImportRgbTransferConsignmentResponse>, APIError> {
+    let imported = rgb_import::import_rgb_transfer_consignment(
+        state,
+        ImportRgbTransferConsignmentRequestData {
+            consignment_base64: payload.consignment_base64,
+            offchain_txid: payload.offchain_txid,
+            expected_asset_id: payload.expected_asset_id,
+        },
+    )
+    .await?;
+
+    Ok(Json(ImportRgbTransferConsignmentResponse {
+        asset_id: imported.asset_id,
+        already_imported: imported.already_imported,
+        metadata: asset_metadata_response_from_metadata(imported.metadata),
+    }))
+}
+
+pub(crate) async fn import_rgb_contract(
+    State(state): State<Arc<AppState>>,
+    WithRejection(Json(payload), _): WithRejection<Json<ImportRgbContractRequest>, APIError>,
+) -> Result<Json<ImportRgbContractResponse>, APIError> {
+    let imported = rgb_import::import_rgb_contract(
+        state,
+        ImportRgbContractRequestData {
+            contract_base64: payload.contract_base64,
+            expected_asset_id: payload.expected_asset_id,
+        },
+    )
+    .await?;
+    Ok(Json(ImportRgbContractResponse {
+        asset_id: imported.asset_id,
+        already_imported: imported.already_imported,
+        metadata: asset_metadata_response_from_metadata(imported.metadata),
     }))
 }
 
@@ -1910,9 +2217,10 @@ pub(crate) async fn cancel_hodl_invoice(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<CancelHodlInvoiceRequest>, APIError>,
 ) -> Result<Json<EmptyResponse>, APIError> {
+    state.check_lightning_supported()?;
     no_cancel(async move {
         let guard = state.check_unlocked().await?;
-        let unlocked_state = guard.as_ref().unwrap();
+        let unlocked_state = guard.as_ref().unwrap().lightning()?;
 
         let payment_hash = validate_and_parse_payment_hash(&payload.payment_hash)?;
         let payment_info = unlocked_state
@@ -1951,7 +2259,10 @@ pub(crate) async fn change_password(
             ));
         }
 
-        check_password_strength(payload.new_password.clone())?;
+        check_password_strength(
+            payload.new_password.clone(),
+            state.static_state.config.auth.password_min_length,
+        )?;
 
         let mnemonic = check_password_validity(&payload.old_password, &state.db())?;
 
@@ -1984,9 +2295,10 @@ pub(crate) async fn claim_hodl_invoice(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<ClaimHodlInvoiceRequest>, APIError>,
 ) -> Result<Json<ClaimHodlInvoiceResponse>, APIError> {
+    state.check_lightning_supported()?;
     no_cancel(async move {
         let guard = state.check_unlocked().await?;
-        let unlocked_state = guard.as_ref().unwrap();
+        let unlocked_state = guard.as_ref().unwrap().lightning()?;
 
         let payment_hash = validate_and_parse_payment_hash(&payload.payment_hash)?;
         let preimage =
@@ -2068,9 +2380,10 @@ pub(crate) async fn close_channel(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<CloseChannelRequest>, APIError>,
 ) -> Result<Json<EmptyResponse>, APIError> {
+    state.check_lightning_supported()?;
     no_cancel(async move {
         let guard = state.check_unlocked().await?;
-        let unlocked_state = guard.as_ref().unwrap();
+        let unlocked_state = guard.as_ref().unwrap().lightning()?;
 
         let channel_id_vec = hex_str_to_vec(&payload.channel_id);
         if channel_id_vec.is_none() || channel_id_vec.as_ref().unwrap().len() != 32 {
@@ -2254,9 +2567,10 @@ pub(crate) async fn connect_peer(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<ConnectPeerRequest>, APIError>,
 ) -> Result<Json<EmptyResponse>, APIError> {
+    state.check_lightning_supported()?;
     no_cancel(async move {
         let guard = state.check_unlocked().await?;
-        let unlocked_state = guard.as_ref().unwrap();
+        let unlocked_state = guard.as_ref().unwrap().lightning()?;
 
         let (peer_pubkey, peer_addr) = parse_peer_info(payload.peer_pubkey_and_addr.to_string())?;
 
@@ -2284,8 +2598,10 @@ pub(crate) async fn create_utxos(
         let guard = state.check_unlocked().await?;
         let unlocked_state = guard.as_ref().unwrap();
 
-        let num = payload.num.unwrap_or(UTXO_NUM);
-        let size = payload.size.unwrap_or(UTXO_SIZE_SAT);
+        let num = payload.num.unwrap_or(unlocked_state.config.rgb.utxo_num);
+        let size = payload
+            .size
+            .unwrap_or(unlocked_state.config.rgb.utxo_size_sat);
         if unlocked_state.external_signer_mode {
             let unsigned_psbt = unlocked_state.rgb_create_utxos_begin(
                 payload.up_to,
@@ -2320,6 +2636,7 @@ pub(crate) async fn decode_ln_invoice(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<DecodeLNInvoiceRequest>, APIError>,
 ) -> Result<Json<DecodeLNInvoiceResponse>, APIError> {
+    state.check_lightning_supported()?;
     let _guard = state.get_unlocked_app_state();
 
     let invoice = match Bolt11Invoice::from_str(&payload.invoice) {
@@ -2333,6 +2650,7 @@ pub(crate) async fn decode_ln_invoice(
         timestamp: invoice.duration_since_epoch().as_secs(),
         asset_id: invoice.rgb_contract_id().map(|c| c.to_string()),
         asset_amount: invoice.rgb_amount(),
+        description: description_from_invoice(&invoice),
         description_hash: match invoice.description() {
             lightning_invoice::Bolt11InvoiceDescriptionRef::Hash(hash) => {
                 Some(hex_str(&hash.0.to_byte_array()))
@@ -2358,6 +2676,7 @@ pub(crate) async fn decode_rgb_invoice(
 
     Ok(Json(DecodeRGBInvoiceResponse {
         recipient_id: invoice_data.recipient_id,
+        proxy_recipient_id: invoice_data.proxy_recipient_id,
         recipient_type: recipient_info.recipient_type.into(),
         asset_schema: invoice_data.asset_schema.map(|s| s.into()),
         asset_id: invoice_data.asset_id,
@@ -2365,12 +2684,15 @@ pub(crate) async fn decode_rgb_invoice(
         network: invoice_data.network.into(),
         expiration_timestamp: invoice_data.expiration_timestamp,
         transport_endpoints: invoice_data.transport_endpoints,
+        unknown_query_params: invoice_data.unknown_query_params,
     }))
 }
 
 pub(crate) async fn decode_swapstring(
+    State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<DecodeSwapstringRequest>, APIError>,
 ) -> Result<Json<DecodeSwapstringResponse>, APIError> {
+    state.check_lightning_supported()?;
     let swapstring = SwapString::from_str(&payload.swapstring)
         .map_err(|e| APIError::InvalidSwapString(payload.swapstring, e.to_string()))?;
     let swap_info = swapstring.swap_info;
@@ -2389,9 +2711,10 @@ pub(crate) async fn disconnect_peer(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<DisconnectPeerRequest>, APIError>,
 ) -> Result<Json<EmptyResponse>, APIError> {
+    state.check_lightning_supported()?;
     no_cancel(async move {
         let guard = state.check_unlocked().await?;
-        let unlocked_state = guard.as_ref().unwrap();
+        let unlocked_state = guard.as_ref().unwrap().lightning()?;
 
         let peer_pubkey = match PublicKey::from_str(&payload.peer_pubkey) {
             Ok(pubkey) => pubkey,
@@ -2495,8 +2818,15 @@ pub(crate) async fn get_channel_id(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<GetChannelIdRequest>, APIError>,
 ) -> Result<Json<GetChannelIdResponse>, APIError> {
+    state.check_lightning_supported()?;
     let tmp_chan_id = check_channel_id(&payload.temporary_channel_id)?;
-    let channel_ids = state.check_unlocked().await?.clone().unwrap().channel_ids();
+    let channel_ids = state
+        .check_unlocked()
+        .await?
+        .as_ref()
+        .unwrap()
+        .lightning()?
+        .channel_ids();
     let channel_id = if let Some(channel_id) = channel_ids.get(&tmp_chan_id) {
         channel_id.0.as_hex().to_string()
     } else {
@@ -2506,12 +2836,45 @@ pub(crate) async fn get_channel_id(
     Ok(Json(GetChannelIdResponse { channel_id }))
 }
 
+// Both fields index a filesystem path (`<transfers>/<txid>/<asset_id>/…`); validate their shapes
+// so a `..`/separator/absolute value cannot traverse out of the consignment dir.
+pub(crate) fn validate_consignment_lookup(asset_id: &str, txid: &str) -> Result<(), APIError> {
+    ContractId::from_str(asset_id).map_err(|_| APIError::InvalidAssetID(asset_id.to_string()))?;
+    bitcoin::Txid::from_str(txid)
+        .map_err(|_| APIError::InvalidRequest(format!("invalid txid: {txid}")))?;
+    Ok(())
+}
+
+pub(crate) async fn get_consignment(
+    State(state): State<Arc<AppState>>,
+    WithRejection(Json(payload), _): WithRejection<Json<GetConsignmentRequest>, APIError>,
+) -> Result<Json<GetConsignmentResponse>, APIError> {
+    validate_consignment_lookup(&payload.asset_id, &payload.txid)?;
+    let file_path = state
+        .check_unlocked()
+        .await?
+        .clone()
+        .unwrap()
+        .rgb_get_send_consignment_path(&payload.asset_id, &payload.txid);
+    if !file_path.exists() {
+        return Err(APIError::ConsignmentNotFound);
+    }
+
+    let mut buf_reader = BufReader::new(File::open(file_path).await?);
+    let mut file_bytes = Vec::new();
+    buf_reader.read_to_end(&mut file_bytes).await?;
+    let bytes_hex = hex_str(&file_bytes);
+
+    Ok(Json(GetConsignmentResponse { bytes_hex }))
+}
+
 pub(crate) async fn get_payment(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<GetPaymentRequest>, APIError>,
 ) -> Result<Json<GetPaymentResponse>, APIError> {
+    state.check_lightning_supported()?;
     let guard = state.check_unlocked().await?;
-    let unlocked_state = guard.as_ref().unwrap();
+    let unlocked_state = guard.as_ref().unwrap().lightning()?;
 
     let requested_ph = validate_and_parse_payment_hash(&payload.payment_hash)?;
 
@@ -2541,6 +2904,7 @@ pub(crate) async fn get_payment(
                             updated_at: payment_info.updated_at,
                             payee_pubkey: payment_info.payee_pubkey.to_string(),
                             preimage: payment_info.preimage.map(|p| hex_str(&p.0)),
+                            description: payment_info.description.clone(),
                             description_hash: payment_info.description_hash.map(|h| hex_str(&h)),
                         },
                     }));
@@ -2571,6 +2935,7 @@ pub(crate) async fn get_payment(
                             updated_at: payment_info.updated_at,
                             payee_pubkey: payment_info.payee_pubkey.to_string(),
                             preimage: payment_info.preimage.map(|p| hex_str(&p.0)),
+                            description: payment_info.description.clone(),
                             description_hash: payment_info.description_hash.map(|h| hex_str(&h)),
                         },
                     }));
@@ -2586,8 +2951,9 @@ pub(crate) async fn get_swap(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<GetSwapRequest>, APIError>,
 ) -> Result<Json<GetSwapResponse>, APIError> {
+    state.check_lightning_supported()?;
     let guard = state.check_unlocked().await?;
-    let unlocked_state = guard.as_ref().unwrap();
+    let unlocked_state = guard.as_ref().unwrap().lightning()?;
 
     let requested_ph = validate_and_parse_payment_hash(&payload.payment_hash)?;
 
@@ -2596,7 +2962,7 @@ pub(crate) async fn get_swap(
         if status == SwapStatus::Waiting && get_current_timestamp() > swap_data.swap_info.expiry {
             status = SwapStatus::Expired;
         } else if status == SwapStatus::Pending
-            && get_current_timestamp() > swap_data.initiated_at.unwrap() + 86400
+            && get_current_timestamp() > swap_data.initiated_at.unwrap() + PENDING_SWAP_TIMEOUT_SECS
         {
             status = SwapStatus::Failed;
         }
@@ -2638,6 +3004,42 @@ pub(crate) async fn get_swap(
     }
 
     Err(APIError::SwapNotFound(payload.payment_hash))
+}
+
+pub(crate) async fn burn(
+    State(state): State<Arc<AppState>>,
+    WithRejection(Json(payload), _): WithRejection<Json<BurnRequest>, APIError>,
+) -> Result<Json<BurnResponse>, APIError> {
+    no_cancel(async move {
+        let guard = state.check_unlocked().await?;
+        let unlocked_state = guard.as_ref().unwrap();
+        let burn_recipient = payload
+            .burn_recipient
+            .map(|r| {
+                hex_str_to_vec(&r)
+                    .ok_or_else(|| APIError::InvalidBurnRecipient(s!("invalid hex string")))
+            })
+            .transpose()?;
+
+        let unlocked_state_copy = unlocked_state.clone();
+        let burn_result = tokio::task::spawn_blocking(move || {
+            unlocked_state_copy.rgb_burn(
+                payload.asset_id,
+                payload.amount,
+                burn_recipient,
+                payload.fee_rate,
+                payload.min_confirmations,
+            )
+        })
+        .await
+        .unwrap()?;
+
+        Ok(Json(BurnResponse {
+            txid: burn_result.txid,
+            batch_transfer_idx: burn_result.batch_transfer_idx,
+        }))
+    })
+    .await
 }
 
 pub(crate) async fn inflate(
@@ -2682,7 +3084,10 @@ pub(crate) async fn init(
             return Err(APIError::ExternalSignerRequired);
         }
 
-        check_password_strength(payload.password.clone())?;
+        check_password_strength(
+            payload.password.clone(),
+            state.static_state.config.auth.password_min_length,
+        )?;
 
         check_already_initialized(&state.db())?;
 
@@ -2694,8 +3099,70 @@ pub(crate) async fn init(
         };
 
         encrypt_and_save_mnemonic(payload.password, mnemonic.clone(), &state.db())?;
+        tracing::info!("Created a new wallet");
 
         Ok(Json(InitResponse { mnemonic }))
+    })
+    .await
+}
+
+/// Configure external-signer mode on a fresh node: persist the signer's identity to `key_source.json`.
+/// Unlock then hosts the gRPC server the signer daemon dials into. Mirrors the SDK
+/// `init_with_external_signer`, but takes the identity over HTTP instead of an in-process backend.
+///
+/// The submitted identity is cross-checked against a live probe of the daemon at
+/// `--remote-signer-addr` before anything is persisted — a typo'd or stale payload (wrong xpub,
+/// stale `protocol_version`, pointed at the wrong daemon) is rejected here instead of silently
+/// wedging every future `/unlock` with `ExternalSignerMismatch` and requiring manual deletion of
+/// `key_source.json` to recover (there is no API to reconfigure once persisted).
+#[cfg(feature = "remote-signer")]
+pub(crate) async fn init_external_signer(
+    State(state): State<Arc<AppState>>,
+    WithRejection(Json(payload), _): WithRejection<
+        Json<crate::signer::remote::daemon::DaemonBootstrap>,
+        APIError,
+    >,
+) -> Result<Json<EmptyResponse>, APIError> {
+    no_cancel(async move {
+        // External-signer mode holds no mnemonic, so `/unlock` has no password to check — the biscuit
+        // token is the only credential standing between an HTTP-reachable attacker and the daemon's
+        // signing capability. Refuse to configure external-signer mode at all with authentication
+        // disabled, rather than silently leaving `/unlock` passwordless.
+        if state.root_public_key.is_none() {
+            return Err(APIError::ExternalSignerRequiresAuthentication);
+        }
+        let _unlocked_state = state.check_locked().await?;
+        crate::utils::validate_external_signer_init(&state, payload.api_level)?;
+
+        let submitted: crate::signer::types::BootstrapData = payload.into();
+
+        // Same connect recipe as `/unlock`; here only the probed bootstrap identity is needed.
+        let live_bootstrap = crate::signer::remote::connect_daemon_attachment(&state)
+            .await?
+            .bootstrap;
+
+        let submitted_key_source = crate::signer::KeySourceFile::from_bootstrap(&submitted);
+        let live_key_source = crate::signer::KeySourceFile::from_bootstrap(&live_bootstrap);
+        if submitted_key_source != live_key_source {
+            return Err(APIError::ExternalSignerProtocolError(format!(
+                "submitted identity does not match a live probe of the daemon at \
+                 --remote-signer-addr (check the payload was copied from that daemon's \
+                 --print-bootstrap output and --remote-signer-addr points at the intended daemon); \
+                 submitted node_id {}, daemon reports node_id {}",
+                submitted_key_source.node_id, live_key_source.node_id,
+            )));
+        }
+
+        // Persist the daemon's own live response — by construction identical to the submitted
+        // payload (checked above), but this keeps `key_source.json` tied to what the daemon itself
+        // reported rather than to whatever the caller happened to send.
+        crate::signer::write_key_source_file(
+            &state.static_state.storage_dir_path,
+            &live_key_source,
+        )
+        .map_err(|e| APIError::ExternalSignerProtocolError(e.to_string()))?;
+
+        Ok(Json(EmptyResponse {}))
     })
     .await
 }
@@ -2704,8 +3171,9 @@ pub(crate) async fn invoice_status(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<InvoiceStatusRequest>, APIError>,
 ) -> Result<Json<InvoiceStatusResponse>, APIError> {
+    state.check_lightning_supported()?;
     let guard = state.check_unlocked().await?;
-    let unlocked_state = guard.as_ref().unwrap();
+    let unlocked_state = guard.as_ref().unwrap().lightning()?;
 
     let invoice = match Bolt11Invoice::from_str(&payload.invoice) {
         Err(e) => return Err(APIError::InvalidInvoice(e.to_string())),
@@ -2785,6 +3253,7 @@ pub(crate) async fn issue_asset_ifa(
             payload.amounts,
             payload.inflation_amounts,
             payload.reject_list_url,
+            payload.issuance_type,
         )?;
 
         Ok(Json(IssueAssetIFAResponse {
@@ -2868,9 +3337,10 @@ pub(crate) async fn keysend(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<KeysendRequest>, APIError>,
 ) -> Result<Json<KeysendResponse>, APIError> {
+    state.check_lightning_supported()?;
     no_cancel(async move {
         let guard = state.check_unlocked().await?;
-        let unlocked_state = guard.as_ref().unwrap();
+        let unlocked_state = guard.as_ref().unwrap().lightning()?;
 
         let dest_pubkey = match hex_str_to_compressed_pubkey(&payload.dest_pubkey) {
             Some(pk) => pk,
@@ -2921,6 +3391,7 @@ pub(crate) async fn keysend(
                 expires_at: None,
                 invoice_type: None,
                 payee_pubkey: dest_pubkey,
+                description: None,
                 description_hash: None,
                 payment_idx: None,
                 async_hash_index: None,
@@ -2945,7 +3416,9 @@ pub(crate) async fn keysend(
             RecipientOnionFields::spontaneous_empty(),
             payment_id,
             route_params,
-            Retry::Timeout(Duration::from_secs(10)),
+            Retry::Timeout(Duration::from_secs(
+                unlocked_state.config.payments.retry_timeout_secs,
+            )),
         ) {
             Ok(_payment_hash) => {
                 tracing::info!(
@@ -2988,7 +3461,11 @@ pub(crate) async fn list_assets(
     )?;
 
     let mut offchain_balances = HashMap::new();
-    for chan_info in unlocked_state.channel_manager.list_channels() {
+    for chan_info in unlocked_state
+        .lightning
+        .iter()
+        .flat_map(|lightning| lightning.channel_manager.list_channels())
+    {
         let channel_id_str = chan_info.channel_id.0.as_hex().to_string();
 
         let rgb_info = match unlocked_state
@@ -3061,14 +3538,35 @@ pub(crate) async fn list_assets(
             .collect()
     });
 
-    Ok(Json(ListAssetsResponse { nia, uda, cfa, ifa }))
+    let bfa = rgb_assets.bfa.map(|assets| {
+        assets
+            .into_iter()
+            .map(|a| {
+                let mut asset: AssetBFA = a.into();
+                (
+                    asset.balance.offchain_outbound,
+                    asset.balance.offchain_inbound,
+                ) = *offchain_balances.get(&asset.asset_id).unwrap_or(&(0, 0));
+                asset
+            })
+            .collect()
+    });
+
+    Ok(Json(ListAssetsResponse {
+        nia,
+        uda,
+        cfa,
+        ifa,
+        bfa,
+    }))
 }
 
 pub(crate) async fn list_channels(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ListChannelsResponse>, APIError> {
+    state.check_lightning_supported()?;
     let guard = state.check_unlocked().await?;
-    let unlocked_state = guard.as_ref().unwrap();
+    let unlocked_state = guard.as_ref().unwrap().lightning()?;
 
     let mut channels = vec![];
     let virtual_sessions = unlocked_state.virtual_channel_session_store();
@@ -3152,8 +3650,9 @@ pub(crate) async fn list_payments(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<ListPaymentsRequest>,
 ) -> Result<Json<ListPaymentsResponse>, APIError> {
+    state.check_lightning_supported()?;
     let guard = state.check_unlocked().await?;
-    let unlocked_state = guard.as_ref().unwrap();
+    let unlocked_state = guard.as_ref().unwrap().lightning()?;
 
     let inbound_payments = unlocked_state.list_updated_inbound_payments();
     let outbound_payments = unlocked_state.outbound_payments();
@@ -3181,6 +3680,7 @@ pub(crate) async fn list_payments(
                 updated_at: payment_info.updated_at,
                 payee_pubkey: payment_info.payee_pubkey.to_string(),
                 preimage: payment_info.preimage.map(|p| hex_str(&p.0)),
+                description: payment_info.description.clone(),
                 description_hash: payment_info.description_hash.map(|h| hex_str(&h)),
             },
         ));
@@ -3210,6 +3710,7 @@ pub(crate) async fn list_payments(
                 updated_at: payment_info.updated_at,
                 payee_pubkey: payment_info.payee_pubkey.to_string(),
                 preimage: payment_info.preimage.map(|p| hex_str(&p.0)),
+                description: payment_info.description.clone(),
                 description_hash: payment_info.description_hash.map(|h| hex_str(&h)),
             },
         ));
@@ -3226,7 +3727,10 @@ pub(crate) async fn list_payments(
     let (payments, first_index_offset, last_index_offset) = paginate_newest_first(
         all,
         params.index_offset.unwrap_or(0),
-        resolve_page_size(params.max_payments, DEFAULT_MAX_PAYMENTS),
+        resolve_page_size(
+            params.max_payments,
+            state.static_state.config.api.default_page_size,
+        ),
     );
 
     Ok(Json(ListPaymentsResponse {
@@ -3239,8 +3743,9 @@ pub(crate) async fn list_payments(
 pub(crate) async fn list_peers(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ListPeersResponse>, APIError> {
+    state.check_lightning_supported()?;
     let guard = state.check_unlocked().await?;
-    let unlocked_state = guard.as_ref().unwrap();
+    let unlocked_state = guard.as_ref().unwrap().lightning()?;
 
     let mut peers = vec![];
     for peer_details in unlocked_state.peer_manager.list_peers() {
@@ -3255,15 +3760,16 @@ pub(crate) async fn list_peers(
 pub(crate) async fn list_swaps(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ListSwapsResponse>, APIError> {
+    state.check_lightning_supported()?;
     let guard = state.check_unlocked().await?;
-    let unlocked_state = guard.as_ref().unwrap();
+    let unlocked_state = guard.as_ref().unwrap().lightning()?;
 
     let map_swap = |payment_hash: &PaymentHash, swap_data: &SwapData, taker: bool| {
         let mut status = swap_data.status;
         if status == SwapStatus::Waiting && get_current_timestamp() > swap_data.swap_info.expiry {
             status = SwapStatus::Expired;
         } else if status == SwapStatus::Pending
-            && get_current_timestamp() > swap_data.initiated_at.unwrap() + 86400
+            && get_current_timestamp() > swap_data.initiated_at.unwrap() + PENDING_SWAP_TIMEOUT_SECS
         {
             status = SwapStatus::Failed;
         }
@@ -3351,7 +3857,10 @@ pub(crate) async fn list_transactions(
     let (transactions, first_index_offset, last_index_offset) = paginate_newest_first(
         indexed,
         payload.index_offset.unwrap_or(0),
-        resolve_page_size(payload.max_transactions, DEFAULT_MAX_TRANSACTIONS),
+        resolve_page_size(
+            payload.max_transactions,
+            state.static_state.config.api.default_page_size,
+        ),
     );
 
     Ok(Json(ListTransactionsResponse {
@@ -3368,15 +3877,13 @@ pub(crate) async fn list_transfers(
     let guard = state.check_unlocked().await?;
     let unlocked_state = guard.as_ref().unwrap();
 
-    let raw_transfers = match (payload.txid, payload.asset_id) {
-        (Some(txid), _) => unlocked_state.rgb_list_transfers_by_txid(txid)?,
-        (None, Some(asset_id)) => unlocked_state.rgb_list_transfers(asset_id)?,
-        (None, None) => {
-            return Err(APIError::InvalidRequest(s!(
-                "either asset_id or txid must be provided"
-            )));
-        }
-    };
+    if payload.txid.is_none() && matches!(payload.asset_filter, AssetFilter::AnyOrNone) {
+        return Err(APIError::InvalidRequest(s!(
+            "either a narrowing asset_filter (Id or None) or a txid must be provided"
+        )));
+    }
+    let raw_transfers =
+        unlocked_state.rgb_list_transfers(payload.asset_filter.into(), payload.txid)?;
 
     let mut transfers = vec![];
     for transfer in raw_transfers {
@@ -3384,16 +3891,7 @@ pub(crate) async fn list_transfers(
             idx: transfer.idx,
             created_at: transfer.created_at,
             updated_at: transfer.updated_at,
-            status: match transfer.status {
-                rgb_lib::TransferStatus::Initiated => TransferStatus::Initiated,
-                rgb_lib::TransferStatus::WaitingCounterparty => TransferStatus::WaitingCounterparty,
-                rgb_lib::TransferStatus::WaitingSafeHeight => TransferStatus::WaitingSafeHeight,
-                rgb_lib::TransferStatus::WaitingConfirmations => {
-                    TransferStatus::WaitingConfirmations
-                }
-                rgb_lib::TransferStatus::Settled => TransferStatus::Settled,
-                rgb_lib::TransferStatus::Failed => TransferStatus::Failed,
-            },
+            status: transfer.status.into(),
             requested_assignment: transfer.requested_assignment.map(|a| a.into()),
             assignments: transfer.assignments.into_iter().map(|a| a.into()).collect(),
             kind: match transfer.kind {
@@ -3403,9 +3901,11 @@ pub(crate) async fn list_transfers(
                 rgb_lib::wallet::TransferKind::Send => TransferKind::Send,
                 rgb_lib::wallet::TransferKind::Inflation => TransferKind::Inflation,
                 rgb_lib::wallet::TransferKind::Burn => TransferKind::Burn,
+                rgb_lib::wallet::TransferKind::Link => TransferKind::Link,
             },
             txid: transfer.txid,
             recipient_id: transfer.recipient_id,
+            proxy_recipient_id: transfer.proxy_recipient_id,
             receive_utxo: transfer.receive_utxo.map(|u| u.to_string()),
             change_utxo: transfer.change_utxo.map(|u| u.to_string()),
             expiration_timestamp: transfer.expiration_timestamp,
@@ -3436,7 +3936,10 @@ pub(crate) async fn list_transfers(
     let (transfers, first_index_offset, last_index_offset) = paginate_newest_first(
         indexed,
         payload.index_offset.unwrap_or(0),
-        resolve_page_size(payload.max_transfers, DEFAULT_MAX_TRANSFERS),
+        resolve_page_size(
+            payload.max_transfers,
+            state.static_state.config.api.default_page_size,
+        ),
     );
 
     Ok(Json(ListTransfersResponse {
@@ -3460,6 +3963,8 @@ pub(crate) async fn list_unspents(
                 outpoint: unspent.utxo.outpoint.to_string(),
                 btc_amount: unspent.utxo.btc_amount,
                 colorable: unspent.utxo.colorable,
+                exists: unspent.utxo.exists,
+                derivation_index: unspent.utxo.derivation_index,
             },
             rgb_allocations: unspent
                 .rgb_allocations
@@ -3486,7 +3991,10 @@ pub(crate) async fn list_unspents(
     let (unspents, first_index_offset, last_index_offset) = paginate_newest_first(
         indexed,
         payload.index_offset.unwrap_or(0),
-        resolve_page_size(payload.max_unspents, DEFAULT_MAX_UNSPENTS),
+        resolve_page_size(
+            payload.max_unspents,
+            state.static_state.config.api.default_page_size,
+        ),
     );
 
     Ok(Json(ListUnspentsResponse {
@@ -3500,9 +4008,10 @@ pub(crate) async fn ln_invoice(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<LNInvoiceRequest>, APIError>,
 ) -> Result<Json<LNInvoiceResponse>, APIError> {
+    state.check_lightning_supported()?;
     no_cancel(async move {
         let guard = state.check_unlocked().await?;
-        let unlocked_state = guard.as_ref().unwrap();
+        let unlocked_state = guard.as_ref().unwrap().lightning()?;
 
         let contract_id = if let Some(asset_id) = &payload.asset_id {
             Some(
@@ -3538,12 +4047,10 @@ pub(crate) async fn ln_invoice(
             }
             None => None,
         };
-        let description = match &payload.description_hash {
-            Some(description_hash) => Bolt11InvoiceDescription::Hash(
-                validate_and_parse_description_hash(description_hash)?,
-            ),
-            None => Bolt11InvoiceDescription::Direct(Description::empty()),
-        };
+        let description = invoice_description_from_request(
+            payload.description.as_deref(),
+            payload.description_hash.as_deref(),
+        )?;
 
         let invoice_params = Bolt11InvoiceParameters {
             amount_msats: payload.amt_msat,
@@ -3586,6 +4093,7 @@ pub(crate) async fn ln_invoice(
                 expires_at: Some(created_at + payload.expiry_sec as u64),
                 claim_deadline_height: None,
                 invoice_type: Some(invoice_type),
+                description: description_from_invoice(&invoice),
                 description_hash: description_hash_from_invoice(&invoice),
                 payment_idx: None,
                 async_hash_index: None,
@@ -3605,26 +4113,24 @@ pub(crate) async fn lock(
 ) -> Result<Json<EmptyResponse>, APIError> {
     tracing::info!("Lock started");
     no_cancel(async move {
-        match state.check_unlocked().await {
+        let _changing_state = match state.check_unlocked().await {
             Ok(unlocked_state) => {
-                state.update_changing_state(true);
+                let guard = ChangingStateGuard::new(state.clone());
                 drop(unlocked_state);
+                guard
             }
             Err(e) => {
-                state.update_changing_state(false);
                 return Err(e);
             }
-        }
+        };
 
-        tracing::debug!("Stopping LDK...");
-        stop_ldk(state.clone()).await;
-        tracing::debug!("LDK stopped");
+        tracing::debug!("Stopping node...");
+        stop_node(state.clone()).await;
+        tracing::debug!("Node stopped");
 
         state.update_unlocked_app_state(None).await;
 
         state.update_ldk_background_services(None);
-
-        state.update_changing_state(false);
 
         tracing::info!("Lock completed");
         Ok(Json(EmptyResponse {}))
@@ -3636,9 +4142,10 @@ pub(crate) async fn maker_execute(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<MakerExecuteRequest>, APIError>,
 ) -> Result<Json<EmptyResponse>, APIError> {
+    state.check_lightning_supported()?;
     no_cancel(async move {
         let guard = state.check_unlocked().await?;
-        let unlocked_state = guard.as_ref().unwrap();
+        let unlocked_state = guard.as_ref().unwrap().lightning()?;
 
         let swapstring = SwapString::from_str(&payload.swapstring)
             .map_err(|e| APIError::InvalidSwapString(payload.swapstring.clone(), e.to_string()))?;
@@ -3696,16 +4203,18 @@ pub(crate) async fn maker_execute(
         let rgb_payment = swap_info
             .to_asset
             .map(|to_asset| (to_asset, swap_info.qty_to));
+        let htlc_min_msat = unlocked_state.config.channels.htlc_min_msat;
         let first_leg = get_route(
+            &unlocked_state.config,
             &unlocked_state.channel_manager,
             &unlocked_state.router,
             unlocked_state.kv_store.as_ref(),
             unlocked_state.runtime_node_id(),
             taker_pk,
             if swap_info.is_to_btc() {
-                Some(swap_info.qty_to + HTLC_MIN_MSAT)
+                Some(swap_info.qty_to + htlc_min_msat)
             } else {
-                Some(HTLC_MIN_MSAT)
+                Some(htlc_min_msat)
             },
             rgb_payment,
             vec![],
@@ -3715,15 +4224,16 @@ pub(crate) async fn maker_execute(
             .from_asset
             .map(|from_asset| (from_asset, swap_info.qty_from));
         let second_leg = get_route(
+            &unlocked_state.config,
             &unlocked_state.channel_manager,
             &unlocked_state.router,
             unlocked_state.kv_store.as_ref(),
             taker_pk,
             unlocked_state.runtime_node_id(),
             if swap_info.is_to_btc() || swap_info.is_asset_asset() {
-                Some(HTLC_MIN_MSAT)
+                Some(htlc_min_msat)
             } else {
-                Some(swap_info.qty_from + HTLC_MIN_MSAT)
+                Some(swap_info.qty_from + htlc_min_msat)
             },
             rgb_payment,
             receive_hints,
@@ -3773,7 +4283,7 @@ pub(crate) async fn maker_execute(
             .map(|hop| hop.fee_msat)
             .sum::<u64>();
 
-        if total_fee >= MAX_SWAP_FEE_MSAT {
+        if total_fee >= unlocked_state.config.payments.max_swap_fee_msat {
             return Err(APIError::FailedPayment(format!(
                 "Fee too high: {total_fee}"
             )));
@@ -3787,7 +4297,7 @@ pub(crate) async fn maker_execute(
             route_params: Some(RouteParameters {
                 payment_params: PaymentParameters::for_keysend(
                     unlocked_state.runtime_node_id(),
-                    DEFAULT_FINAL_CLTV_EXPIRY_DELTA,
+                    unlocked_state.config.payments.final_cltv_expiry_delta,
                     false,
                 ),
                 // This value is not used anywhere, it's set by the router
@@ -3854,9 +4364,10 @@ pub(crate) async fn maker_init(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<MakerInitRequest>, APIError>,
 ) -> Result<Json<MakerInitResponse>, APIError> {
+    state.check_lightning_supported()?;
     no_cancel(async move {
         let guard = state.check_unlocked().await?;
-        let unlocked_state = guard.as_ref().unwrap();
+        let unlocked_state = guard.as_ref().unwrap().lightning()?;
 
         let from_asset = match &payload.from_asset {
             None => None,
@@ -3909,7 +4420,11 @@ pub(crate) async fn maker_init(
 
         let (payment_hash, payment_secret) = unlocked_state
             .channel_manager
-            .create_inbound_payment(Some(DUST_LIMIT_MSAT), payload.timeout_sec, None)
+            .create_inbound_payment(
+                Some(unlocked_state.config.channels.dust_limit_msat),
+                payload.timeout_sec,
+                None,
+            )
             .unwrap();
         unlocked_state.add_maker_swap(payment_hash, swap_data);
 
@@ -3932,11 +4447,17 @@ pub(crate) async fn network_info(
     let guard = state.check_unlocked().await?;
     let unlocked_state = guard.as_ref().unwrap();
 
-    let best_block = unlocked_state.channel_manager.current_best_block();
+    let height = if let Some(lightning) = &unlocked_state.lightning {
+        lightning.channel_manager.current_best_block().height
+    } else {
+        let indexer_url = unlocked_state.indexer_url.clone();
+        drop(guard);
+        crate::node_info::mainnet_height(indexer_url).await?
+    };
 
     Ok(Json(NetworkInfoResponse {
         network: state.static_state.network.into(),
-        height: best_block.height,
+        height,
     }))
 }
 
@@ -3946,73 +4467,41 @@ pub(crate) async fn node_info(
     let guard = state.check_unlocked().await?;
     let unlocked_state = guard.as_ref().unwrap();
 
-    let chans = unlocked_state.channel_manager.list_channels();
-
-    let balances = unlocked_state.chain_monitor.get_claimable_balances(&[]);
-    let local_balance_sat = balances
-        .iter()
-        .map(|b| b.claimable_amount_satoshis())
-        .sum::<u64>();
-
-    let close_fees_map = |b| match b {
-        &Balance::ClaimableOnChannelClose {
-            ref balance_candidates,
-            confirmed_balance_candidate_index,
-            ..
-        } => balance_candidates[confirmed_balance_candidate_index].transaction_fee_satoshis,
-        _ => 0,
-    };
-    let eventual_close_fees_sat = balances.iter().map(close_fees_map).sum::<u64>();
-
-    let pending_payments_map = |b| match b {
-        &Balance::MaybeTimeoutClaimableHTLC {
-            amount_satoshis,
-            outbound_payment,
-            ..
-        } if outbound_payment => amount_satoshis,
-        _ => 0,
-    };
-    let pending_outbound_payments_sat = balances.iter().map(pending_payments_map).sum::<u64>();
-
-    let graph_lock = unlocked_state.network_graph.read_only();
-    let network_nodes = graph_lock.nodes().len();
-    let network_channels = graph_lock.channels().len();
-
-    let latest_rgs_snapshot_timestamp = unlocked_state
-        .network_graph
-        .get_last_rapid_gossip_sync_timestamp()
-        .map(|val| val as u64);
+    let lightning = crate::node_info::LightningInfo::from_state(unlocked_state);
 
     Ok(Json(NodeInfoResponse {
         pubkey: unlocked_state.runtime_node_pubkey(),
-        num_channels: chans.len(),
-        num_usable_channels: chans.iter().filter(|c| c.is_usable).count(),
-        local_balance_sat,
-        eventual_close_fees_sat,
-        pending_outbound_payments_sat,
-        num_peers: unlocked_state.peer_manager.list_peers().len(),
+        num_channels: lightning.num_channels,
+        num_usable_channels: lightning.num_usable_channels,
+        local_balance_sat: lightning.local_balance_sat,
+        eventual_close_fees_sat: lightning.eventual_close_fees_sat,
+        pending_outbound_payments_sat: lightning.pending_outbound_payments_sat,
+        num_peers: lightning.num_peers,
         account_xpub_vanilla: unlocked_state.rgb_get_keys().account_xpub_vanilla,
         account_xpub_colored: unlocked_state.rgb_get_keys().account_xpub_colored,
         max_media_upload_size_mb: state.static_state.max_media_upload_size_mb,
-        rgb_htlc_min_msat: HTLC_MIN_MSAT,
-        rgb_channel_capacity_min_sat: OPENRGBCHANNEL_MIN_SAT,
-        channel_capacity_min_sat: OPENCHANNEL_MIN_SAT,
-        channel_capacity_max_sat: OPENCHANNEL_MAX_SAT,
-        channel_asset_min_amount: OPENCHANNEL_MIN_RGB_AMT,
+        rgb_htlc_min_msat: unlocked_state.config.channels.htlc_min_msat,
+        rgb_channel_capacity_min_sat: unlocked_state.config.channels.open_rgb_min_sat(),
+        channel_capacity_min_sat: unlocked_state.config.channels.open_min_sat,
+        channel_capacity_max_sat: unlocked_state.config.channels.open_max_sat,
+        channel_asset_min_amount: unlocked_state.config.channels.open_min_rgb_amount,
         channel_asset_max_amount: u64::MAX,
-        network_nodes,
-        network_channels,
-        latest_rgs_snapshot_timestamp,
+        network_nodes: lightning.network_nodes,
+        network_channels: lightning.network_channels,
+        latest_rgs_snapshot_timestamp: lightning.latest_rgs_snapshot_timestamp,
     }))
 }
 
 struct OpenChannelVirtualIntentGuard {
-    unlocked_state: Arc<UnlockedAppState>,
+    unlocked_state: Arc<crate::utils::LightningState>,
     temporary_channel_id: Option<ChannelId>,
 }
 
 impl OpenChannelVirtualIntentGuard {
-    fn new(unlocked_state: Arc<UnlockedAppState>, temporary_channel_id: ChannelId) -> Self {
+    fn new(
+        unlocked_state: Arc<crate::utils::LightningState>,
+        temporary_channel_id: ChannelId,
+    ) -> Self {
         Self {
             unlocked_state,
             temporary_channel_id: Some(temporary_channel_id),
@@ -4037,9 +4526,17 @@ pub(crate) async fn open_channel(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<OpenChannelRequest>, APIError>,
 ) -> Result<Json<OpenChannelResponse>, APIError> {
+    state.check_lightning_supported()?;
     no_cancel(async move {
         let guard = state.check_unlocked().await?;
-        let unlocked_state = guard.as_ref().unwrap();
+        let unlocked_state = guard.as_ref().unwrap().lightning()?;
+
+        // Channel persistence is remote-first: without VSS the open would
+        // accept and then stall silently, so refuse it up front.
+        #[cfg(feature = "vss")]
+        if !unlocked_state.monitor_kv_store.remote_reachable().await {
+            return Err(APIError::VssUnreachable);
+        }
 
         let is_virtual_open = match payload.virtual_open_mode.as_deref() {
             None => false,
@@ -4080,10 +4577,12 @@ pub(crate) async fn open_channel(
             }
         }
 
+        let channels_config = &unlocked_state.config.channels;
         let colored_info = match (payload.asset_id, payload.asset_amount) {
-            (Some(_), Some(amt)) if amt < OPENCHANNEL_MIN_RGB_AMT => {
+            (Some(_), Some(amt)) if amt < channels_config.open_min_rgb_amount => {
                 return Err(APIError::InvalidAmount(format!(
-                    "Channel RGB amount must be equal to or higher than {OPENCHANNEL_MIN_RGB_AMT}"
+                    "Channel RGB amount must be equal to or higher than {}",
+                    channels_config.open_min_rgb_amount
                 )));
             }
             (Some(asset), Some(amt)) => {
@@ -4097,18 +4596,21 @@ pub(crate) async fn open_channel(
             }
         };
 
-        if colored_info.is_some() && payload.capacity_sat < OPENRGBCHANNEL_MIN_SAT {
+        if colored_info.is_some() && payload.capacity_sat < channels_config.open_rgb_min_sat() {
             return Err(APIError::InvalidAmount(format!(
-                "RGB channel amount must be equal to or higher than {OPENRGBCHANNEL_MIN_SAT} sats"
+                "RGB channel amount must be equal to or higher than {} sats",
+                channels_config.open_rgb_min_sat()
             )));
-        } else if payload.capacity_sat < OPENCHANNEL_MIN_SAT {
+        } else if payload.capacity_sat < channels_config.open_min_sat {
             return Err(APIError::InvalidAmount(format!(
-                "Channel amount must be equal to or higher than {OPENCHANNEL_MIN_SAT} sats"
+                "Channel amount must be equal to or higher than {} sats",
+                channels_config.open_min_sat
             )));
         }
-        if payload.capacity_sat > OPENCHANNEL_MAX_SAT {
+        if payload.capacity_sat > channels_config.open_max_sat {
             return Err(APIError::InvalidAmount(format!(
-                "Channel amount must be equal to or less than {OPENCHANNEL_MAX_SAT} sats"
+                "Channel amount must be equal to or less than {} sats",
+                channels_config.open_max_sat
             )));
         }
 
@@ -4182,7 +4684,7 @@ pub(crate) async fn open_channel(
             )));
         }
 
-        let mut channel_config = ChannelConfig::default();
+        let mut channel_config = channels_config.channel_config();
         if let Some(fee_base_msat) = payload.fee_base_msat {
             channel_config.forwarding_fee_base_msat = fee_base_msat;
         }
@@ -4192,8 +4694,9 @@ pub(crate) async fn open_channel(
         let config = UserConfig {
             channel_handshake_limits: ChannelHandshakeLimits {
                 trust_own_funding_0conf: is_virtual_open,
-                // lnd's max to_self_delay is 2016, so we want to be compatible.
-                their_to_self_delay: 2016,
+                // defaults to 2016 for compatibility with lnd's max to_self_delay
+                their_to_self_delay: channels_config.their_to_self_delay,
+                max_minimum_depth: channels_config.max_minimum_depth,
                 ..Default::default()
             },
             channel_handshake_config: ChannelHandshakeConfig {
@@ -4203,15 +4706,19 @@ pub(crate) async fn open_channel(
                     payload.public
                 },
                 our_htlc_minimum_msat: if is_virtual_open {
-                    VIRTUAL_HTLC_MIN_MSAT
+                    channels_config.virtual_htlc_min_msat
                 } else {
-                    HTLC_MIN_MSAT
+                    channels_config.htlc_min_msat
                 },
                 minimum_depth: if is_virtual_open {
                     0
                 } else {
-                    MIN_CHANNEL_CONFIRMATIONS as u32
+                    unlocked_state.config.rgb.min_channel_confirmations as u32
                 },
+                our_to_self_delay: channels_config.our_to_self_delay,
+                max_inbound_htlc_value_in_flight_percent_of_channel: channels_config
+                    .max_inbound_htlc_value_in_flight_percent,
+                our_max_accepted_htlcs: channels_config.our_max_accepted_htlcs,
                 negotiate_scid_privacy: is_virtual_open,
                 negotiate_anchors_zero_fee_htlc_tx: payload.with_anchors,
                 their_channel_reserve_satoshis_override: if is_virtual_open {
@@ -4226,7 +4733,7 @@ pub(crate) async fn open_channel(
         };
 
         // checks on balances here are not precise since they do not take fees into account
-        let consignment_endpoint = if let Some((contract_id, asset_amount)) = &colored_info {
+        let (rgb_asset, schema) = if let Some((contract_id, asset_amount)) = &colored_info {
             let balance = unlocked_state.rgb_get_btc_balance(true)?;
             if payload.capacity_sat > balance.colored.spendable {
                 return Err(APIError::InsufficientFunds(payload.capacity_sat - balance.colored.spendable));
@@ -4235,28 +4742,26 @@ pub(crate) async fn open_channel(
             if *asset_amount > balance.spendable {
                 return Err(APIError::InsufficientAssets);
             }
-
-            Some(RgbTransport::from_str(&unlocked_state.proxy_endpoint).unwrap())
-        } else {
-            None
-        };
-
-        let schema = if let Some((contract_id, asset_amount)) = &colored_info {
             let schema = unlocked_state
                 .rgb_get_asset_metadata(*contract_id)?
                 .asset_schema;
+            // the LN-side RGB wallet does not support the BFA schema
+            if schema == RgbLibAssetSchema::Bfa {
+                return Err(APIError::UnsupportedSchema(s!("Bfa")));
+            }
             if !is_virtual_open {
                 let mut fake_p2wsh: [u8; 34] = [0; 34];
                 fake_p2wsh[1] = 32;
                 let script_buf = ScriptBuf::from_bytes(fake_p2wsh.to_vec());
                 let recipient_id =
-                    recipient_id_from_script_buf(script_buf, state.static_state.network);
+                    recipient_id_from_script_buf(script_buf, state.static_state.network)?;
                 let asset_id = contract_id.to_string();
                 let assignment = match schema {
                     RgbLibAssetSchema::Nia | RgbLibAssetSchema::Cfa | RgbLibAssetSchema::Ifa => {
                         RgbLibAssignment::Fungible(*asset_amount)
                     }
                     RgbLibAssetSchema::Uda => RgbLibAssignment::NonFungible,
+                    RgbLibAssetSchema::Bfa => unreachable!("rejected above"),
                 };
 
                 let recipient_map = map! {
@@ -4270,14 +4775,17 @@ pub(crate) async fn open_channel(
                         transport_endpoints: vec![unlocked_state.proxy_endpoint.clone()]
                 }]};
 
+                let fee_rate_sat_vb = unlocked_state.config.rgb.fee_rate_sat_vb;
+                let min_channel_confirmations =
+                    unlocked_state.config.rgb.min_channel_confirmations;
                 let unlocked_state_copy = unlocked_state.clone();
                 tokio::task::spawn_blocking(move || {
                     unlocked_state_copy.rgb_send_begin(
                         recipient_map,
                         true,
-                        FEE_RATE,
-                        MIN_CHANNEL_CONFIRMATIONS,
-                        None,
+                        fee_rate_sat_vb,
+                        min_channel_confirmations,
+                        get_current_timestamp() + DEFAULT_RGB_TRANSFER_EXPIRATION_SECS,
                         true,
                         // Channel-funding dry run: mirror the real funding tx's final locktime.
                         Some(0),
@@ -4286,13 +4794,24 @@ pub(crate) async fn open_channel(
                 .await
                 .unwrap()?;
             }
-            Some(schema)
+            #[cfg(not(test))]
+            let wire_push_asset_amount = payload.push_asset_amount;
+            #[cfg(test)]
+            let wire_push_asset_amount = if node_override_matches(
+                &FORCE_PUSH_ASSET_AMOUNT_ON_NODE,
+                unlocked_state.channel_manager.get_our_node_id(),
+            ) {
+                Some(*asset_amount + 1)
+            } else {
+                payload.push_asset_amount
+            };
+            (Some((*contract_id, wire_push_asset_amount)), Some(schema))
         } else {
             let balance = unlocked_state.rgb_get_btc_balance(true)?;
             if payload.capacity_sat > balance.vanilla.spendable {
                 return Err(APIError::InsufficientFunds(payload.capacity_sat - balance.vanilla.spendable));
             }
-            None
+            (None, None)
         };
 
         // Persist RGB channel_info before create_channel so funding
@@ -4324,6 +4843,8 @@ pub(crate) async fn open_channel(
                 local_rgb_amount: *asset_amount - push_amount,
                 remote_rgb_amount: push_amount,
                 batch_transfer_idx: None,
+                // set when the acceptor's accept_channel says it already knows the asset
+                counterparty_knows_asset: false,
             };
             unlocked_state
                 .kv_store
@@ -4345,8 +4866,7 @@ pub(crate) async fn open_channel(
                 0,
                 temporary_channel_id,
                 Some(config),
-                consignment_endpoint,
-                payload.push_asset_amount,
+                rgb_asset,
                 is_virtual_open,
             )
             .map_err(|e| {
@@ -4438,24 +4958,136 @@ pub(crate) async fn post_asset_media(
     .await
 }
 
+pub(crate) async fn provide_out_of_band_ack(
+    State(state): State<Arc<AppState>>,
+    WithRejection(Json(payload), _): WithRejection<Json<ProvideOutOfBandAckRequest>, APIError>,
+) -> Result<Json<ProvideOutOfBandAckResponse>, APIError> {
+    no_cancel(async move {
+        let guard = state.check_unlocked().await?;
+        let unlocked_state = guard.as_ref().unwrap();
+
+        let unlocked_state_copy = unlocked_state.clone();
+        let operation = tokio::task::spawn_blocking(move || {
+            unlocked_state_copy.rgb_provide_out_of_band_ack(payload.recipient_id)
+        })
+        .await
+        .unwrap()?;
+
+        Ok(Json(ProvideOutOfBandAckResponse {
+            operation: operation.map(|o| o.into()),
+        }))
+    })
+    .await
+}
+
+pub(crate) async fn provide_out_of_band_consignment(
+    State(state): State<Arc<AppState>>,
+    WithRejection(mut multipart, _): WithRejection<Multipart, APIError>,
+) -> Result<Json<ProvideOutOfBandConsignmentResponse>, APIError> {
+    no_cancel(async move {
+        let guard = state.check_unlocked().await?;
+        let unlocked_state = guard.as_ref().unwrap();
+
+        let mut consignment_bytes = None;
+        let mut media_files_bytes = Vec::new();
+        while let Some(field) = multipart
+            .next_field()
+            .await
+            .map_err(|_| APIError::ConsignmentFileNotProvided)?
+        {
+            let field_name = field.name().map(|n| n.to_string());
+            let field_bytes = field
+                .bytes()
+                .await
+                .map_err(|e| APIError::Unexpected(format!("Failed to read bytes: {e}")))?;
+            match field_name.as_deref() {
+                Some("media") => {
+                    if field_bytes.is_empty() {
+                        return Err(APIError::MediaFileEmpty);
+                    }
+                    media_files_bytes.push(field_bytes);
+                }
+                _ => {
+                    if field_bytes.is_empty() {
+                        return Err(APIError::ConsignmentFileEmpty);
+                    }
+                    consignment_bytes = Some(field_bytes);
+                }
+            }
+        }
+        let consignment_bytes = consignment_bytes.ok_or(APIError::ConsignmentFileNotProvided)?;
+
+        // persist the received consignment and media to temp files and hand their paths to rgb-lib
+        let unlocked_state_copy = unlocked_state.clone();
+        let ldk_data_dir = state.static_state.ldk_data_dir.clone();
+        let refresh_result = tokio::task::spawn_blocking(
+            move || -> Result<HashMap<i32, RgbLibRefreshedTransfer>, APIError> {
+                let write_temp = |prefix: &str, bytes: &[u8]| -> Result<_, APIError> {
+                    let mut file = tempfile::Builder::new()
+                        .prefix(prefix)
+                        .tempfile_in(&ldk_data_dir)?;
+                    file.write_all(bytes)?;
+                    file.flush()?;
+                    Ok(file)
+                };
+
+                let consignment_file = write_temp("consignment_oob_", &consignment_bytes)?;
+                let consignment_path = consignment_file.path().to_string_lossy().to_string();
+
+                // the temp files must stay alive until rgb-lib has read them: a NamedTempFile
+                // deletes its file on drop, so hold the handles and derive the paths from them
+                let media_files = media_files_bytes
+                    .iter()
+                    .map(|bytes| write_temp("media_oob_", bytes))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let media_file_paths = media_files
+                    .iter()
+                    .map(|f| f.path().to_string_lossy().to_string())
+                    .collect();
+
+                unlocked_state_copy
+                    .rgb_provide_out_of_band_consignment(consignment_path, media_file_paths)
+                    .map_err(|e| match e {
+                        RgbLibError::InvalidFilePath { .. } => APIError::InvalidConsignment,
+                        other => other.into(),
+                    })
+            },
+        )
+        .await
+        .unwrap()?;
+
+        let transfers = refresh_result
+            .into_iter()
+            .map(|(idx, t)| (idx, t.into()))
+            .collect();
+
+        Ok(Json(ProvideOutOfBandConsignmentResponse { transfers }))
+    })
+    .await
+}
+
 pub(crate) async fn refresh_transfers(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<RefreshRequest>, APIError>,
-) -> Result<Json<EmptyResponse>, APIError> {
+) -> Result<Json<RefreshResponse>, APIError> {
     no_cancel(async move {
         let guard = state.check_unlocked().await?;
         let unlocked_state = guard.as_ref().unwrap();
         let unlocked_state_copy = unlocked_state.clone();
 
         let filter = payload.filter.into_iter().map(|f| f.into()).collect();
-        tokio::task::spawn_blocking(move || {
+        let refresh_result = tokio::task::spawn_blocking(move || {
             unlocked_state_copy.rgb_refresh(payload.asset_id, filter, payload.skip_sync)
         })
         .await
         .unwrap()?;
 
         tracing::info!("Refresh complete");
-        Ok(Json(EmptyResponse {}))
+        let transfers = refresh_result
+            .into_iter()
+            .map(|(idx, t)| (idx, t.into()))
+            .collect();
+        Ok(Json(RefreshResponse { transfers }))
     })
     .await
 }
@@ -4474,13 +5106,23 @@ pub(crate) async fn restore(
 
         check_already_initialized(&state.db())?;
 
-        restore_backup(
-            Path::new(&payload.backup_path),
-            &payload.password,
-            &state.static_state.storage_dir_path,
-        )?;
+        let unpacked = unpack_backup(Path::new(&payload.backup_path), &payload.password)?;
 
-        // restore_backup overwrote the SQLite file under the pre-restore pool;
+        // Check the backup can be unlocked while the storage dir is still untouched: installing a
+        // backup whose mnemonic cannot be read would initialize the node with data it can never
+        // open, and both init and restore then refuse to run.
+        let staged_db = open_database_pool(unpacked.dir())
+            .await
+            .map_err(|e| APIError::Unexpected(e.to_string()))?;
+        let staged_check = check_password_validity(&payload.password, &staged_db);
+        // drop, never close: the query above ran on the database runtime, so awaiting a close
+        // here would wait on a wakeup that runtime no longer delivers
+        drop(staged_db);
+        staged_check?;
+
+        install_backup(&unpacked, &state.static_state.storage_dir_path)?;
+
+        // install_backup overwrote the SQLite file under the pre-restore pool;
         // reopen so subsequent queries (including unlock) see the restored data.
         let new_pool = open_database_pool(&state.static_state.storage_dir_path)
             .await
@@ -4527,7 +5169,7 @@ pub(crate) async fn rgb_invoice(
                 payload.asset_id,
                 assignment,
                 payload.expiration_timestamp,
-                vec![unlocked_state.proxy_endpoint.clone()],
+                payload.transport_endpoints,
                 payload.min_confirmations,
             )?
         } else {
@@ -4535,7 +5177,7 @@ pub(crate) async fn rgb_invoice(
                 payload.asset_id,
                 assignment,
                 payload.expiration_timestamp,
-                vec![unlocked_state.proxy_endpoint.clone()],
+                payload.transport_endpoints,
                 payload.min_confirmations,
             )?
         };
@@ -4587,9 +5229,10 @@ pub(crate) async fn send_onion_message(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<SendOnionMessageRequest>, APIError>,
 ) -> Result<Json<EmptyResponse>, APIError> {
+    state.check_lightning_supported()?;
     no_cancel(async move {
         let guard = state.check_unlocked().await?;
-        let unlocked_state = guard.as_ref().unwrap();
+        let unlocked_state = guard.as_ref().unwrap().lightning()?;
 
         if payload.node_ids.is_empty() {
             return Err(APIError::InvalidNodeIds(s!(
@@ -4652,9 +5295,10 @@ pub(crate) async fn send_payment(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<SendPaymentRequest>, APIError>,
 ) -> Result<Json<SendPaymentResponse>, APIError> {
+    state.check_lightning_supported()?;
     no_cancel(async move {
         let guard = state.check_unlocked().await?;
-        let unlocked_state = guard.as_ref().unwrap();
+        let unlocked_state = guard.as_ref().unwrap().lightning()?;
 
         let mut status = HTLCStatus::Pending;
         let created_at = get_current_timestamp();
@@ -4695,6 +5339,7 @@ pub(crate) async fn send_payment(
                     expires_at: None,
                     claim_deadline_height: None,
                     invoice_type: None,
+                    description: None,
                     description_hash: None,
                     payment_idx: None,
                     async_hash_index: None,
@@ -4703,7 +5348,9 @@ pub(crate) async fn send_payment(
             )?;
 
             let params = OptionalOfferPaymentParams {
-                retry_strategy: Retry::Timeout(Duration::from_secs(10)),
+                retry_strategy: Retry::Timeout(Duration::from_secs(
+                    unlocked_state.config.payments.retry_timeout_secs,
+                )),
                 ..Default::default()
             };
             let pay = unlocked_state.channel_manager
@@ -4720,6 +5367,9 @@ pub(crate) async fn send_payment(
                 Err(e) => return Err(APIError::InvalidInvoice(e.to_string())),
                 Ok(v) => v,
             };
+            if invoice.is_expired() {
+                return Err(APIError::InvalidInvoice(s!("invoice has expired")));
+            }
 
             let payment_id = PaymentId((*invoice.payment_hash()).to_byte_array());
             let payment_secret = Some(*invoice.payment_secret());
@@ -4783,6 +5433,41 @@ pub(crate) async fn send_payment(
                 }
             };
 
+            if let Some((contract_id, asset_amount)) = rgb_payment {
+                if !has_sufficient_asset_channel(
+                    unlocked_state,
+                    contract_id,
+                    asset_amount,
+                    amt_msat,
+                ) {
+                    if let Some((linked_contract_id, host_pubkey)) = find_linked_asset_channel(
+                        unlocked_state,
+                        contract_id,
+                        asset_amount,
+                        amt_msat,
+                        invoice.recover_payee_pub_key(),
+                    ) {
+                        let linked_payment = send_linked_asset_payment(
+                            unlocked_state,
+                            &invoice,
+                            contract_id,
+                            linked_contract_id,
+                            asset_amount,
+                            amt_msat,
+                            host_pubkey,
+                        )
+                        .await?;
+
+                        return Ok(Json(SendPaymentResponse {
+                            payment_id: hex_str(&linked_payment.payment_id.0),
+                            payment_hash: Some(hex_str(&linked_payment.payment_hash.0)),
+                            payment_secret: Some(hex_str(&linked_payment.payment_secret.0)),
+                            status: linked_payment.status,
+                        }));
+                    }
+                }
+            }
+
             if rgb_payment.is_none() {
                 let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
                 if let Some(existing) = unlocked_state.inbound_payments().get(&payment_hash) {
@@ -4809,6 +5494,7 @@ pub(crate) async fn send_payment(
                     expires_at: None,
                     claim_deadline_height: None,
                     invoice_type: None,
+                    description: description_from_invoice(&invoice),
                     description_hash: description_hash_from_invoice(&invoice),
                     payment_idx: None,
                     async_hash_index: None,
@@ -4832,7 +5518,9 @@ pub(crate) async fn send_payment(
                 payment_id,
                 Some(amt_msat),
                 RouteParametersConfig::default(),
-                Retry::Timeout(Duration::from_secs(10)),
+                Retry::Timeout(Duration::from_secs(
+                    unlocked_state.config.payments.retry_timeout_secs,
+                )),
             ) {
                 Ok(_) => {
                     let payee_pubkey = invoice.recover_payee_pub_key();
@@ -4975,9 +5663,10 @@ pub(crate) async fn taker(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<TakerRequest>, APIError>,
 ) -> Result<Json<EmptyResponse>, APIError> {
+    state.check_lightning_supported()?;
     no_cancel(async move {
         let guard = state.check_unlocked().await?;
-        let unlocked_state = guard.as_ref().unwrap();
+        let unlocked_state = guard.as_ref().unwrap().lightning()?;
         let swapstring = SwapString::from_str(&payload.swapstring)
             .map_err(|e| APIError::InvalidSwapString(payload.swapstring.clone(), e.to_string()))?;
 
@@ -5005,20 +5694,56 @@ pub(crate) async fn taker(
     .await
 }
 
+/// The unlock key source for external-signer mode: connect to the signer daemon and wrap the live
+/// attachment. Split by cfg so a build without the `remote-signer` feature gets a clean
+/// `ExternalSignerRequired` error — the "feature off ⇒ external mode cannot proceed" invariant is
+/// structural here, instead of an `unreachable!()` in `unlock` argued from a guard dozens of lines
+/// away.
+#[cfg(feature = "remote-signer")]
+async fn external_signer_key_source(
+    state: &Arc<AppState>,
+) -> Result<crate::core_types::NodeKeySource, APIError> {
+    // Remote external signer (Option A): the daemon holds the seed and answers all signing
+    // (identity/scripts/channel/node-crypto/RGB PSBT) over framed TCP. The persisted
+    // key_source.json is validated against the daemon's bootstrap inside start_node.
+    let attachment = crate::signer::remote::connect_daemon_attachment(state).await?;
+    Ok(crate::core_types::NodeKeySource::External(
+        crate::core_types::ExternalKeySource {
+            bootstrap: attachment.bootstrap.clone(),
+            signer_attachment: attachment,
+        },
+    ))
+}
+
+#[cfg(not(feature = "remote-signer"))]
+async fn external_signer_key_source(
+    _state: &Arc<AppState>,
+) -> Result<crate::core_types::NodeKeySource, APIError> {
+    Err(APIError::ExternalSignerRequired)
+}
+
 pub(crate) async fn unlock(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<UnlockRequest>, APIError>,
 ) -> Result<Json<EmptyResponse>, APIError> {
     tracing::info!("Unlock started");
     no_cancel(async move {
-        if is_external_signer_mode_configured(&state)? {
-            return Err(APIError::ExternalSignerRequired);
+        let external_configured = is_external_signer_mode_configured(&state)?;
+        // External-signer mode holds no mnemonic, so that branch below never checks
+        // `payload.password` — the biscuit token is the only credential guarding `/unlock`. Refuse to
+        // unlock rather than let anyone who can reach the HTTP port unlock the node when
+        // authentication is disabled. Checked unconditionally (not just under `remote-signer`) since
+        // `init_external_signer` is the primary way to configure this today, but nothing stops
+        // `key_source.json` from having been written by another path.
+        if external_configured && state.root_public_key.is_none() {
+            return Err(APIError::ExternalSignerRequiresAuthentication);
         }
 
-        match state.check_locked().await {
+        let _changing_state = match state.check_locked().await {
             Ok(unlocked_state) => {
-                state.update_changing_state(true);
+                let guard = ChangingStateGuard::new(state.clone());
                 drop(unlocked_state);
+                guard
             }
             Err(e) => {
                 return Err(match e {
@@ -5026,31 +5751,25 @@ pub(crate) async fn unlock(
                     _ => e,
                 });
             }
-        }
+        };
 
-        // Clear the changing-state flag on any exit — including a panic during
-        // startup — so a failed unlock can't wedge the node in ChangingState.
-        let _changing_state_guard = crate::utils::CallOnDrop::new({
-            let state = state.clone();
-            move || state.update_changing_state(false)
-        });
+        let key_source = if external_configured {
+            external_signer_key_source(&state).await?
+        } else {
+            let mnemonic = check_password_validity(&payload.password, &state.db())?;
+            crate::core_types::NodeKeySource::InternalMnemonic(mnemonic)
+        };
 
-        let mnemonic = check_password_validity(&payload.password, &state.db())?;
-
-        tracing::debug!("Starting LDK...");
-        let (new_ldk_background_services, new_unlocked_app_state) = start_ldk(
-            state.clone(),
-            crate::core_types::NodeKeySource::InternalMnemonic(mnemonic),
-            payload.into(),
-        )
-        .await?;
-        tracing::debug!("LDK started");
+        tracing::debug!("Starting node...");
+        let (new_ldk_background_services, new_unlocked_app_state) =
+            start_node(state.clone(), key_source, payload.into()).await?;
+        tracing::debug!("Node started");
 
         state
             .update_unlocked_app_state(Some(new_unlocked_app_state))
             .await;
 
-        state.update_ldk_background_services(Some(new_ldk_background_services));
+        state.update_ldk_background_services(new_ldk_background_services);
 
         tracing::info!("Unlock completed");
         Ok(Json(EmptyResponse {}))
@@ -5062,26 +5781,28 @@ pub(crate) async fn unlock(
 pub(crate) async fn vss_backup(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, APIError> {
-    let guard = state.check_unlocked().await?;
-    let unlocked_state = guard.as_ref().unwrap().clone();
-    drop(guard);
+    crate::utils::no_cancel(async move {
+        let guard = state.check_unlocked().await?;
+        let unlocked_state = guard.as_ref().unwrap().clone();
 
-    let vss_client = unlocked_state
-        .rgb_wallet_wrapper
-        .vss_client()
-        .ok_or_else(|| APIError::Unexpected("VSS is not configured".to_string()))?;
+        let vss_client = unlocked_state
+            .rgb_wallet_wrapper
+            .vss_client()
+            .ok_or_else(|| APIError::Unexpected("VSS is not configured".to_string()))?;
 
-    let wrapper = unlocked_state.rgb_wallet_wrapper.clone();
-    let version = tokio::task::spawn_blocking(move || {
-        let wallet = wrapper.get_rgb_wallet();
-        let rt = vss_client.handle().clone();
-        rt.block_on(wallet.vss_backup(&vss_client))
+        let wrapper = unlocked_state.rgb_wallet_wrapper.clone();
+        let version = tokio::task::spawn_blocking(move || {
+            let wallet = wrapper.get_rgb_wallet();
+            let rt = vss_client.handle().clone();
+            rt.block_on(wallet.vss_backup(&vss_client))
+        })
+        .await
+        .map_err(|e| APIError::Unexpected(format!("VSS backup task failed: {e}")))?
+        .map_err(|e| APIError::Unexpected(format!("VSS backup failed: {e}")))?;
+
+        Ok(Json(serde_json::json!({ "version": version })))
     })
     .await
-    .map_err(|e| APIError::Unexpected(format!("VSS backup task failed: {e}")))?
-    .map_err(|e| APIError::Unexpected(format!("VSS backup failed: {e}")))?;
-
-    Ok(Json(serde_json::json!({ "version": version })))
 }
 
 #[cfg(feature = "vss")]
@@ -5113,6 +5834,7 @@ pub(crate) async fn vss_backup_info(
         "backup_exists": info.backup_exists,
         "server_version": info.server_version,
         "backup_required": info.backup_required,
+        "last_auto_backup_error": info.last_auto_backup_error,
         "pending_kv_writes": pending_kv_writes,
     })))
 }
@@ -5137,7 +5859,7 @@ pub(crate) async fn vss_clear_fence(
         // Internal-mnemonic mode authenticates with the password and derives
         // the `m/535'/1'` identity. External-signer mode holds no mnemonic, so
         // it reconstructs the bootstrap identity from the persisted
-        // key_source.json — the same store id start_ldk acquired the fence
+        // key_source.json — the same store id start_node acquired the fence
         // under. Without this branch, external-signer nodes could never clear
         // a leftover fence and would be wedged after their first shutdown.
         // [[derive_vss_identity_from_key_source]]
@@ -5151,11 +5873,13 @@ pub(crate) async fn vss_clear_fence(
             }
         };
 
+        let vss_retry = state.static_state.config.vss.clone();
         tokio::task::spawn_blocking(move || {
-            let store = crate::vss_kv_store::VssKvStore::new(
+            let store = crate::vss_kv_store::VssKvStore::new_with_retry(
                 vss_url,
                 identity.pubkey_hex,
                 identity.signing_key,
+                &vss_retry,
             )?;
             store.delete_fence()
         })
@@ -5173,14 +5897,43 @@ mod request_tests {
     use super::*;
     use crate::gossip::GossipSourceConfig;
 
+    const VALID_ASSET_ID: &str = "rgb:EIkAVQvq-WbAb5JG-CYxbUER-oqDNwne-ZNxBDID-p0cpf9U";
+    const VALID_TXID: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    #[test]
+    fn consignment_lookup_accepts_valid_ids() {
+        assert!(validate_consignment_lookup(VALID_ASSET_ID, VALID_TXID).is_ok());
+    }
+
+    #[test]
+    fn consignment_lookup_rejects_traversal_asset_id() {
+        assert!(validate_consignment_lookup("../../../etc/passwd", VALID_TXID).is_err());
+    }
+
+    #[test]
+    fn consignment_lookup_rejects_traversal_txid() {
+        assert!(validate_consignment_lookup(VALID_ASSET_ID, "../../secret").is_err());
+    }
+
+    #[test]
+    fn consignment_lookup_rejects_separators() {
+        assert!(validate_consignment_lookup(VALID_ASSET_ID, "abc/def").is_err());
+        assert!(validate_consignment_lookup("rgb:a/b", VALID_TXID).is_err());
+    }
+
     #[test]
     fn unlock_request_with_gossip_source_deserializes() {
         let json = r#"{
             "password": "x",
-            "bitcoind_rpc_username": "u",
-            "bitcoind_rpc_password": "p",
-            "bitcoind_rpc_host": "127.0.0.1",
-            "bitcoind_rpc_port": 18443,
+            "ldk_chain_sync": {
+                "mode": "BlockSync",
+                "config": {
+                    "bitcoind_rpc_username": "u",
+                    "bitcoind_rpc_password": "p",
+                    "bitcoind_rpc_host": "127.0.0.1",
+                    "bitcoind_rpc_port": 18443
+                }
+            },
             "announce_addresses": [],
             "gossip_source": { "type": "rgs", "server_url": "https://example.invalid" }
         }"#;
@@ -5195,10 +5948,15 @@ mod request_tests {
     fn unlock_request_without_gossip_source_defaults_to_none() {
         let json = r#"{
             "password": "x",
-            "bitcoind_rpc_username": "u",
-            "bitcoind_rpc_password": "p",
-            "bitcoind_rpc_host": "127.0.0.1",
-            "bitcoind_rpc_port": 18443,
+            "ldk_chain_sync": {
+                "mode": "BlockSync",
+                "config": {
+                    "bitcoind_rpc_username": "u",
+                    "bitcoind_rpc_password": "p",
+                    "bitcoind_rpc_host": "127.0.0.1",
+                    "bitcoind_rpc_port": 18443
+                }
+            },
             "announce_addresses": []
         }"#;
         let req: UnlockRequest = serde_json::from_str(json).unwrap();
@@ -5294,5 +6052,338 @@ mod request_tests {
             cursor = last;
         }
         assert_eq!(seen, vec!["v5", "v4", "v3", "v2", "v1"]);
+    }
+}
+
+#[cfg(test)]
+mod state_mocks {
+    use super::*;
+    use crate::disk::FilesystemLogger;
+    use crate::utils::{open_database_pool, StaticState};
+    use rln_migration::{Migrator, MigratorTrait};
+    use std::collections::HashSet;
+    use std::sync::{Mutex, RwLock};
+    use tokio::sync::Mutex as TokioMutex;
+    use tokio_util::sync::CancellationToken;
+
+    pub(super) async fn mock_state_with_auth(
+        root_public_key: Option<biscuit_auth::PublicKey>,
+    ) -> Arc<AppState> {
+        mock_state(root_public_key, None).await
+    }
+
+    pub(super) async fn mock_state(
+        root_public_key: Option<biscuit_auth::PublicKey>,
+        remote_signer_listen_addr: Option<std::net::SocketAddr>,
+    ) -> Arc<AppState> {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.keep();
+        let database = open_database_pool(&path)
+            .await
+            .expect("mock database connection");
+        Migrator::up(&database, None).await.expect("run migrations");
+
+        Arc::new(AppState {
+            static_state: Arc::new(StaticState {
+                config: Default::default(),
+                ldk_peer_listening_port: 9735,
+                network: rgb_lib::BitcoinNetwork::Regtest,
+                storage_dir_path: path.clone(),
+                ldk_data_dir: path.join(".ldk"),
+                logger: Arc::new(FilesystemLogger::new(path)),
+                max_media_upload_size_mb: 1,
+                max_aggregated_media_size_per_channel_mb:
+                    crate::rgb_file_transfer::MAX_MEDIA_MB_PER_CHANNEL,
+                max_pending_consignments: crate::rgb_file_transfer::MAX_PENDING_CONSIGNMENTS,
+                max_media_files_per_channel: crate::rgb_file_transfer::MAX_MEDIA_FILES_PER_CHANNEL,
+                enable_virtual_channels_v0: false,
+                virtual_peer_pubkeys: vec![],
+                database: RwLock::new(Arc::new(database)),
+                lsp_base_url: None,
+                lsp_bearer_token: None,
+                vss_url: None,
+                vss_allow_empty_restore: false,
+                reuse_addresses: false,
+                remote_signer_listen_addr,
+            }),
+            cancel_token: CancellationToken::new(),
+            unlocked_app_state: Arc::new(TokioMutex::new(None)),
+            ldk_background_services: Arc::new(Mutex::new(None)),
+            attached_external_signer: Arc::new(Mutex::new(None)),
+            changing_state: Mutex::new(false),
+            root_public_key,
+            revoked_tokens: Arc::new(Mutex::new(HashSet::new())),
+        })
+    }
+}
+
+#[cfg(test)]
+mod changing_state_guard_tests {
+    use super::state_mocks::mock_state_with_auth;
+    use super::ChangingStateGuard;
+
+    // Poll the actual admission helper behind the session mutex; no sleep or spawned-task race.
+    #[tokio::test]
+    async fn queued_locked_admission_rechecks_transition() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+        let state = mock_state_with_auth(None).await;
+        let storage_dir = state.static_state.storage_dir_path.clone();
+        let guard = state.unlocked_app_state.lock().await;
+        assert!(guard.is_none());
+        let mut waiting = std::pin::pin!(state.check_locked());
+        poll_fn(|cx| {
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        *state.get_changing_state() = true;
+        drop(guard);
+        assert!(matches!(
+            waiting.await,
+            Err(crate::error::APIError::ChangingState)
+        ));
+        assert!(state.unlocked_app_state.lock().await.is_none());
+        assert!(state.ldk_background_services.lock().unwrap().is_none());
+        *state.get_changing_state() = false;
+        std::fs::remove_dir_all(storage_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sets_and_clears_the_flag() {
+        let state = mock_state_with_auth(None).await;
+        assert!(!*state.get_changing_state());
+        {
+            let _guard = ChangingStateGuard::new(state.clone());
+            assert!(*state.get_changing_state());
+        }
+        assert!(!*state.get_changing_state());
+    }
+
+    // A flag left set by a panicking lock/unlock makes `shutdown_signal` wait forever.
+    #[tokio::test]
+    async fn clears_the_flag_on_panic_unwind() {
+        let state = mock_state_with_auth(None).await;
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ChangingStateGuard::new(state.clone());
+            assert!(*state.get_changing_state());
+            panic!("boom");
+        }));
+        assert!(panicked.is_err(), "closure should have panicked");
+        assert!(
+            !*state.get_changing_state(),
+            "the flag must be cleared while unwinding a panic"
+        );
+    }
+}
+
+/// External-signer mode holds no mnemonic, so `/unlock` never checks a password on that path — the
+/// biscuit token is the only credential guarding it. These tests pin down that both HTTP entry points
+/// that can leave a node running in external-signer mode refuse to do so when authentication is
+/// disabled, rather than silently leaving `/unlock` passwordless.
+#[cfg(all(test, feature = "remote-signer"))]
+mod external_signer_auth_tests {
+    use super::state_mocks::{mock_state, mock_state_with_auth};
+    use super::*;
+    use std::marker::PhantomData;
+
+    /// A biscuit keypair for tests that need authentication *enabled* (root_public_key = Some).
+    fn test_root_public_key() -> biscuit_auth::PublicKey {
+        biscuit_auth::KeyPair::new().public()
+    }
+
+    /// Starts a real `DaemonSigner` over an ephemeral seed and returns its listen address, for tests
+    /// that need `init_external_signer`'s live daemon probe to succeed against something real. The
+    /// daemon requires the shared token just as in production, so `state`'s storage dir is given the
+    /// node's copy — otherwise the probe never gets past the auth handshake.
+    async fn spawn_test_daemon(
+        seed: [u8; 32],
+        listener: tokio::net::TcpListener,
+        state: &Arc<AppState>,
+    ) {
+        use crate::signer::remote::auth::AuthToken;
+
+        let signer = Arc::new(
+            crate::signer::remote::daemon::DaemonSigner::new_ephemeral(
+                seed,
+                bitcoin::Network::Regtest,
+                true,
+            )
+            .expect("daemon signer"),
+        );
+        let token_path = AuthToken::node_path(&state.static_state.storage_dir_path);
+        let token = AuthToken::load_or_generate(&token_path).expect("node auth token");
+        tokio::spawn(crate::signer::remote::daemon::serve(
+            listener,
+            signer,
+            None,
+            Arc::new(crate::signer::remote::daemon::DaemonAuth::Token(token)),
+        ));
+    }
+
+    /// Binds the daemon's loopback listener up front: a test needs its address to build the state,
+    /// and [`spawn_test_daemon`] needs that state's storage dir to place the node's token in.
+    async fn bind_test_daemon_listener() -> (tokio::net::TcpListener, std::net::SocketAddr) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        (listener, addr)
+    }
+
+    #[tokio::test]
+    async fn init_external_signer_refuses_when_authentication_disabled() {
+        let state = mock_state_with_auth(None).await;
+        let payload = crate::signer::remote::daemon::DaemonBootstrap {
+            node_id: "02aa".repeat(11),
+            account_xpub_vanilla: "xpub-vanilla".to_string(),
+            account_xpub_colored: "xpub-colored".to_string(),
+            master_fingerprint: "deadbeef".to_string(),
+            protocol_version: "1".to_string(),
+            api_level: crate::signer::SUPPORTED_SIGNER_API_LEVEL,
+        };
+        let result =
+            init_external_signer(State(state), WithRejection(Json(payload), PhantomData)).await;
+        assert!(matches!(
+            result,
+            Err(APIError::ExternalSignerRequiresAuthentication)
+        ));
+    }
+
+    #[tokio::test]
+    async fn unlock_refuses_external_signer_mode_when_authentication_disabled() {
+        let state = mock_state_with_auth(None).await;
+        // Configure external-signer mode directly (bypassing the now-guarded HTTP route) to pin down
+        // that `unlock` itself refuses too — defense in depth in case `key_source.json` was written
+        // by another path, or authentication was disabled after `init_external_signer` ran.
+        let bootstrap = crate::signer::types::BootstrapData {
+            identity: crate::signer::types::SignerIdentity {
+                node_id: "02aa".repeat(11),
+                account_xpub_vanilla: "xpub-vanilla".to_string(),
+                account_xpub_colored: "xpub-colored".to_string(),
+                master_fingerprint: "deadbeef".to_string(),
+            },
+            protocol_version: "1".to_string(),
+            api_level: crate::signer::SUPPORTED_SIGNER_API_LEVEL,
+        };
+        crate::signer::write_key_source_file(
+            &state.static_state.storage_dir_path,
+            &crate::signer::KeySourceFile::from_bootstrap(&bootstrap),
+        )
+        .expect("write key_source.json");
+
+        let payload: UnlockRequest = serde_json::from_str(
+            r#"{
+                "password": "whatever",
+                "ldk_chain_sync": {
+                    "mode": "BlockSync",
+                    "config": {
+                        "bitcoind_rpc_username": "u",
+                        "bitcoind_rpc_password": "p",
+                        "bitcoind_rpc_host": "127.0.0.1",
+                        "bitcoind_rpc_port": 18443
+                    }
+                },
+                "announce_addresses": []
+            }"#,
+        )
+        .expect("deserialize unlock request");
+
+        let result = unlock(State(state), WithRejection(Json(payload), PhantomData)).await;
+        assert!(matches!(
+            result,
+            Err(APIError::ExternalSignerRequiresAuthentication)
+        ));
+    }
+
+    /// A typo'd/stale identity (wrong node_id here, but any field would do) must be rejected against
+    /// a live probe of the daemon, and — critically — nothing gets persisted, so the operator can just
+    /// retry `/initexternalsigner` with a corrected payload instead of hitting `AlreadyInitialized`
+    /// and needing to manually delete `key_source.json`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn init_external_signer_rejects_identity_mismatching_the_live_daemon() {
+        let seed = [21u8; 32];
+        let (listener, daemon_addr) = bind_test_daemon_listener().await;
+        let state = mock_state(Some(test_root_public_key()), Some(daemon_addr)).await;
+        spawn_test_daemon(seed, listener, &state).await;
+
+        let payload = crate::signer::remote::daemon::DaemonBootstrap {
+            node_id: "02".to_string() + &"ab".repeat(32), // wrong: not the daemon's real node_id
+            account_xpub_vanilla: "xpub-vanilla".to_string(),
+            account_xpub_colored: "xpub-colored".to_string(),
+            master_fingerprint: "deadbeef".to_string(),
+            protocol_version: "1".to_string(),
+            api_level: crate::signer::SUPPORTED_SIGNER_API_LEVEL,
+        };
+
+        let result = init_external_signer(
+            State(state.clone()),
+            WithRejection(Json(payload), PhantomData),
+        )
+        .await;
+
+        // Assert on the message, not just the variant: with the auth handshake in front of the probe,
+        // a setup slip (e.g. a missing token file) would produce the same variant and let this test
+        // pass without ever reaching the identity comparison it exists to cover.
+        match result.as_ref() {
+            Err(APIError::ExternalSignerProtocolError(msg)) => assert!(
+                msg.contains("submitted identity does not match"),
+                "expected the identity-mismatch rejection, got: {msg}"
+            ),
+            Err(other) => {
+                panic!("expected a protocol error rejecting the mismatched identity, got {other:?}")
+            }
+            Ok(_) => panic!("expected the mismatched identity to be rejected, but init succeeded"),
+        }
+        assert!(
+            !is_external_signer_mode_configured(&state).expect("check configured"),
+            "a rejected init must not persist key_source.json"
+        );
+    }
+
+    /// The mirror image of the mismatch test: an identity that genuinely matches the daemon's live
+    /// bootstrap must be accepted and persisted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn init_external_signer_accepts_identity_matching_the_live_daemon() {
+        let seed = [22u8; 32];
+        let (listener, daemon_addr) = bind_test_daemon_listener().await;
+        let state = mock_state(Some(test_root_public_key()), Some(daemon_addr)).await;
+        spawn_test_daemon(seed, listener, &state).await;
+
+        // Fetch the daemon's real identity the same way an operator would via --print-bootstrap.
+        let probe_signer = crate::signer::remote::daemon::DaemonSigner::new_ephemeral(
+            seed,
+            bitcoin::Network::Regtest,
+            true,
+        )
+        .expect("probe signer");
+        let real = probe_signer
+            .bootstrap_identity()
+            .expect("bootstrap identity");
+
+        let payload = crate::signer::remote::daemon::DaemonBootstrap {
+            node_id: real.node_id,
+            account_xpub_vanilla: real.account_xpub_vanilla,
+            account_xpub_colored: real.account_xpub_colored,
+            master_fingerprint: real.master_fingerprint,
+            protocol_version: real.protocol_version,
+            api_level: real.api_level,
+        };
+
+        let result = init_external_signer(
+            State(state.clone()),
+            WithRejection(Json(payload), PhantomData),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "expected init to succeed, got {:?}",
+            result.as_ref().err()
+        );
+        assert!(
+            is_external_signer_mode_configured(&state).expect("check configured"),
+            "a successful init must persist key_source.json"
+        );
     }
 }

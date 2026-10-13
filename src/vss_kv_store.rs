@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use bitcoin::io;
@@ -21,19 +21,51 @@ use vss_client::util::retry::{
 type VssRetryPolicy =
     MaxTotalDelayRetryPolicy<MaxAttemptsRetryPolicy<ExponentialBackoffRetryPolicy<VssError>>>;
 
-/// Dedicated runtime for driving synchronous VSS calls (see [`VssKvStore::block_on`]).
-static VSS_RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_name("vss-runtime")
-        .enable_all()
-        .build()
-        .expect("Failed to create VSS tokio runtime")
+/// Serialized runtime for driving synchronous VSS calls (see [`VssKvStore::block_on`]).
+///
+/// A current-thread runtime is intentional here. Entering a multi-thread Tokio runtime from
+/// short-lived handoff threads races its reactor registration under ThreadSanitizer, while VSS
+/// persistence requires ordered synchronous semantics rather than parallel call execution.
+static VSS_RUNTIME: LazyLock<Mutex<tokio::runtime::Runtime>> = LazyLock::new(|| {
+    Mutex::new(
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create VSS tokio runtime"),
+    )
 });
 
 /// Result of a single VSS get-object during a paged `download_all`. `Ok(None)`
 /// means the key disappeared between list and get (race; benign).
 type FetchResult = Result<Option<(String, Vec<u8>)>, VssError>;
+
+/// Whether a VSS failure is worth retrying: transport failures (connection
+/// refused/timeouts surface as `InternalError`) and server 5xx. Auth,
+/// bad-request and version-conflict errors are permanent.
+fn is_transient_vss_error(e: &VssError) -> bool {
+    matches!(
+        e,
+        VssError::InternalServerError(_) | VssError::InternalError(_)
+    )
+}
+
+/// Maps a `VssError` to `io::Error`, encoding transience in the kind so
+/// callers (see `RemoteFirstKvStore`) can decide whether to retry.
+/// [`is_transient_io_error`] is the matching decoder.
+fn vss_err_to_io(e: VssError, msg: String) -> io::Error {
+    let kind = if is_transient_vss_error(&e) {
+        io::ErrorKind::TimedOut
+    } else {
+        io::ErrorKind::Other
+    };
+    io::Error::new(kind, msg)
+}
+
+/// True when the error came from a VSS outage (see [`vss_err_to_io`]) rather
+/// than a permanent failure.
+pub(crate) fn is_transient_io_error(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::TimedOut
+}
 
 /// HKDF info tag used to derive this KV stream's per-value encryption key.
 /// Domain-separates it from rgb-lib's wallet-backup stream so the two derived
@@ -90,16 +122,32 @@ impl VssKvStore {
     /// * `store_id` - Keyspace identifier (derived from node pubkey)
     /// * `signing_key` - Secret key used both for sigs-auth and for deriving
     ///   the per-value encryption key via HKDF-SHA256.
+    #[cfg(test)]
     pub fn new(
         server_url: String,
         store_id: String,
         signing_key: SecretKey,
     ) -> Result<Self, io::Error> {
+        Self::new_with_retry(
+            server_url,
+            store_id,
+            signing_key,
+            &crate::config::VssSection::default(),
+        )
+    }
+
+    pub fn new_with_retry(
+        server_url: String,
+        store_id: String,
+        signing_key: SecretKey,
+        retry: &crate::config::VssSection,
+    ) -> Result<Self, io::Error> {
         let auth_provider = SigsAuthProvider::new(signing_key, HashMap::new());
 
-        let retry_policy = ExponentialBackoffRetryPolicy::new(Duration::from_millis(100))
-            .with_max_attempts(3)
-            .with_max_total_delay(Duration::from_secs(5));
+        let retry_policy =
+            ExponentialBackoffRetryPolicy::new(Duration::from_millis(retry.retry_backoff_ms))
+                .with_max_attempts(retry.retry_max_attempts)
+                .with_max_total_delay(Duration::from_secs(retry.retry_max_total_delay_secs));
 
         let client = VssClient::new_with_headers(server_url, retry_policy, Arc::new(auth_provider));
 
@@ -123,12 +171,20 @@ impl VssKvStore {
     {
         if tokio::runtime::Handle::try_current().is_ok() {
             std::thread::scope(|s| {
-                s.spawn(|| VSS_RUNTIME.block_on(future))
-                    .join()
-                    .expect("VSS runtime thread panicked")
+                s.spawn(|| {
+                    VSS_RUNTIME
+                        .lock()
+                        .expect("VSS runtime lock poisoned")
+                        .block_on(future)
+                })
+                .join()
+                .expect("VSS runtime thread panicked")
             })
         } else {
-            VSS_RUNTIME.block_on(future)
+            VSS_RUNTIME
+                .lock()
+                .expect("VSS runtime lock poisoned")
+                .block_on(future)
         }
     }
 
@@ -452,7 +508,8 @@ impl VssKvStore {
         };
         self.client.put_object(&request).await.map_err(|e| {
             tracing::error!(vss_key, error = %e, "VssKvStore write_async failed");
-            io::Error::new(io::ErrorKind::Other, format!("VSS write failed: {e}"))
+            let msg = format!("VSS write failed: {e}");
+            vss_err_to_io(e, msg)
         })?;
         Ok(())
     }
@@ -477,7 +534,8 @@ impl VssKvStore {
         };
         self.client.put_object(&request).await.map_err(|e| {
             tracing::error!(vss_key, error = %e, "VssKvStore remove_async failed");
-            io::Error::new(io::ErrorKind::Other, format!("VSS remove failed: {e}"))
+            let msg = format!("VSS remove failed: {e}");
+            vss_err_to_io(e, msg)
         })?;
         Ok(())
     }
@@ -566,6 +624,89 @@ impl VssKvStore {
         }
 
         Ok(all_items)
+    }
+
+    /// Deletes a key by its raw VSS name, e.g. one of rgb-lib's backup keys.
+    pub(crate) fn remove_raw(&self, vss_key: &str) -> Result<(), io::Error> {
+        // VSS honors `version = -1` only for puts; `delete_items` require the
+        // object's current version, so a blind delete is rejected with a
+        // version conflict and, once queued, retries forever without ever
+        // converging. Read the current version and issue a conditional delete;
+        // an absent key means the removal goal is already met.
+        let get_req = GetObjectRequest {
+            store_id: self.store_id.clone(),
+            key: vss_key.to_string(),
+        };
+        let existing_version = match self.block_on(self.client.get_object(&get_req)) {
+            Ok(resp) => match resp.value {
+                Some(kv) => kv.version,
+                None => return Ok(()),
+            },
+            Err(VssError::NoSuchKeyError(_)) => return Ok(()),
+            Err(e) => {
+                tracing::error!(vss_key, error = %e, "VssKvStore remove read failed");
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("VSS remove read failed: {e}"),
+                ));
+            }
+        };
+
+        let request = PutObjectRequest {
+            store_id: self.store_id.clone(),
+            global_version: None,
+            transaction_items: vec![],
+            delete_items: vec![KeyValue {
+                key: vss_key.to_string(),
+                version: existing_version,
+                value: vec![],
+            }],
+        };
+
+        match self.block_on(self.client.put_object(&request)) {
+            Ok(_) | Err(VssError::NoSuchKeyError(_)) => Ok(()),
+            Err(e) => {
+                tracing::error!(vss_key, error = %e, "VssKvStore remove failed");
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("VSS remove failed: {e}"),
+                ))
+            }
+        }
+    }
+
+    /// Lists every key in the store except the fence.
+    pub fn list_all_keys(&self) -> Result<Vec<String>, io::Error> {
+        let mut keys = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let list_req = ListKeyVersionsRequest {
+                store_id: self.store_id.clone(),
+                key_prefix: None,
+                page_size: None,
+                page_token: page_token.clone(),
+            };
+            let response = self
+                .block_on(self.client.list_key_versions(&list_req))
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("VSS list_key_versions failed: {e}"),
+                    )
+                })?;
+            keys.extend(
+                response
+                    .key_versions
+                    .into_iter()
+                    .map(|kv| kv.key)
+                    .filter(|k| k != FENCE_KEY),
+            );
+            match response.next_page_token {
+                Some(token) if !token.is_empty() => page_token = Some(token),
+                _ => break,
+            }
+        }
+        Ok(keys)
     }
 }
 
@@ -712,52 +853,7 @@ impl KVStoreSync for VssKvStore {
         tracing::trace!(vss_key, "VssKvStore remove");
 
         self.check_fence_periodic();
-
-        // VSS honors `version = -1` only for puts; `delete_items` require the
-        // object's current version, so a blind delete is rejected with a
-        // version conflict and, once queued, retries forever without ever
-        // converging. Read the current version and issue a conditional delete;
-        // an absent key means the removal goal is already met.
-        let get_req = GetObjectRequest {
-            store_id: self.store_id.clone(),
-            key: vss_key.clone(),
-        };
-        let existing_version = match self.block_on(self.client.get_object(&get_req)) {
-            Ok(resp) => match resp.value {
-                Some(kv) => kv.version,
-                None => return Ok(()),
-            },
-            Err(VssError::NoSuchKeyError(_)) => return Ok(()),
-            Err(e) => {
-                tracing::error!(vss_key, error = %e, "VssKvStore remove read failed");
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("VSS remove read failed: {e}"),
-                ));
-            }
-        };
-
-        let request = PutObjectRequest {
-            store_id: self.store_id.clone(),
-            global_version: None,
-            transaction_items: vec![],
-            delete_items: vec![KeyValue {
-                key: vss_key.clone(),
-                version: existing_version,
-                value: vec![],
-            }],
-        };
-
-        match self.block_on(self.client.put_object(&request)) {
-            Ok(_) | Err(VssError::NoSuchKeyError(_)) => Ok(()),
-            Err(e) => {
-                tracing::error!(vss_key, error = %e, "VssKvStore remove failed");
-                Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("VSS remove failed: {e}"),
-                ))
-            }
-        }
+        self.remove_raw(&vss_key)
     }
 
     fn list(

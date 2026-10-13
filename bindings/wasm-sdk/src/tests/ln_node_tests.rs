@@ -1,4 +1,5 @@
 use super::*;
+use crate::peer_session::{has_peer_manager_hooks, has_peer_manager_hooks_v2};
 use futures::executor::block_on;
 use serde::Deserialize;
 use wasm_bindgen_test::wasm_bindgen_test;
@@ -141,12 +142,17 @@ fn runtime_scope_key_canonicalizes_proxy_aliases_contract() {
 }
 
 #[test]
-fn node_constructor_installs_auto_peer_manager_hooks_contract() {
+fn configured_non_mainnet_constructor_installs_auto_peer_manager_hooks_contract() {
     clear_rln_ldk_peer_manager_hooks();
     assert!(!has_peer_manager_hooks());
     assert!(!has_peer_manager_hooks_v2());
 
-    let _node = RlnWasmNode::new("ws://127.0.0.1:3001".to_string()).expect("node should build");
+    let _node = RlnWasmNode::new_with_node_runtime_id(
+        "ws://127.0.0.1:3001".to_string(),
+        "auto-hooks".to_string(),
+        "regtest".to_string(),
+    )
+    .expect("node should build");
 
     assert!(has_peer_manager_hooks());
     assert!(has_peer_manager_hooks_v2());
@@ -286,7 +292,7 @@ fn bridge_apply_payment_status_via_event_stream_updates_runtime_and_log() {
         "wasm_native_ldk".to_string(),
     )
     .expect("node should build");
-    node.ldk_runtime.upsert_payment(LdkRuntimePaymentStateData {
+    node.test_ldk().upsert_payment(LdkRuntimePaymentStateData {
         amt_msat: Some(3_000_000),
         asset_amount: None,
         asset_id: None,
@@ -312,7 +318,7 @@ fn bridge_apply_payment_status_via_event_stream_updates_runtime_and_log() {
     assert_eq!(updated.status, "failed");
 
     let runtime_payment = node
-        .ldk_runtime
+        .test_ldk()
         .get_payment("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         .expect("runtime payment should exist");
     assert_eq!(runtime_payment.status, "failed");
@@ -379,6 +385,8 @@ fn hook_payload_transport_event_updates_native_channel_state() {
                 asset_id: None,
                 asset_local_amount: None,
                 virtual_open_mode: None,
+                outbound_msat: 0,
+                next_outbound_htlc_limit_msat: 0,
             },
         },
     );
@@ -417,7 +425,7 @@ fn hook_payload_transport_event_updates_bridge_runtime_state() {
         "wasm_native_ldk".to_string(),
     )
     .expect("node should build");
-    node.ldk_runtime.upsert_channel(LdkRuntimeChannelStateData {
+    node.test_ldk().upsert_channel(LdkRuntimeChannelStateData {
         temporary_channel_id: "tmp-bridge-hook".to_string(),
         channel_id: "chan-bridge-hook".to_string(),
         peer_pubkey: "peer-bridge-hook".to_string(),
@@ -429,10 +437,12 @@ fn hook_payload_transport_event_updates_bridge_runtime_state() {
         asset_id: None,
         asset_local_amount: None,
         virtual_open_mode: None,
+        outbound_msat: 0,
+        next_outbound_htlc_limit_msat: 0,
     });
 
     apply_runtime_hook_payload(
-        &node.ldk_runtime,
+        &node.test_ldk(),
         true,
         &node.peers,
         &node.channels,
@@ -445,7 +455,7 @@ fn hook_payload_transport_event_updates_bridge_runtime_state() {
     .expect("hook payload should apply");
 
     let channel = node
-        .ldk_runtime
+        .test_ldk()
         .list_channels()
         .into_iter()
         .find(|entry| entry.channel_id == "chan-bridge-hook")
@@ -466,14 +476,14 @@ fn hook_payload_peer_reconnected_updates_bridge_peer_started_state() {
         "wasm_native_ldk".to_string(),
     )
     .expect("node should build");
-    node.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: "peer-bridge-reconnect".to_string(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: false,
     });
 
     apply_runtime_hook_payload(
-        &node.ldk_runtime,
+        &node.test_ldk(),
         true,
         &node.peers,
         &node.channels,
@@ -486,7 +496,7 @@ fn hook_payload_peer_reconnected_updates_bridge_peer_started_state() {
     .expect("hook payload should apply");
 
     let peer = node
-        .ldk_runtime
+        .test_ldk()
         .get_peer("peer-bridge-reconnect")
         .expect("peer should exist");
     assert!(peer.started);
@@ -901,7 +911,7 @@ fn hook_payload_mixed_stream_preserves_event_order_and_terminal_payment_state_co
         "wasm_native_ldk".to_string(),
     )
     .expect("node should build");
-    node.ldk_runtime.upsert_channel(LdkRuntimeChannelStateData {
+    node.test_ldk().upsert_channel(LdkRuntimeChannelStateData {
         temporary_channel_id: "tmp-mixed".to_string(),
         channel_id: "chan-mixed".to_string(),
         peer_pubkey: "peer-mixed".to_string(),
@@ -913,8 +923,10 @@ fn hook_payload_mixed_stream_preserves_event_order_and_terminal_payment_state_co
         asset_id: None,
         asset_local_amount: None,
         virtual_open_mode: None,
+        outbound_msat: 0,
+        next_outbound_htlc_limit_msat: 0,
     });
-    node.ldk_runtime.upsert_payment(LdkRuntimePaymentStateData {
+    node.test_ldk().upsert_payment(LdkRuntimePaymentStateData {
         amt_msat: Some(SDK_HTLC_MIN_MSAT),
         asset_amount: None,
         asset_id: None,
@@ -937,7 +949,7 @@ fn hook_payload_mixed_stream_preserves_event_order_and_terminal_payment_state_co
 
     for payload_hex in payloads {
         apply_runtime_hook_payload(
-            &node.ldk_runtime,
+            &node.test_ldk(),
             true,
             &node.peers,
             &node.channels,
@@ -951,13 +963,13 @@ fn hook_payload_mixed_stream_preserves_event_order_and_terminal_payment_state_co
     }
 
     let payment = node
-        .ldk_runtime
+        .test_ldk()
         .get_payment("pay-mixed")
         .expect("payment should exist");
     assert_eq!(payment.status, "succeeded");
 
     let channel_exists = node
-        .ldk_runtime
+        .test_ldk()
         .list_channels()
         .iter()
         .any(|entry| entry.channel_id == "chan-mixed");
@@ -1155,7 +1167,7 @@ fn bridge_backend_list_peers_reads_runtime_state_contract() {
         "wasm_native_ldk".to_string(),
     )
     .expect("node should build");
-    node.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: "0334cc4bca04ce3d1537310f55e91ec4cec7e5a88fa0fba20a24cce1fe6de2a2b0".to_string(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
@@ -1180,7 +1192,7 @@ fn bridge_backend_channel_views_use_runtime_state_contract() {
         "wasm_native_ldk".to_string(),
     )
     .expect("node should build");
-    node.ldk_runtime.upsert_channel(LdkRuntimeChannelStateData {
+    node.test_ldk().upsert_channel(LdkRuntimeChannelStateData {
         temporary_channel_id: "tmp-1".to_string(),
         channel_id: "chan-1".to_string(),
         peer_pubkey: "0334cc4bca04ce3d1537310f55e91ec4cec7e5a88fa0fba20a24cce1fe6de2a2b0"
@@ -1193,6 +1205,8 @@ fn bridge_backend_channel_views_use_runtime_state_contract() {
         asset_id: None,
         asset_local_amount: None,
         virtual_open_mode: None,
+        outbound_msat: 0,
+        next_outbound_htlc_limit_msat: 0,
     });
 
     let channels_js = node.list_channels_value().expect("list channels");
@@ -1228,7 +1242,7 @@ fn bridge_backend_payment_views_use_runtime_state_contract() {
         "wasm_native_ldk".to_string(),
     )
     .expect("node should build");
-    node.ldk_runtime.upsert_payment(LdkRuntimePaymentStateData {
+    node.test_ldk().upsert_payment(LdkRuntimePaymentStateData {
         amt_msat: Some(5_000),
         asset_amount: None,
         asset_id: None,
@@ -1265,7 +1279,7 @@ fn bridge_backend_ingest_event_syncs_runtime_payment_state_contract() {
         "wasm_native_ldk".to_string(),
     )
     .expect("node should build");
-    node.ldk_runtime.upsert_payment(LdkRuntimePaymentStateData {
+    node.test_ldk().upsert_payment(LdkRuntimePaymentStateData {
         amt_msat: Some(7_000),
         asset_amount: None,
         asset_id: None,
@@ -1286,7 +1300,7 @@ fn bridge_backend_ingest_event_syncs_runtime_payment_state_contract() {
         .expect("ingest should succeed");
 
     let runtime_payment = node
-        .ldk_runtime
+        .test_ldk()
         .get_payment("pay-sync")
         .expect("runtime payment");
     assert_eq!(runtime_payment.status, "succeeded");
@@ -1299,7 +1313,7 @@ fn bridge_backend_fail_pending_syncs_runtime_payment_state_contract() {
         "wasm_native_ldk".to_string(),
     )
     .expect("node should build");
-    node.ldk_runtime.upsert_payment(LdkRuntimePaymentStateData {
+    node.test_ldk().upsert_payment(LdkRuntimePaymentStateData {
         amt_msat: Some(8_000),
         asset_amount: None,
         asset_id: None,
@@ -1317,7 +1331,7 @@ fn bridge_backend_fail_pending_syncs_runtime_payment_state_contract() {
     let _ = node.fail_pending_payments_api().expect("fail pending");
 
     let runtime_payment = node
-        .ldk_runtime
+        .test_ldk()
         .get_payment("pay-fail")
         .expect("runtime payment");
     assert_eq!(runtime_payment.status, "failed");
@@ -1331,12 +1345,12 @@ fn bridge_backend_disconnect_peer_without_local_session_contract() {
     )
     .expect("node should build");
     let pubkey = "0334cc4bca04ce3d1537310f55e91ec4cec7e5a88fa0fba20a24cce1fe6de2a2b0";
-    node.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: pubkey.to_string(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: false,
     });
-    node.ldk_runtime.upsert_channel(LdkRuntimeChannelStateData {
+    node.test_ldk().upsert_channel(LdkRuntimeChannelStateData {
         temporary_channel_id: "tmp-disconnect".to_string(),
         channel_id: "chan-disconnect".to_string(),
         peer_pubkey: pubkey.to_string(),
@@ -1348,13 +1362,15 @@ fn bridge_backend_disconnect_peer_without_local_session_contract() {
         asset_id: None,
         asset_local_amount: None,
         virtual_open_mode: None,
+        outbound_msat: 0,
+        next_outbound_htlc_limit_msat: 0,
     });
 
     block_on(node.disconnect_peer(pubkey.to_string())).expect("disconnect should succeed");
 
-    assert!(!node.ldk_runtime.has_peer(pubkey));
+    assert!(!node.test_ldk().has_peer(pubkey));
     assert!(node
-        .ldk_runtime
+        .test_ldk()
         .list_channels()
         .iter()
         .all(|ch| ch.peer_pubkey != pubkey));
@@ -1377,12 +1393,12 @@ fn bridge_backend_close_all_peers_clears_runtime_peers_without_sessions_contract
             "chan-close-2",
         ),
     ] {
-        node.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+        node.test_ldk().upsert_peer(LdkRuntimePeerStateData {
             pubkey: peer_pubkey.to_string(),
             peer_addr: "127.0.0.1:9735".to_string(),
             started: false,
         });
-        node.ldk_runtime.upsert_channel(LdkRuntimeChannelStateData {
+        node.test_ldk().upsert_channel(LdkRuntimeChannelStateData {
             temporary_channel_id: format!("tmp-{channel_id}"),
             channel_id: channel_id.to_string(),
             peer_pubkey: peer_pubkey.to_string(),
@@ -1394,13 +1410,15 @@ fn bridge_backend_close_all_peers_clears_runtime_peers_without_sessions_contract
             asset_id: None,
             asset_local_amount: None,
             virtual_open_mode: None,
+            outbound_msat: 0,
+            next_outbound_htlc_limit_msat: 0,
         });
     }
 
     block_on(node.close_all_peers()).expect("close all peers should succeed");
 
-    assert!(node.ldk_runtime.list_peers().is_empty());
-    assert!(node.ldk_runtime.list_channels().is_empty());
+    assert!(node.test_ldk().list_peers().is_empty());
+    assert!(node.test_ldk().list_channels().is_empty());
 }
 
 #[test]
@@ -1410,13 +1428,13 @@ fn bridge_backend_runtime_state_restores_across_node_instances_contract() {
 
     let node_a = RlnWasmNode::new(proxy.clone()).expect("node should build");
     node_a.ensure_runtime_ready().expect("runtime should start");
-    node_a.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node_a.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: "0334cc4bca04ce3d1537310f55e91ec4cec7e5a88fa0fba20a24cce1fe6de2a2b0".to_string(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
     });
     node_a
-        .ldk_runtime
+        .test_ldk()
         .upsert_channel(LdkRuntimeChannelStateData {
             temporary_channel_id: "tmp-restore".to_string(),
             channel_id: "chan-restore".to_string(),
@@ -1430,9 +1448,11 @@ fn bridge_backend_runtime_state_restores_across_node_instances_contract() {
             asset_id: None,
             asset_local_amount: None,
             virtual_open_mode: None,
+            outbound_msat: 0,
+            next_outbound_htlc_limit_msat: 0,
         });
     node_a
-        .ldk_runtime
+        .test_ldk()
         .upsert_payment(LdkRuntimePaymentStateData {
             amt_msat: Some(SDK_HTLC_MIN_MSAT),
             asset_amount: None,
@@ -1485,7 +1505,7 @@ fn bridge_backend_restore_requires_peer_reconnect_before_open_channel_contract()
 
     let node_a = RlnWasmNode::new(proxy.clone()).expect("node should build");
     node_a.ensure_runtime_ready().expect("runtime should start");
-    node_a.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node_a.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: peer_pubkey.clone(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
@@ -1514,7 +1534,7 @@ fn bridge_backend_restore_requires_peer_reconnect_before_open_channel_contract()
         .expect_err("open must fail before reconnect");
     assert_eq!(err.as_string().unwrap_or_default(), "peer is not connected");
 
-    assert!(node_b.ldk_runtime.set_peer_started(&peer_pubkey, true));
+    assert!(node_b.test_ldk().set_peer_started(&peer_pubkey, true));
     let opened_js = node_b
         .open_channel_value(peer_pubkey, SDK_OPENCHANNEL_MIN_SAT, false, None, None)
         .expect("open should succeed after reconnect");
@@ -1531,7 +1551,7 @@ fn bridge_backend_restore_disconnected_peer_forces_send_payment_failure_until_re
 
     let node_a = RlnWasmNode::new(proxy.clone()).expect("node should build");
     node_a.ensure_runtime_ready().expect("runtime should start");
-    node_a.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node_a.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: peer_pubkey.clone(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
@@ -1542,7 +1562,7 @@ fn bridge_backend_restore_disconnected_peer_forces_send_payment_failure_until_re
         .ensure_runtime_ready()
         .expect("runtime should restore");
     assert_eq!(
-        node_b.ldk_runtime.get_peer(&peer_pubkey).map(|p| p.started),
+        node_b.test_ldk().get_peer(&peer_pubkey).map(|p| p.started),
         Some(false)
     );
 
@@ -1562,7 +1582,7 @@ fn bridge_backend_restore_disconnected_peer_forces_send_payment_failure_until_re
     let first_doc: serde_json::Value = crate::js_from(first_send).expect("parse send");
     assert_eq!(first_doc["status"], "failed");
 
-    assert!(node_b.ldk_runtime.set_peer_started(&peer_pubkey, true));
+    assert!(node_b.test_ldk().set_peer_started(&peer_pubkey, true));
     let second_send = node_b
         .send_payment_value(invoice, Some(SDK_INVOICE_MIN_MSAT), None, None)
         .expect("send should succeed after reconnect");
@@ -1579,7 +1599,7 @@ fn bridge_backend_restore_disconnected_peer_forces_keysend_failure_until_reconne
 
     let node_a = RlnWasmNode::new(proxy.clone()).expect("node should build");
     node_a.ensure_runtime_ready().expect("runtime should start");
-    node_a.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node_a.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: peer_pubkey.clone(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
@@ -1590,7 +1610,7 @@ fn bridge_backend_restore_disconnected_peer_forces_keysend_failure_until_reconne
         .ensure_runtime_ready()
         .expect("runtime should restore");
     assert_eq!(
-        node_b.ldk_runtime.get_peer(&peer_pubkey).map(|p| p.started),
+        node_b.test_ldk().get_peer(&peer_pubkey).map(|p| p.started),
         Some(false)
     );
 
@@ -1600,7 +1620,7 @@ fn bridge_backend_restore_disconnected_peer_forces_keysend_failure_until_reconne
     let first_doc: serde_json::Value = crate::js_from(first).expect("parse keysend");
     assert_eq!(first_doc["status"], "failed");
 
-    assert!(node_b.ldk_runtime.set_peer_started(&peer_pubkey, true));
+    assert!(node_b.test_ldk().set_peer_started(&peer_pubkey, true));
     let second = node_b
         .keysend_value(peer_pubkey, SDK_HTLC_MIN_MSAT, None, None)
         .expect("keysend should stay pending after reconnect");
@@ -1617,7 +1637,7 @@ fn bridge_backend_trusted_virtual_keysend_finalizes_via_runtime_virtual_payment_
 
     let node = RlnWasmNode::new(proxy).expect("node should build");
     node.ensure_runtime_ready().expect("runtime should start");
-    node.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: peer_pubkey.clone(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
@@ -1671,8 +1691,9 @@ fn wasm_two_node_handles_same_proxy_distinct_runtime_ids_contract() {
     crate::ldk_runtime::test_utils::reset_runtime_storage_for_tests();
     let proxy = "ws://proxy.runtime-id-isolation.example".to_string();
 
-    let node_a = RlnWasmNode::new_with_runtime_id_opt(proxy.clone(), Some("node-a".to_string()), None)
-        .expect("node A should build");
+    let node_a =
+        RlnWasmNode::new_with_runtime_id_opt(proxy.clone(), Some("node-a".to_string()), None)
+            .expect("node A should build");
     let node_b = RlnWasmNode::new_with_runtime_id_opt(proxy, Some("node-b".to_string()), None)
         .expect("node B should build");
 
@@ -1703,8 +1724,9 @@ fn wasm_signing_identity_differs_by_runtime_id_contract() {
     crate::ldk_runtime::test_utils::reset_runtime_storage_for_tests();
     let proxy = "ws://proxy.signing-identity-runtime-id.example".to_string();
 
-    let node_a = RlnWasmNode::new_with_runtime_id_opt(proxy.clone(), Some("node-a".to_string()), None)
-        .expect("node A should build");
+    let node_a =
+        RlnWasmNode::new_with_runtime_id_opt(proxy.clone(), Some("node-a".to_string()), None)
+            .expect("node A should build");
     let node_b = RlnWasmNode::new_with_runtime_id_opt(proxy, Some("node-b".to_string()), None)
         .expect("node B should build");
 
@@ -1754,14 +1776,15 @@ fn wasm_channel_payment_state_does_not_cross_runtime_ids_contract() {
     let peer_pubkey =
         "0334cc4bca04ce3d1537310f55e91ec4cec7e5a88fa0fba20a24cce1fe6de2a2b0".to_string();
 
-    let node_a = RlnWasmNode::new_with_runtime_id_opt(proxy.clone(), Some("node-a".to_string()), None)
-        .expect("node A should build");
+    let node_a =
+        RlnWasmNode::new_with_runtime_id_opt(proxy.clone(), Some("node-a".to_string()), None)
+            .expect("node A should build");
     let node_b = RlnWasmNode::new_with_runtime_id_opt(proxy, Some("node-b".to_string()), None)
         .expect("node B should build");
 
     node_a.ensure_runtime_ready().expect("node A runtime");
     node_b.ensure_runtime_ready().expect("node B runtime");
-    node_a.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node_a.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: peer_pubkey.clone(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
@@ -1811,13 +1834,13 @@ fn bridge_backend_channel_api_open_get_list_close_contract() {
     node.ensure_runtime_ready().expect("runtime should start");
     let peer_pubkey =
         "0334cc4bca04ce3d1537310f55e91ec4cec7e5a88fa0fba20a24cce1fe6de2a2b0".to_string();
-    node.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: peer_pubkey.clone(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
     });
     assert_eq!(
-        node.ldk_runtime.get_peer(&peer_pubkey).map(|p| p.started),
+        node.test_ldk().get_peer(&peer_pubkey).map(|p| p.started),
         Some(true)
     );
 
@@ -1856,7 +1879,7 @@ fn bridge_backend_channel_api_open_get_list_close_contract() {
     let after_close = after_close.as_array().expect("channels array");
     assert!(after_close.is_empty());
     assert!(node
-        .ldk_runtime
+        .test_ldk()
         .list_channels()
         .into_iter()
         .all(|ch| ch.channel_id != channel_id));
@@ -2050,6 +2073,8 @@ fn channel_transport_events_update_node_channel_state_and_logs() {
                 asset_id: None,
                 asset_local_amount: None,
                 virtual_open_mode: None,
+                outbound_msat: 0,
+                next_outbound_htlc_limit_msat: 0,
             },
         },
     );
@@ -2132,6 +2157,8 @@ fn peer_disconnected_event_cleans_stale_channels_without_peer_entry() {
                 asset_id: None,
                 asset_local_amount: None,
                 virtual_open_mode: None,
+                outbound_msat: 0,
+                next_outbound_htlc_limit_msat: 0,
             },
         },
     );
@@ -2224,6 +2251,8 @@ fn ingest_runtime_transport_event_value_applies_and_returns_contract_data() {
                 asset_id: None,
                 asset_local_amount: None,
                 virtual_open_mode: None,
+                outbound_msat: 0,
+                next_outbound_htlc_limit_msat: 0,
             },
         },
     );
@@ -2266,6 +2295,8 @@ fn ingest_runtime_transport_event_json_returns_json_payload() {
                 asset_id: None,
                 asset_local_amount: None,
                 virtual_open_mode: None,
+                outbound_msat: 0,
+                next_outbound_htlc_limit_msat: 0,
             },
         },
     );
@@ -2569,7 +2600,7 @@ fn open_channel_non_virtual_rejects_without_mutating_state_contract() {
     .expect("node should build");
     let peer_pubkey =
         "029999999999999999999999999999999999999999999999999999999999999999".to_string();
-    node.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: peer_pubkey.clone(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
@@ -2615,7 +2646,7 @@ fn open_channel_non_virtual_rgb_rejected_with_explicit_contract_message() {
     .expect("node should build");
     let peer_pubkey =
         "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
-    node.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: peer_pubkey.clone(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
@@ -2648,7 +2679,7 @@ fn open_channel_virtual_mode_is_persisted_in_runtime_contract() {
     .expect("node should build");
     let peer_pubkey =
         "02acacacacacacacacacacacacacacacacacacacacacacacacacacacacacacac".to_string();
-    node.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: peer_pubkey.clone(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
@@ -2684,7 +2715,7 @@ fn open_channel_virtual_becomes_usable_only_after_runtime_event_contract() {
     .expect("node should build");
     let peer_pubkey =
         "02afafafafafafafafafafafafafafafafafafafafafafafafafafafafafafaf".to_string();
-    node.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: peer_pubkey.clone(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
@@ -2736,7 +2767,7 @@ fn open_channel_virtual_rejected_when_feature_disabled_contract() {
     node.set_enable_virtual_channels_v0(false);
     let peer_pubkey =
         "02a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0".to_string();
-    node.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: peer_pubkey.clone(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
@@ -2805,7 +2836,7 @@ fn close_channel_virtual_requires_peer_pubkey_contract() {
     .expect("node should build");
     let peer_pubkey =
         "02adadadadadadadadadadadadadadadadadadadadadadadadadadadadadadad".to_string();
-    node.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: peer_pubkey.clone(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
@@ -2847,7 +2878,7 @@ fn close_channel_rejects_force_for_virtual_channel_contract() {
     .expect("node should build");
     let peer_pubkey =
         "02adadadadadadadadadadadadadadadadadadadadadadadadadadadadadadad".to_string();
-    node.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: peer_pubkey.clone(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
@@ -2889,7 +2920,7 @@ fn close_channel_virtual_rejected_when_feature_disabled_contract() {
     .expect("node should build");
     let peer_pubkey =
         "02ababababababababababababababababababababababababababababababab".to_string();
-    node.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: peer_pubkey.clone(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
@@ -2932,7 +2963,7 @@ fn close_channel_rejects_virtual_cleanup_when_counterparty_btc_value_remains_con
     .expect("node should build");
     let peer_pubkey =
         "02bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
-    node.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: peer_pubkey.clone(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
@@ -2985,7 +3016,7 @@ fn close_channel_allows_virtual_cleanup_after_btc_roundtrip_contract() {
     .expect("node should build");
     let peer_pubkey =
         "02cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string();
-    node.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: peer_pubkey.clone(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
@@ -3117,12 +3148,12 @@ fn close_channel_allows_virtual_cleanup_after_authoritative_peer_keysend_roundtr
         .expect("node b pubkey")
         .to_string();
 
-    node_a.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node_a.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: node_b_pubkey.clone(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
     });
-    node_b.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node_b.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: node_a_pubkey.clone(),
         peer_addr: "127.0.0.1:9736".to_string(),
         started: true,
@@ -3194,7 +3225,7 @@ fn close_channel_rejects_virtual_cleanup_after_non_authoritative_inbound_credit_
     .expect("node should build");
     let peer_pubkey =
         "02cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd".to_string();
-    node.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: peer_pubkey.clone(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
@@ -3258,7 +3289,7 @@ fn close_channel_rejects_virtual_cleanup_when_claimable_invoice_exists_contract(
     .expect("node should build");
     let peer_pubkey =
         "02dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string();
-    node.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: peer_pubkey.clone(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
@@ -3598,12 +3629,12 @@ fn bridge_send_payment_requires_connected_known_payee_peer_contract() {
         .expect("payee pubkey")
         .to_string();
 
-    sender.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    sender.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: "0334cc4bca04ce3d1537310f55e91ec4cec7e5a88fa0fba20a24cce1fe6de2a2b0".to_string(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
     });
-    sender.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    sender.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: payee_pubkey.clone(),
         peer_addr: "127.0.0.1:9736".to_string(),
         started: false,
@@ -3615,7 +3646,7 @@ fn bridge_send_payment_requires_connected_known_payee_peer_contract() {
     let first_doc: serde_json::Value = crate::js_from(first).expect("parse first send");
     assert_eq!(first_doc["status"], "failed");
 
-    assert!(sender.ldk_runtime.set_peer_started(&payee_pubkey, true));
+    assert!(sender.test_ldk().set_peer_started(&payee_pubkey, true));
     let second = sender
         .send_payment_value(invoice, Some(SDK_INVOICE_MIN_MSAT), None, None)
         .expect("send payment should be pending after payee reconnect");
@@ -3654,14 +3685,14 @@ fn bridge_send_payment_on_usable_channel_finalizes_via_runtime_channel_payment_e
         .expect("payee pubkey")
         .to_string();
 
-    sender.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    sender.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: payee_pubkey.clone(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
     });
     assert!(sender.test_set_runtime_peer_started(&payee_pubkey, true));
     sender
-        .ldk_runtime
+        .test_ldk()
         .upsert_channel(LdkRuntimeChannelStateData {
             temporary_channel_id: "tmp-chan-runtime-success".to_string(),
             channel_id: "chan-runtime-success".to_string(),
@@ -3674,6 +3705,8 @@ fn bridge_send_payment_on_usable_channel_finalizes_via_runtime_channel_payment_e
             asset_id: None,
             asset_local_amount: None,
             virtual_open_mode: None,
+            outbound_msat: 0,
+            next_outbound_htlc_limit_msat: 0,
         });
 
     let send_js = sender
@@ -3747,13 +3780,13 @@ fn bridge_send_payment_propagates_receiver_terminal_status_and_rgb_transfer_cont
         .expect("payee pubkey")
         .to_string();
 
-    sender.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    sender.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: payee_pubkey.clone(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
     });
     sender
-        .ldk_runtime
+        .test_ldk()
         .upsert_channel(LdkRuntimeChannelStateData {
             temporary_channel_id: "tmp-rx-propagation".to_string(),
             channel_id: "chan-rx-propagation".to_string(),
@@ -3766,6 +3799,8 @@ fn bridge_send_payment_propagates_receiver_terminal_status_and_rgb_transfer_cont
             asset_id: None,
             asset_local_amount: None,
             virtual_open_mode: None,
+            outbound_msat: 0,
+            next_outbound_htlc_limit_msat: 0,
         });
 
     let send_js = sender
@@ -3894,12 +3929,12 @@ fn close_channel_regular_coop_and_force_contracts() {
         "wasm_native_ldk".to_string(),
     )
     .expect("node");
-    node.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: peer_pubkey.clone(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
     });
-    node.ldk_runtime.upsert_channel(LdkRuntimeChannelStateData {
+    node.test_ldk().upsert_channel(LdkRuntimeChannelStateData {
         temporary_channel_id: "tmp-close-regular-1".to_string(),
         channel_id: "chan-close-regular-1".to_string(),
         peer_pubkey: peer_pubkey.clone(),
@@ -3911,6 +3946,8 @@ fn close_channel_regular_coop_and_force_contracts() {
         asset_id: None,
         asset_local_amount: None,
         virtual_open_mode: None,
+        outbound_msat: 0,
+        next_outbound_htlc_limit_msat: 0,
     });
     node.close_channel_with_options(
         "chan-close-regular-1".to_string(),
@@ -3925,7 +3962,7 @@ fn close_channel_regular_coop_and_force_contracts() {
     let channels: serde_json::Value = crate::js_from(channels_js).expect("parse channels");
     assert!(channels.as_array().expect("channels array").is_empty());
 
-    node.ldk_runtime.upsert_channel(LdkRuntimeChannelStateData {
+    node.test_ldk().upsert_channel(LdkRuntimeChannelStateData {
         temporary_channel_id: "tmp-close-regular-2".to_string(),
         channel_id: "chan-close-regular-2".to_string(),
         peer_pubkey: peer_pubkey.clone(),
@@ -3937,6 +3974,8 @@ fn close_channel_regular_coop_and_force_contracts() {
         asset_id: None,
         asset_local_amount: None,
         virtual_open_mode: None,
+        outbound_msat: 0,
+        next_outbound_htlc_limit_msat: 0,
     });
     node.close_channel_with_options("chan-close-regular-2".to_string(), Some(peer_pubkey), true)
         .expect("regular force close");
@@ -3960,12 +3999,12 @@ fn close_channel_regular_coop_persists_across_node_recreation_contract() {
     let node =
         RlnWasmNode::new_with_runtime_backend(runtime_proxy.clone(), "wasm_native_ldk".to_string())
             .expect("node");
-    node.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: peer_pubkey.clone(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
     });
-    node.ldk_runtime.upsert_channel(LdkRuntimeChannelStateData {
+    node.test_ldk().upsert_channel(LdkRuntimeChannelStateData {
         temporary_channel_id: "tmp-close-restart-1".to_string(),
         channel_id: "chan-close-restart-1".to_string(),
         peer_pubkey: peer_pubkey.clone(),
@@ -3977,6 +4016,8 @@ fn close_channel_regular_coop_persists_across_node_recreation_contract() {
         asset_id: None,
         asset_local_amount: None,
         virtual_open_mode: None,
+        outbound_msat: 0,
+        next_outbound_htlc_limit_msat: 0,
     });
 
     node.close_channel_with_options("chan-close-restart-1".to_string(), Some(peer_pubkey), false)
@@ -4024,13 +4065,13 @@ fn close_channel_regular_force_records_channel_closed_sequence_contract() {
         "wasm_native_ldk".to_string(),
     )
     .expect("node");
-    node.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: peer_pubkey.clone(),
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
     });
     let channel_id = "chan-close-force-1".to_string();
-    node.ldk_runtime.upsert_channel(LdkRuntimeChannelStateData {
+    node.test_ldk().upsert_channel(LdkRuntimeChannelStateData {
         temporary_channel_id: "tmp-close-force-1".to_string(),
         channel_id: channel_id.clone(),
         peer_pubkey: peer_pubkey.clone(),
@@ -4042,6 +4083,8 @@ fn close_channel_regular_force_records_channel_closed_sequence_contract() {
         asset_id: None,
         asset_local_amount: None,
         virtual_open_mode: None,
+        outbound_msat: 0,
+        next_outbound_htlc_limit_msat: 0,
     });
 
     node.close_channel_with_options(channel_id, Some(peer_pubkey), true)
@@ -4086,12 +4129,12 @@ fn close_channel_counterparty_event_persists_across_node_recreation_contract() {
     let node =
         RlnWasmNode::new_with_runtime_backend(runtime_proxy.clone(), "wasm_native_ldk".to_string())
             .expect("node");
-    node.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    node.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: peer_pubkey,
         peer_addr: "127.0.0.1:9735".to_string(),
         started: true,
     });
-    node.ldk_runtime.upsert_channel(LdkRuntimeChannelStateData {
+    node.test_ldk().upsert_channel(LdkRuntimeChannelStateData {
         temporary_channel_id: "tmp-close-counterparty-1".to_string(),
         channel_id: "chan-close-counterparty-1".to_string(),
         peer_pubkey: "03cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
@@ -4104,6 +4147,8 @@ fn close_channel_counterparty_event_persists_across_node_recreation_contract() {
         asset_id: None,
         asset_local_amount: None,
         virtual_open_mode: None,
+        outbound_msat: 0,
+        next_outbound_htlc_limit_msat: 0,
     });
 
     let closed_payload_hex = hex::encode("channel_closed:chan-close-counterparty-1");
@@ -4175,6 +4220,8 @@ fn close_channel_force_after_restart_records_sequence_contract() {
             asset_id: None,
             asset_local_amount: None,
             virtual_open_mode: None,
+            outbound_msat: 0,
+            next_outbound_htlc_limit_msat: 0,
         });
     let usable_payload_hex = hex::encode(format!("channel_usable:{channel_id}"));
     first
@@ -4253,12 +4300,12 @@ fn multi_hop_route_without_direct_payee_finalizes_via_runtime_routed_engine_cont
         .expect("payment hash")
         .to_string();
     let mut receiver_payment = receiver
-        .ldk_runtime
+        .test_ldk()
         .get_payment(&payment_hash)
         .expect("receiver pending payment must exist");
     receiver_payment.status = "pending".to_string();
     receiver_payment.updated_at = unix_now_secs();
-    receiver.ldk_runtime.upsert_payment(receiver_payment);
+    receiver.test_ldk().upsert_payment(receiver_payment);
 
     let relay_invoice_json = relay
         .create_ln_invoice_json(Some(SDK_INVOICE_MIN_MSAT), 3600, None, None)
@@ -4280,7 +4327,7 @@ fn multi_hop_route_without_direct_payee_finalizes_via_runtime_routed_engine_cont
     sender.test_upsert_runtime_peer(relay_pubkey.clone(), "127.0.0.1:9735".to_string(), true);
     assert!(sender.test_set_runtime_peer_started(&relay_pubkey, true));
     sender
-        .ldk_runtime
+        .test_ldk()
         .upsert_channel(LdkRuntimeChannelStateData {
             temporary_channel_id: "tmp-mh-relay".to_string(),
             channel_id: "chan-mh-relay".to_string(),
@@ -4293,6 +4340,8 @@ fn multi_hop_route_without_direct_payee_finalizes_via_runtime_routed_engine_cont
             asset_id: None,
             asset_local_amount: None,
             virtual_open_mode: None,
+            outbound_msat: 0,
+            next_outbound_htlc_limit_msat: 0,
         });
 
     let send_js = sender
@@ -4388,7 +4437,7 @@ fn multi_hop_route_prefers_direct_usable_channel_over_routed_engine_contract() {
     sender.test_upsert_runtime_peer(payee_pubkey.clone(), "127.0.0.1:9735".to_string(), true);
     assert!(sender.test_set_runtime_peer_started(&payee_pubkey, true));
     sender
-        .ldk_runtime
+        .test_ldk()
         .upsert_channel(LdkRuntimeChannelStateData {
             temporary_channel_id: "tmp-mh-direct-pref-payee".to_string(),
             channel_id: "chan-mh-direct-pref-payee".to_string(),
@@ -4401,6 +4450,8 @@ fn multi_hop_route_prefers_direct_usable_channel_over_routed_engine_contract() {
             asset_id: None,
             asset_local_amount: None,
             virtual_open_mode: None,
+            outbound_msat: 0,
+            next_outbound_htlc_limit_msat: 0,
         });
     if recovered_payee_pubkey != payee_pubkey {
         sender.test_upsert_runtime_peer(
@@ -4410,7 +4461,7 @@ fn multi_hop_route_prefers_direct_usable_channel_over_routed_engine_contract() {
         );
         assert!(sender.test_set_runtime_peer_started(&recovered_payee_pubkey, true));
         sender
-            .ldk_runtime
+            .test_ldk()
             .upsert_channel(LdkRuntimeChannelStateData {
                 temporary_channel_id: "tmp-mh-direct-pref-payee-recovered".to_string(),
                 channel_id: "chan-mh-direct-pref-payee-recovered".to_string(),
@@ -4423,12 +4474,14 @@ fn multi_hop_route_prefers_direct_usable_channel_over_routed_engine_contract() {
                 asset_id: None,
                 asset_local_amount: None,
                 virtual_open_mode: None,
+                outbound_msat: 0,
+                next_outbound_htlc_limit_msat: 0,
             });
     }
     sender.test_upsert_runtime_peer(relay_pubkey.clone(), "127.0.0.1:9736".to_string(), true);
     assert!(sender.test_set_runtime_peer_started(&relay_pubkey, true));
     sender
-        .ldk_runtime
+        .test_ldk()
         .upsert_channel(LdkRuntimeChannelStateData {
             temporary_channel_id: "tmp-mh-direct-pref-relay".to_string(),
             channel_id: "chan-mh-direct-pref-relay".to_string(),
@@ -4441,6 +4494,8 @@ fn multi_hop_route_prefers_direct_usable_channel_over_routed_engine_contract() {
             asset_id: None,
             asset_local_amount: None,
             virtual_open_mode: None,
+            outbound_msat: 0,
+            next_outbound_htlc_limit_msat: 0,
         });
 
     let send_js = sender
@@ -4514,12 +4569,12 @@ fn multi_hop_route_requires_pending_receiver_invoice_contract() {
         .to_string();
 
     let mut receiver_payment = receiver
-        .ldk_runtime
+        .test_ldk()
         .get_payment(&payment_hash)
         .expect("receiver pending payment must exist");
     receiver_payment.status = "failed".to_string();
     receiver_payment.updated_at = unix_now_secs();
-    receiver.ldk_runtime.upsert_payment(receiver_payment);
+    receiver.test_ldk().upsert_payment(receiver_payment);
 
     let relay_invoice_json = relay
         .create_ln_invoice_json(Some(SDK_INVOICE_MIN_MSAT), 3600, None, None)
@@ -4536,13 +4591,13 @@ fn multi_hop_route_requires_pending_receiver_invoice_contract() {
         .to_string();
 
     let _ = sender.list_peers_value().expect("warm sender runtime");
-    sender.ldk_runtime.upsert_peer(LdkRuntimePeerStateData {
+    sender.test_ldk().upsert_peer(LdkRuntimePeerStateData {
         pubkey: relay_pubkey.clone(),
         peer_addr: "127.0.0.1:9736".to_string(),
         started: true,
     });
     sender
-        .ldk_runtime
+        .test_ldk()
         .upsert_channel(LdkRuntimeChannelStateData {
             temporary_channel_id: "tmp-mh-route-gate-relay".to_string(),
             channel_id: "chan-mh-route-gate-relay".to_string(),
@@ -4555,9 +4610,11 @@ fn multi_hop_route_requires_pending_receiver_invoice_contract() {
             asset_id: None,
             asset_local_amount: None,
             virtual_open_mode: None,
+            outbound_msat: 0,
+            next_outbound_htlc_limit_msat: 0,
         });
     assert!(
-        sender.ldk_runtime.get_peer(&payee_pubkey).is_none(),
+        sender.test_ldk().get_peer(&payee_pubkey).is_none(),
         "sender should not have direct payee peer for routed scenario"
     );
 
@@ -4654,7 +4711,7 @@ fn vanilla_payment_on_rgb_channel_success_path_contract() {
     sender.test_upsert_runtime_peer(payee_pubkey.clone(), "127.0.0.1:9735".to_string(), true);
     assert!(sender.test_set_runtime_peer_started(&payee_pubkey, true));
     sender
-        .ldk_runtime
+        .test_ldk()
         .upsert_channel(LdkRuntimeChannelStateData {
             temporary_channel_id: "tmp-vanilla-rgb-1".to_string(),
             channel_id: "chan-vanilla-rgb-1".to_string(),
@@ -4667,6 +4724,8 @@ fn vanilla_payment_on_rgb_channel_success_path_contract() {
             asset_id: Some("rgb:VanillaOverRgbParity-1".to_string()),
             asset_local_amount: Some(100),
             virtual_open_mode: None,
+            outbound_msat: 0,
+            next_outbound_htlc_limit_msat: 0,
         });
     if recovered_payee_pubkey != payee_pubkey {
         sender.test_upsert_runtime_peer(
@@ -4676,7 +4735,7 @@ fn vanilla_payment_on_rgb_channel_success_path_contract() {
         );
         assert!(sender.test_set_runtime_peer_started(&recovered_payee_pubkey, true));
         sender
-            .ldk_runtime
+            .test_ldk()
             .upsert_channel(LdkRuntimeChannelStateData {
                 temporary_channel_id: "tmp-vanilla-rgb-1-recovered".to_string(),
                 channel_id: "chan-vanilla-rgb-1-recovered".to_string(),
@@ -4689,6 +4748,8 @@ fn vanilla_payment_on_rgb_channel_success_path_contract() {
                 asset_id: Some("rgb:VanillaOverRgbParity-1".to_string()),
                 asset_local_amount: Some(100),
                 virtual_open_mode: None,
+                outbound_msat: 0,
+                next_outbound_htlc_limit_msat: 0,
             });
     }
     let channels_js = sender.list_channels_value().expect("list sender channels");
@@ -4731,11 +4792,12 @@ fn sdk_facade_forwards_network_info() {
     let node = sdk
         .new_node("ws://127.0.0.1:3001".to_string())
         .expect("new node");
-    let network_js = sdk.network_info_value(&node).expect("network info");
-    let network: serde_json::Value =
-        serde_wasm_bindgen::from_value(network_js).expect("parse network");
-    assert_eq!(network["network"], "regtest");
-    assert_eq!(network["height"], 0);
+    assert!(sdk
+        .network_info_value(&node)
+        .unwrap_err()
+        .as_string()
+        .unwrap()
+        .starts_with("NetworkInfoUnavailable:"));
 }
 
 #[test]
@@ -4746,7 +4808,7 @@ fn sdk_facade_forwards_node_info() {
         .expect("new node");
     let node_js = sdk.node_info_value(&node).expect("node info");
     let info: serde_json::Value = serde_wasm_bindgen::from_value(node_js).expect("parse node");
-    assert_eq!(info["ldk_over_websocket"], true);
+    assert_eq!(info["ldk_over_websocket"], false);
     assert!(info["runtime"].as_str().is_some());
 }
 
@@ -4961,11 +5023,12 @@ fn sdk_node_handle_forwards_network_info() {
     let node = sdk
         .create_node_handle("ws://127.0.0.1:3001".to_string())
         .expect("node handle");
-    let network_js = node.network_info_value().expect("network info");
-    let network: serde_json::Value =
-        serde_wasm_bindgen::from_value(network_js).expect("parse network");
-    assert_eq!(network["network"], "regtest");
-    assert_eq!(network["height"], 0);
+    assert!(node
+        .network_info_value()
+        .unwrap_err()
+        .as_string()
+        .unwrap()
+        .starts_with("NetworkInfoUnavailable:"));
 }
 
 #[test]
@@ -4976,7 +5039,7 @@ fn sdk_node_handle_forwards_node_info() {
         .expect("node handle");
     let node_js = node.node_info_value().expect("node info");
     let info: serde_json::Value = serde_wasm_bindgen::from_value(node_js).expect("parse node");
-    assert_eq!(info["ldk_over_websocket"], true);
+    assert_eq!(info["ldk_over_websocket"], false);
     assert!(info["runtime"].as_str().is_some());
 }
 
@@ -6898,6 +6961,8 @@ fn list_channels_merges_runtime_metadata_from_local_cache_contract() {
         asset_id: None,
         asset_local_amount: None,
         virtual_open_mode: None,
+        outbound_msat: 0,
+        next_outbound_htlc_limit_msat: 0,
     };
     node.channels.borrow_mut().insert(
         channel.channel_id.clone(),
@@ -6906,7 +6971,7 @@ fn list_channels_merges_runtime_metadata_from_local_cache_contract() {
             data: channel,
         },
     );
-    node.ldk_runtime.upsert_channel(LdkRuntimeChannelStateData {
+    node.test_ldk().upsert_channel(LdkRuntimeChannelStateData {
         temporary_channel_id: "tmp-local-rich".to_string(),
         channel_id: "chan-local-rich".to_string(),
         peer_pubkey: String::new(),
@@ -6918,6 +6983,8 @@ fn list_channels_merges_runtime_metadata_from_local_cache_contract() {
         asset_id: None,
         asset_local_amount: None,
         virtual_open_mode: None,
+        outbound_msat: 0,
+        next_outbound_htlc_limit_msat: 0,
     });
 
     let channels_js = node.list_channels_value().expect("list channels");

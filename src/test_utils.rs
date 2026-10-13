@@ -24,12 +24,17 @@ pub fn mock_locked_app_state() -> TestAppState {
 
     TestAppState(Arc::new(AppState {
         static_state: Arc::new(StaticState {
+            config: Default::default(),
             ldk_peer_listening_port: 9735,
             network: rgb_lib::BitcoinNetwork::Regtest,
             storage_dir_path: path.clone(),
             ldk_data_dir: path.join(".ldk"),
             logger: Arc::new(FilesystemLogger::new(path)),
             max_media_upload_size_mb: 1,
+            max_aggregated_media_size_per_channel_mb:
+                crate::rgb_file_transfer::MAX_MEDIA_MB_PER_CHANNEL,
+            max_pending_consignments: crate::rgb_file_transfer::MAX_PENDING_CONSIGNMENTS,
+            max_media_files_per_channel: crate::rgb_file_transfer::MAX_MEDIA_FILES_PER_CHANNEL,
             enable_virtual_channels_v0: false,
             virtual_peer_pubkeys: vec![],
             database: RwLock::new(Arc::new(database)),
@@ -38,6 +43,7 @@ pub fn mock_locked_app_state() -> TestAppState {
             vss_url: None,
             vss_allow_empty_restore: false,
             reuse_addresses: false,
+            remote_signer_listen_addr: None,
         }),
         cancel_token: CancellationToken::new(),
         unlocked_app_state: Arc::new(TokioMutex::new(None)),
@@ -77,4 +83,29 @@ pub fn error_mapping_snapshot_for_tests() -> ErrorMappingSnapshot {
             "boom",
         ))),
     }
+}
+
+#[cfg(feature = "uniffi")]
+pub fn export_rgb_contract_bytes_for_tests(node: &crate::SdkNode, asset_id: &str) -> Vec<u8> {
+    use rgb_lib::FileContent;
+
+    let state = node.handle.app_state();
+    let unlocked_state = crate::runtime::block_on(async {
+        state
+            .get_unlocked_app_state()
+            .await
+            .as_ref()
+            .cloned()
+            .expect("test node is unlocked")
+    });
+    let contract = unlocked_state
+        .rgb_wallet_wrapper
+        .get_rgb_wallet()
+        .export_asset_contract(asset_id.to_string())
+        .expect("export issued RGB contract");
+    let mut bytes = Vec::new();
+    contract
+        .save(&mut bytes)
+        .expect("serialize issued RGB contract");
+    bytes
 }

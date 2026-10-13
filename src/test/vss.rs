@@ -5,15 +5,17 @@
 
 #[cfg(feature = "vss")]
 mod tests {
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use bitcoin::secp256k1::{rand::rngs::OsRng, Secp256k1, SecretKey};
     use hex::DisplayHex;
     use lightning::util::persist::KVStoreSync;
-    use sea_orm::{ConnectOptions, Database};
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseBackend, Statement};
 
-    use crate::kv_store::SeaOrmKvStore;
+    use crate::kv_store::{KvStoreEntry, KvStoreKey, SeaOrmKvStore};
     use crate::synced_kv_store::SyncedKvStore;
     use crate::vss_kv_store::{parse_vss_key, vss_key, VssKvStore};
 
@@ -47,6 +49,143 @@ mod tests {
         let db = crate::runtime::block_on(Database::connect(opt)).expect("test db");
         crate::runtime::block_on(rln_migration::Migrator::up(&db, None)).expect("migration");
         Arc::new(db)
+    }
+
+    fn open_test_sqlite(path: &Path) -> Arc<sea_orm::DatabaseConnection> {
+        use rln_migration::MigratorTrait;
+
+        let conn_str = format!("sqlite:{}?mode=rwc", path.display());
+        let mut opt = ConnectOptions::new(conn_str);
+        opt.max_connections(1)
+            .connect_timeout(Duration::from_secs(5));
+        let db = crate::runtime::block_on(Database::connect(opt)).expect("persistent test DB");
+        crate::runtime::block_on(rln_migration::Migrator::up(&db, None)).expect("migration");
+        Arc::new(db)
+    }
+
+    fn synced_kv_child_command(
+        mode: &str,
+        db_path: &Path,
+        store_id: &str,
+        signing_key: &SecretKey,
+    ) -> Command {
+        let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+        command
+            .args([
+                "--exact",
+                "test::vss::tests::synced_kv_os_kill_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("RLN_SYNCED_KV_CHILD_MODE", mode)
+            .env("RLN_SYNCED_KV_CHILD_DB", db_path)
+            .env("RLN_SYNCED_KV_CHILD_STORE_ID", store_id)
+            .env(
+                "RLN_SYNCED_KV_CHILD_SECRET",
+                signing_key.secret_bytes().as_hex().to_string(),
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    }
+
+    fn prepare_synced_kv_fixture(db_path: &Path, store_id: &str, signing_key: SecretKey) {
+        let local = SeaOrmKvStore::from_connection(open_test_sqlite(db_path));
+        local
+            .write(
+                crate::synced_kv_store::RGB_SENDER_FUNDING_NAMESPACE,
+                "",
+                "funding",
+                b"old".to_vec(),
+            )
+            .expect("seed local value");
+        let remote = VssKvStore::new(VSS_URL.to_owned(), store_id.to_owned(), signing_key)
+            .expect("seed VSS store");
+        remote
+            .write(
+                crate::synced_kv_store::RGB_SENDER_FUNDING_NAMESPACE,
+                "",
+                "funding",
+                b"old".to_vec(),
+            )
+            .expect("seed remote value");
+    }
+
+    fn trace_synced_kv_checkpoints(mode: &str) -> Vec<String> {
+        let directory = tempfile::tempdir().expect("trace tempdir");
+        let db_path = directory.path().join("store.sqlite");
+        let trace_path = directory.path().join("trace.txt");
+        let (signing_key, store_id) = generate_test_keys();
+        prepare_synced_kv_fixture(&db_path, &store_id, signing_key);
+        let status = synced_kv_child_command(mode, &db_path, &store_id, &signing_key)
+            .env("RLN_SYNCED_KV_PERSISTENCE_TRACE_PATH", &trace_path)
+            .status()
+            .expect("run synchronized KV trace child");
+        assert!(
+            status.success(),
+            "synchronized KV trace child failed for {mode}"
+        );
+        let prefix = if mode == "write" {
+            "synced-write-"
+        } else {
+            "synced-remove-"
+        };
+        let checkpoints: Vec<_> = std::fs::read_to_string(trace_path)
+            .expect("read synchronized KV trace")
+            .lines()
+            .filter(|line| line.starts_with(prefix))
+            .map(str::to_owned)
+            .collect();
+        assert!(
+            !checkpoints.is_empty(),
+            "no synchronized KV checkpoints for {mode}"
+        );
+        let mut unique = checkpoints.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            checkpoints.len(),
+            unique.len(),
+            "duplicate checkpoints for {mode}"
+        );
+        checkpoints
+    }
+
+    fn kill_synced_kv_at_checkpoint(mode: &str, checkpoint: &str) -> (PathBuf, String, SecretKey) {
+        let directory = tempfile::tempdir().expect("kill tempdir");
+        let root = directory.keep();
+        let db_path = root.join("store.sqlite");
+        let ready_path = root.join("ready");
+        let (signing_key, store_id) = generate_test_keys();
+        prepare_synced_kv_fixture(&db_path, &store_id, signing_key);
+        let mut child = synced_kv_child_command(mode, &db_path, &store_id, &signing_key)
+            .env("RLN_SYNCED_KV_KILL_AT", checkpoint)
+            .env("RLN_SYNCED_KV_KILL_READY_PATH", &ready_path)
+            .spawn()
+            .expect("spawn synchronized KV kill child");
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if ready_path.exists() {
+                break;
+            }
+            if let Some(status) = child.try_wait().expect("poll synchronized KV child") {
+                panic!("synchronized KV child exited before {checkpoint}: {status}");
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("synchronized KV child did not reach {checkpoint}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child.kill().expect("kill synchronized KV child");
+        let status = child.wait().expect("wait for synchronized KV child");
+        assert!(
+            !status.success(),
+            "killed synchronized KV child unexpectedly succeeded"
+        );
+        (db_path, store_id, signing_key)
     }
 
     // --- Unit tests ---
@@ -308,6 +447,96 @@ mod tests {
         // List should also work
         let cm_keys = synced2.list("channel_manager", "").expect("list");
         assert_eq!(cm_keys, vec!["manager"]);
+    }
+
+    /// A wiped VSS store is refilled from local state: keys missing on the
+    /// remote are pushed, keys the remote already holds are left untouched,
+    /// and local-only rows (pending queue, marker, graph/scorer) stay local.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn synced_kv_store_push_fills_missing_remote_keys() {
+        use lightning::util::persist::{
+            NETWORK_GRAPH_PERSISTENCE_KEY, NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
+            NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
+        };
+        if !vss_server_available() {
+            eprintln!("SKIP: VSS server not available at {VSS_URL}");
+            return;
+        }
+
+        let (signing_key, store_id) = generate_test_keys();
+        let db = create_test_sqlite();
+        let local = Arc::new(SeaOrmKvStore::from_connection(db));
+        let vss = Arc::new(
+            VssKvStore::new(VSS_URL.to_string(), store_id, signing_key).expect("vss store"),
+        );
+        let synced = SyncedKvStore::with_vss(local.clone(), vss.clone());
+
+        synced
+            .write("channel_manager", "", "manager", vec![0xCA; 64])
+            .unwrap();
+        synced
+            .write("monitors", "", "deadbeef_0", vec![0xBE; 64])
+            .unwrap();
+        synced
+            .write("monitors", "", "deadbeef_1", vec![0xBF; 64])
+            .unwrap();
+        synced
+            .write_local_only("reimport_marker", "", "fascia_replay", vec![1])
+            .unwrap();
+        local
+            .write(
+                NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
+                NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
+                NETWORK_GRAPH_PERSISTENCE_KEY,
+                vec![0x11; 8],
+            )
+            .unwrap();
+        local
+            .write(
+                crate::synced_kv_store::PENDING_NS,
+                "",
+                "x//y",
+                vec![1, 0xAA],
+            )
+            .unwrap();
+
+        // Wipe the remote, then plant a foreign value the push must not clobber.
+        for k in vss.list_all_keys().expect("list keys") {
+            let (p, s, key) = parse_vss_key(&k).expect("rln key");
+            vss.remove(&p, &s, &key, false).expect("remote remove");
+        }
+        assert!(vss.list_all_keys().expect("list keys").is_empty());
+        vss.write("monitors", "", "deadbeef_1", vec![0xEE; 64])
+            .unwrap();
+
+        assert_eq!(synced.push_missing_to_vss().expect("push"), 2);
+
+        assert_eq!(
+            vss.read("channel_manager", "", "manager").unwrap(),
+            vec![0xCA; 64]
+        );
+        assert_eq!(
+            vss.read("monitors", "", "deadbeef_0").unwrap(),
+            vec![0xBE; 64]
+        );
+        assert_eq!(
+            vss.read("monitors", "", "deadbeef_1").unwrap(),
+            vec![0xEE; 64],
+            "existing remote value must not be overwritten"
+        );
+        let mut remote_keys = vss.list_all_keys().expect("list keys");
+        remote_keys.sort();
+        assert_eq!(
+            remote_keys,
+            vec![
+                vss_key("channel_manager", "", "manager"),
+                vss_key("monitors", "", "deadbeef_0"),
+                vss_key("monitors", "", "deadbeef_1"),
+            ],
+            "local-only rows must not be pushed"
+        );
+
+        assert_eq!(synced.push_missing_to_vss().expect("push again"), 0);
     }
 
     /// Edge case: VSS server unreachable. Writes must still succeed locally
@@ -631,9 +860,66 @@ mod tests {
             .expect_err("fence must still be owned by b");
     }
 
+    /// The "VSS fence broken" panic now takes the node down through the normal shutdown, which
+    /// ends in a fence release. That release must be a no-op: the fence it would delete belongs
+    /// to the instance that took the store over.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vss_broken_fence_shutdown_leaves_the_new_owner_alone() {
+        if !vss_server_available() {
+            eprintln!("SKIP: VSS server not available at {VSS_URL}");
+            return;
+        }
+
+        let (signing_key, store_id) = generate_test_keys();
+
+        // A is the running node.
+        let store_a =
+            VssKvStore::new(VSS_URL.to_string(), store_id.clone(), signing_key).expect("store a");
+        store_a.acquire_fence().expect("a acquires fence");
+
+        // An operator moves the store to B while A is still up: A's next fence check panics.
+        let store_b =
+            VssKvStore::new(VSS_URL.to_string(), store_id.clone(), signing_key).expect("store b");
+        store_b.delete_fence().expect("operator clears the fence");
+        store_b.acquire_fence().expect("b takes over");
+
+        // A's panic-driven shutdown reaches the fence release.
+        store_a
+            .release_fence_if_owned()
+            .expect("dispossessed release must not error");
+
+        // B still owns the store.
+        let store_c = VssKvStore::new(VSS_URL.to_string(), store_id, signing_key).expect("store c");
+        store_c
+            .acquire_fence()
+            .expect_err("fence must still be owned by b");
+    }
+
     /// A failed unlock must roll back what it acquired: the VSS fence is
     /// released and the changing-state flag is cleared, so a retry (failed or
     /// successful) is never wedged behind a stranded fence.
+    fn select_electrum_backend(payload: &mut crate::routes::UnlockRequest) {
+        payload.ldk_chain_sync = crate::core_types::LdkChainSync::TransactionSync {
+            indexer_url: crate::utils::ELECTRUM_URL_REGTEST.to_string(),
+        };
+    }
+
+    async fn unlock_with_electrum_backend(node_address: std::net::SocketAddr, password: &str) {
+        let mut payload = crate::test::unlock_req(password);
+        select_electrum_backend(&mut payload);
+        let res = reqwest::Client::new()
+            .post(format!("http://{node_address}/unlock"))
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+        crate::test::check_response_is_ok(res)
+            .await
+            .json::<crate::routes::EmptyResponse>()
+            .await
+            .unwrap();
+    }
+
     #[serial_test::serial]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn vss_failed_unlock_releases_fence_and_allows_retry() {
@@ -666,6 +952,7 @@ mod tests {
 
         // Unlock against an unreachable indexer: fails after the fence acquire.
         let mut payload = crate::test::unlock_req(password);
+        select_electrum_backend(&mut payload);
         payload.indexer_url = Some("127.0.0.1:1".to_string());
         let client = reqwest::Client::new();
         for attempt in 1..=2 {
@@ -693,7 +980,98 @@ mod tests {
         }
 
         // With the fence rolled back a retry with good parameters succeeds.
-        crate::test::unlock(node_address, password).await;
+        unlock_with_electrum_backend(node_address, password).await;
+
+        crate::test::shutdown(&[node_address]).await;
+    }
+
+    /// A VSS store wiped while the node keeps its local state is refilled at
+    /// the next unlock: node keys are pushed and the RGB backup re-uploaded.
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn vss_wiped_store_is_refilled_on_unlock() {
+        if !vss_server_available() {
+            eprintln!("SKIP: VSS server not available at {VSS_URL}");
+            return;
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(180),
+            wiped_store_is_refilled_inner(),
+        )
+        .await
+        .expect("vss_wiped_store_is_refilled_on_unlock timed out");
+    }
+
+    async fn wiped_store_is_refilled_inner() {
+        use lightning::util::persist::{
+            CHANNEL_MANAGER_PERSISTENCE_KEY, CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+            CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+        };
+        use rgb_lib::bdk_wallet::keys::bip39::Mnemonic;
+
+        crate::test::initialize();
+
+        let test_dir_node = "tmp/vss_wiped_store_refilled/node1";
+        let node_address = crate::test::start_daemon_with_vss(
+            test_dir_node,
+            crate::test::NODE1_PEER_PORT,
+            false,
+            Some(VSS_URL.to_string()),
+            false,
+        )
+        .await;
+        let password = "vss_wiped_store_refilled";
+        let mnemonic = crate::test::init(node_address, password, None)
+            .await
+            .mnemonic;
+        unlock_with_electrum_backend(node_address, password).await;
+        crate::test::lock(node_address).await;
+
+        let identity = crate::ldk::derive_vss_identity(
+            &Mnemonic::parse(&mnemonic).unwrap(),
+            bitcoin::Network::Regtest,
+        )
+        .unwrap();
+        let node_store = VssKvStore::new(
+            VSS_URL.to_string(),
+            identity.pubkey_hex.clone(),
+            identity.signing_key,
+        )
+        .unwrap();
+        let rgb_store = VssKvStore::new(
+            VSS_URL.to_string(),
+            format!("{}_rgb", identity.pubkey_hex),
+            identity.signing_key,
+        )
+        .unwrap();
+
+        let before = node_store.list_all_keys().unwrap();
+        assert!(before.contains(&vss_key(
+            CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+            CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+            CHANNEL_MANAGER_PERSISTENCE_KEY,
+        )));
+        assert!(!rgb_store.list_all_keys().unwrap().is_empty());
+        for store in [&node_store, &rgb_store] {
+            for key in store.list_all_keys().unwrap() {
+                store.remove_raw(&key).unwrap();
+            }
+            assert!(store.list_all_keys().unwrap().is_empty());
+        }
+
+        unlock_with_electrum_backend(node_address, password).await;
+
+        let after = node_store.list_all_keys().unwrap();
+        for key in &before {
+            assert!(after.contains(key), "key missing after refill: {key}");
+        }
+        let info: serde_json::Value = reqwest::get(format!("http://{node_address}/vssbackupinfo"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(info["backup_exists"], true, "{info}");
 
         crate::test::shutdown(&[node_address]).await;
     }
@@ -730,9 +1108,9 @@ mod tests {
         let password = "vss_lock_release_fence";
         crate::test::init(node_address, password, None).await;
 
-        crate::test::unlock(node_address, password).await;
+        unlock_with_electrum_backend(node_address, password).await;
         crate::test::lock(node_address).await;
-        crate::test::unlock(node_address, password).await;
+        unlock_with_electrum_backend(node_address, password).await;
 
         crate::test::shutdown(&[node_address]).await;
     }
@@ -975,5 +1353,500 @@ mod tests {
         );
 
         client.delete_backup().await.expect("cleanup");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn synced_kv_store_drain_never_regresses_newer_write() {
+        if !vss_server_available() {
+            eprintln!("SKIP: VSS server not available at {VSS_URL}");
+            return;
+        }
+
+        let proxy = super::super::vss_offline_force_close::VssProxy::start();
+        let (signing_key, store_id) = generate_test_keys();
+        let remote =
+            Arc::new(VssKvStore::new(proxy.url(), store_id, signing_key).expect("vss store"));
+        let synced = SyncedKvStore::with_vss(
+            Arc::new(SeaOrmKvStore::from_connection(create_test_sqlite())),
+            Arc::clone(&remote),
+        );
+
+        synced
+            .write("", "", "aux_state", b"v1".to_vec())
+            .expect("v1");
+
+        proxy.go_offline();
+        synced
+            .write("", "", "aux_state", b"v2".to_vec())
+            .expect("v2 local");
+        assert_eq!(synced.pending_remote_writes(), 1, "v2 must be queued");
+
+        proxy.go_online();
+        synced
+            .write("", "", "aux_state", b"v3".to_vec())
+            .expect("v3");
+
+        assert_eq!(
+            KVStoreSync::read(&*remote, "", "", "aux_state").expect("remote read"),
+            b"v3".to_vec(),
+            "remote must hold the newest value; a stale queued write must not regress it"
+        );
+    }
+
+    /// Manager writes must be VSS-durable before completing; graph/scorer must
+    /// never reach VSS; aux keys keep best-effort replication.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bp_router_routes_manager_remote_first() {
+        use lightning::util::persist::{
+            KVStore, NETWORK_GRAPH_PERSISTENCE_KEY, SCORER_PERSISTENCE_KEY,
+        };
+
+        if !vss_server_available() {
+            eprintln!("SKIP: VSS server not available at {VSS_URL}");
+            return;
+        }
+
+        let proxy = super::super::vss_offline_force_close::VssProxy::start();
+        let (signing_key, store_id) = generate_test_keys();
+        let remote =
+            Arc::new(VssKvStore::new(proxy.url(), store_id, signing_key).expect("vss store"));
+        let local = Arc::new(SeaOrmKvStore::from_connection(create_test_sqlite()));
+        let remote_first = Arc::new(crate::async_kv_store::RemoteFirstKvStore::new(
+            Arc::clone(&local),
+            Some(Arc::clone(&remote)),
+        ));
+        let synced = Arc::new(SyncedKvStore::with_vss(
+            Arc::clone(&local),
+            Arc::clone(&remote),
+        ));
+        let router = Arc::new(crate::async_kv_store::BpKvStoreRouter::new(
+            Arc::clone(&remote_first),
+            Arc::clone(&local),
+            synced,
+        ));
+
+        router
+            .write("", "", "manager", b"m1".to_vec())
+            .await
+            .expect("manager write");
+        assert_eq!(
+            remote.read_async("", "", "manager").await.expect("on VSS"),
+            b"m1".to_vec(),
+            "manager must be durable on VSS when the write completes"
+        );
+
+        router
+            .write(
+                lightning::util::persist::OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE,
+                lightning::util::persist::OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE,
+                lightning::util::persist::OUTPUT_SWEEPER_PERSISTENCE_KEY,
+                b"sw1".to_vec(),
+            )
+            .await
+            .expect("sweeper write");
+        assert_eq!(
+            remote
+                .read_async(
+                    lightning::util::persist::OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE,
+                    lightning::util::persist::OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE,
+                    lightning::util::persist::OUTPUT_SWEEPER_PERSISTENCE_KEY,
+                )
+                .await
+                .expect("on VSS"),
+            b"sw1".to_vec(),
+            "sweeper state must be durable on VSS when the write completes"
+        );
+
+        router
+            .write("", "", NETWORK_GRAPH_PERSISTENCE_KEY, b"g1".to_vec())
+            .await
+            .expect("graph write");
+        router
+            .write("", "", SCORER_PERSISTENCE_KEY, b"s1".to_vec())
+            .await
+            .expect("scorer write");
+        assert!(
+            remote
+                .read_async("", "", NETWORK_GRAPH_PERSISTENCE_KEY)
+                .await
+                .is_err(),
+            "network graph must not replicate to VSS"
+        );
+        assert!(
+            remote
+                .read_async("", "", SCORER_PERSISTENCE_KEY)
+                .await
+                .is_err(),
+            "scorer must not replicate to VSS"
+        );
+        assert!(
+            KVStoreSync::read(&*local, "", "", NETWORK_GRAPH_PERSISTENCE_KEY).is_ok(),
+            "network graph must be stored locally"
+        );
+
+        // Manager write during an outage blocks (retry loop) instead of
+        // acking; it completes once VSS is back and lands durably.
+        proxy.go_offline();
+        let router_task = Arc::clone(&router);
+        let pending =
+            tokio::spawn(async move { router_task.write("", "", "manager", b"m2".to_vec()).await });
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !pending.is_finished(),
+            "manager write must not complete while VSS is unreachable"
+        );
+        proxy.go_online();
+        tokio::time::timeout(Duration::from_secs(30), pending)
+            .await
+            .expect("write must finish after recovery")
+            .expect("join")
+            .expect("write ok");
+        assert_eq!(
+            remote.read_async("", "", "manager").await.expect("on VSS"),
+            b"m2".to_vec(),
+        );
+    }
+
+    /// Queued replications must survive a restart: a new SyncedKvStore over
+    /// the same local DB reloads them and a drain delivers them to VSS.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_queue_survives_restart_and_drains() {
+        if !vss_server_available() {
+            eprintln!("SKIP: VSS server not available at {VSS_URL}");
+            return;
+        }
+
+        let proxy = super::super::vss_offline_force_close::VssProxy::start();
+        let (signing_key, store_id) = generate_test_keys();
+        let remote =
+            Arc::new(VssKvStore::new(proxy.url(), store_id, signing_key).expect("vss store"));
+        let conn = create_test_sqlite();
+        let local = Arc::new(SeaOrmKvStore::from_connection(Arc::clone(&conn)));
+
+        proxy.go_offline();
+        {
+            let synced = SyncedKvStore::with_vss(Arc::clone(&local), Arc::clone(&remote));
+            synced
+                .write("", "", "aux_a", b"v_a".to_vec())
+                .expect("local write during outage");
+            synced
+                .write("", "", "aux_b", b"v_b".to_vec())
+                .expect("local write during outage");
+            assert_eq!(synced.pending_remote_writes(), 2);
+        }
+
+        // "Restart": fresh store instance over the same local DB.
+        let synced = SyncedKvStore::with_vss(
+            Arc::new(SeaOrmKvStore::from_connection(conn)),
+            Arc::clone(&remote),
+        );
+        assert_eq!(
+            synced.pending_remote_writes(),
+            2,
+            "pending replications must be reloaded from the local DB"
+        );
+
+        proxy.go_online();
+        synced.drain_pending();
+        assert_eq!(synced.pending_remote_writes(), 0);
+        assert_eq!(
+            KVStoreSync::read(&*remote, "", "", "aux_a").expect("on VSS"),
+            b"v_a".to_vec()
+        );
+        assert_eq!(
+            KVStoreSync::read(&*remote, "", "", "aux_b").expect("on VSS"),
+            b"v_b".to_vec()
+        );
+
+        // Delivered rows must be gone from disk, or a later restart would
+        // resurrect and re-send stale values.
+        let reopened = SyncedKvStore::with_vss(Arc::clone(&local), Arc::clone(&remote));
+        assert_eq!(
+            reopened.pending_remote_writes(),
+            0,
+            "drained entries must not survive on disk"
+        );
+    }
+
+    /// A queued removal must also survive a restart and converge on VSS.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_removal_survives_restart_and_drains() {
+        if !vss_server_available() {
+            eprintln!("SKIP: VSS server not available at {VSS_URL}");
+            return;
+        }
+
+        let proxy = super::super::vss_offline_force_close::VssProxy::start();
+        let (signing_key, store_id) = generate_test_keys();
+        let remote =
+            Arc::new(VssKvStore::new(proxy.url(), store_id, signing_key).expect("vss store"));
+        let conn = create_test_sqlite();
+        let local = Arc::new(SeaOrmKvStore::from_connection(Arc::clone(&conn)));
+
+        {
+            let synced = SyncedKvStore::with_vss(Arc::clone(&local), Arc::clone(&remote));
+            synced
+                .write("", "", "aux_rm", b"v".to_vec())
+                .expect("write");
+            proxy.go_offline();
+            synced
+                .remove("", "", "aux_rm", false)
+                .expect("local remove");
+            assert_eq!(synced.pending_remote_writes(), 1);
+        }
+
+        let synced = SyncedKvStore::with_vss(
+            Arc::new(SeaOrmKvStore::from_connection(conn)),
+            Arc::clone(&remote),
+        );
+        assert_eq!(synced.pending_remote_writes(), 1);
+
+        proxy.go_online();
+        synced.drain_pending();
+        assert_eq!(synced.pending_remote_writes(), 0);
+        assert!(
+            KVStoreSync::read(&*remote, "", "", "aux_rm").is_err(),
+            "queued removal must have converged on VSS"
+        );
+        let reopened = SyncedKvStore::with_vss(Arc::clone(&local), Arc::clone(&remote));
+        assert_eq!(reopened.pending_remote_writes(), 0);
+    }
+
+    #[test]
+    fn local_mutation_and_replication_intent_are_one_sqlite_transaction() {
+        let connection = create_test_sqlite();
+        let local = SeaOrmKvStore::from_connection(Arc::clone(&connection));
+        local
+            .write("target", "", "write-key", b"old".to_vec())
+            .expect("seed write target");
+        local
+            .write("target", "", "remove-key", b"retained".to_vec())
+            .expect("seed remove target");
+
+        crate::runtime::block_on(connection.execute(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            format!(
+                "CREATE TRIGGER reject_vss_intent BEFORE INSERT ON kv_store \
+                 WHEN NEW.primary_namespace = '{}' \
+                 BEGIN SELECT RAISE(ABORT, 'injected intent failure'); END",
+                crate::synced_kv_store::PENDING_NS
+            ),
+        )))
+        .expect("install failure trigger");
+
+        assert!(local
+            .write_with_replication_intent(
+                KvStoreEntry::new("target", "", "write-key", b"new".to_vec()),
+                KvStoreEntry::new(
+                    crate::synced_kv_store::PENDING_NS,
+                    "",
+                    "target//write-key",
+                    vec![1, 0x01],
+                ),
+            )
+            .is_err());
+        assert_eq!(
+            local
+                .read("target", "", "write-key")
+                .expect("old value survives"),
+            b"old"
+        );
+        assert!(
+            local
+                .read(crate::synced_kv_store::PENDING_NS, "", "target//write-key")
+                .is_err(),
+            "failed intent insertion must roll back the target write"
+        );
+
+        assert!(local
+            .remove_with_replication_intent(
+                KvStoreKey::new("target", "", "remove-key"),
+                KvStoreEntry::new(
+                    crate::synced_kv_store::PENDING_NS,
+                    "",
+                    "target//remove-key",
+                    vec![0],
+                ),
+            )
+            .is_err());
+        assert_eq!(
+            local
+                .read("target", "", "remove-key")
+                .expect("removed value survives rollback"),
+            b"retained"
+        );
+    }
+
+    #[test]
+    fn full_pending_queue_rejects_before_local_mutation_without_eviction() {
+        let (signing_key, store_id) = generate_test_keys();
+        let connection = create_test_sqlite();
+        let local = Arc::new(SeaOrmKvStore::from_connection(connection));
+        let existing_vss_key = vss_key("existing", "", "key");
+        let mut existing_row = vec![1];
+        existing_row.extend_from_slice(b"pending");
+        local
+            .write(
+                crate::synced_kv_store::PENDING_NS,
+                "",
+                &existing_vss_key,
+                existing_row,
+            )
+            .expect("seed pending intent");
+        let unreachable = Arc::new(
+            VssKvStore::new("http://127.0.0.1:5/vss".to_string(), store_id, signing_key)
+                .expect("vss store"),
+        );
+        let synced = SyncedKvStore::with_vss_capacity(Arc::clone(&local), unreachable, 1);
+
+        let error = synced
+            .write("new", "", "key", b"must-not-land".to_vec())
+            .expect_err("a full backlog must apply backpressure");
+        assert_eq!(error.kind(), bitcoin::io::ErrorKind::WouldBlock);
+        assert!(local.read("new", "", "key").is_err());
+        assert_eq!(synced.pending_remote_writes(), 1);
+        assert_eq!(
+            local
+                .read(crate::synced_kv_store::PENDING_NS, "", &existing_vss_key)
+                .expect("existing intent must not be evicted"),
+            [vec![1], b"pending".to_vec()].concat()
+        );
+    }
+
+    #[test]
+    fn funding_journal_write_fails_closed_and_remains_replayable() {
+        let (signing_key, store_id) = generate_test_keys();
+        let connection = create_test_sqlite();
+        let local = Arc::new(SeaOrmKvStore::from_connection(Arc::clone(&connection)));
+        let unreachable = Arc::new(
+            VssKvStore::new("http://127.0.0.1:5/vss".to_string(), store_id, signing_key)
+                .expect("vss store"),
+        );
+        let synced = SyncedKvStore::with_vss(Arc::clone(&local), Arc::clone(&unreachable));
+        let journal = b"funding-journal".to_vec();
+
+        synced
+            .write(
+                crate::synced_kv_store::RGB_PRIMARY_NAMESPACE,
+                crate::synced_kv_store::RGB_FUNDING_ACCEPTANCE_NAMESPACE,
+                "temporary-channel",
+                journal.clone(),
+            )
+            .expect_err("critical funding state must not acknowledge a local-only write");
+        assert_eq!(
+            synced
+                .read(
+                    crate::synced_kv_store::RGB_PRIMARY_NAMESPACE,
+                    crate::synced_kv_store::RGB_FUNDING_ACCEPTANCE_NAMESPACE,
+                    "temporary-channel"
+                )
+                .expect("local recovery state"),
+            journal
+        );
+        assert_eq!(synced.pending_remote_writes(), 1);
+        drop(synced);
+
+        let reopened = SyncedKvStore::with_vss(
+            Arc::new(SeaOrmKvStore::from_connection(connection)),
+            unreachable,
+        );
+        assert_eq!(
+            reopened.pending_remote_writes(),
+            1,
+            "restart must recover the failed critical replication"
+        );
+    }
+
+    #[test]
+    #[ignore = "subprocess used by synced_kv_os_kill_matrix"]
+    fn synced_kv_os_kill_child() {
+        let mode = std::env::var("RLN_SYNCED_KV_CHILD_MODE").expect("child mode");
+        let db_path =
+            PathBuf::from(std::env::var("RLN_SYNCED_KV_CHILD_DB").expect("child database path"));
+        let store_id = std::env::var("RLN_SYNCED_KV_CHILD_STORE_ID").expect("child VSS store ID");
+        let secret = std::env::var("RLN_SYNCED_KV_CHILD_SECRET").expect("child VSS secret");
+        let signing_key = secret.parse::<SecretKey>().expect("parse child VSS secret");
+        let local = Arc::new(SeaOrmKvStore::from_connection(open_test_sqlite(&db_path)));
+        let remote = Arc::new(
+            VssKvStore::new(VSS_URL.to_owned(), store_id, signing_key).expect("child VSS store"),
+        );
+        let synced = SyncedKvStore::with_vss(local, remote);
+        match mode.as_str() {
+            "write" => synced
+                .write(
+                    crate::synced_kv_store::RGB_SENDER_FUNDING_NAMESPACE,
+                    "",
+                    "funding",
+                    b"new".to_vec(),
+                )
+                .expect("synchronized write"),
+            "remove" => synced
+                .remove(
+                    crate::synced_kv_store::RGB_SENDER_FUNDING_NAMESPACE,
+                    "",
+                    "funding",
+                    false,
+                )
+                .expect("synchronized remove"),
+            _ => panic!("unknown child mode {mode}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the VSS integration service"]
+    fn synced_kv_os_kill_matrix() {
+        assert!(
+            vss_server_available(),
+            "VSS server is required at {VSS_URL}"
+        );
+        for mode in ["write", "remove"] {
+            for checkpoint in trace_synced_kv_checkpoints(mode) {
+                let (db_path, store_id, signing_key) =
+                    kill_synced_kv_at_checkpoint(mode, &checkpoint);
+                let local = Arc::new(SeaOrmKvStore::from_connection(open_test_sqlite(&db_path)));
+                let remote = Arc::new(
+                    VssKvStore::new(VSS_URL.to_owned(), store_id, signing_key)
+                        .expect("reopen VSS store"),
+                );
+                let synced = SyncedKvStore::with_vss(Arc::clone(&local), Arc::clone(&remote));
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while synced.pending_remote_writes() != 0 && Instant::now() < deadline {
+                    synced.drain_pending();
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                assert_eq!(
+                    synced.pending_remote_writes(),
+                    0,
+                    "pending replication did not drain after {checkpoint}"
+                );
+
+                let local_value = local.read(
+                    crate::synced_kv_store::RGB_SENDER_FUNDING_NAMESPACE,
+                    "",
+                    "funding",
+                );
+                let remote_value = remote.read(
+                    crate::synced_kv_store::RGB_SENDER_FUNDING_NAMESPACE,
+                    "",
+                    "funding",
+                );
+                if mode == "write" {
+                    assert_eq!(local_value.expect("local write"), b"new".to_vec());
+                    assert_eq!(remote_value.expect("remote write"), b"new".to_vec());
+                } else {
+                    assert_eq!(
+                        local_value.expect_err("local removal").kind(),
+                        bitcoin::io::ErrorKind::NotFound
+                    );
+                    assert_eq!(
+                        remote_value.expect_err("remote removal").kind(),
+                        bitcoin::io::ErrorKind::NotFound
+                    );
+                }
+                drop(synced);
+                std::fs::remove_dir_all(db_path.parent().expect("database parent"))
+                    .expect("remove synchronized KV fixture");
+            }
+        }
     }
 }

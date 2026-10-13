@@ -120,26 +120,52 @@ pub struct RlnLdkPeerManagerHooks {
     pub report_error: Rc<dyn Fn(&str) -> Result<(), JsValue>>,
 }
 
+struct RegisteredPeerManagerHooks {
+    hooks: Rc<RlnLdkPeerManagerHooks>,
+    check_lightning_supported: Option<Rc<dyn Fn() -> Result<(), JsValue>>>,
+}
+
+impl RegisteredPeerManagerHooks {
+    fn check_lightning_supported(&self) -> Result<(), JsValue> {
+        if let Some(check) = &self.check_lightning_supported {
+            check()?;
+        }
+        Ok(())
+    }
+}
+
 thread_local! {
-    static RLN_LDK_PEER_MANAGER_HOOKS: RefCell<Option<Rc<RlnLdkPeerManagerHooks>>> = RefCell::new(None);
+    static RLN_LDK_PEER_MANAGER_HOOKS: RefCell<Option<Rc<RegisteredPeerManagerHooks>>> = RefCell::new(None);
     static RLN_LDK_PEER_MANAGER_HOOKS_V2_READY: Cell<bool> = const { Cell::new(false) };
+    // Explicit clear disables owned-hook fallback; automatic owner release must not
+    // disconnect other nodes that still own their registrations.
+    static RLN_LDK_PEER_MANAGER_HOOKS_EXPLICITLY_CLEARED: Cell<bool> = const { Cell::new(false) };
 }
 
 pub fn install_rln_ldk_peer_manager_hooks(hooks: RlnLdkPeerManagerHooks) {
+    install_registered_peer_manager_hooks(Rc::new(RegisteredPeerManagerHooks {
+        hooks: Rc::new(hooks),
+        check_lightning_supported: None,
+    }));
+}
+
+fn install_registered_peer_manager_hooks(hooks: Rc<RegisteredPeerManagerHooks>) {
+    RLN_LDK_PEER_MANAGER_HOOKS_EXPLICITLY_CLEARED.with(|cleared| cleared.set(false));
     RLN_LDK_PEER_MANAGER_HOOKS.with(|slot| {
-        slot.replace(Some(Rc::new(hooks)));
+        slot.replace(Some(hooks));
     });
     RLN_LDK_PEER_MANAGER_HOOKS_V2_READY.with(|ready| ready.set(true));
 }
 
 pub fn clear_rln_ldk_peer_manager_hooks() {
+    RLN_LDK_PEER_MANAGER_HOOKS_EXPLICITLY_CLEARED.with(|cleared| cleared.set(true));
     RLN_LDK_PEER_MANAGER_HOOKS.with(|slot| {
         slot.replace(None);
     });
     RLN_LDK_PEER_MANAGER_HOOKS_V2_READY.with(|ready| ready.set(false));
 }
 
-fn get_rln_ldk_peer_manager_hooks() -> Option<Rc<RlnLdkPeerManagerHooks>> {
+fn get_rln_ldk_peer_manager_hooks() -> Option<Rc<RegisteredPeerManagerHooks>> {
     RLN_LDK_PEER_MANAGER_HOOKS.with(|slot| slot.borrow().as_ref().cloned())
 }
 
@@ -295,34 +321,46 @@ impl PeerManagerAdapter for RustPeerManagerAdapter {
 }
 
 fn callbacks_from_hooks(
-    hooks: Rc<RlnLdkPeerManagerHooks>,
+    hooks: Rc<RegisteredPeerManagerHooks>,
     peer_pubkey: String,
 ) -> RustPeerManagerCallbacks {
     RustPeerManagerCallbacks {
         new_outbound_connection: Box::new({
             let hooks = hooks.clone();
-            move |peer_pubkey| (hooks.new_outbound_connection)(peer_pubkey)
+            move |peer_pubkey| {
+                hooks.check_lightning_supported()?;
+                (hooks.hooks.new_outbound_connection)(peer_pubkey)
+            }
         }),
         read_event: Box::new({
             let hooks = hooks.clone();
             let peer_pubkey = peer_pubkey.clone();
-            move |payload_hex| (hooks.read_event)(&peer_pubkey, payload_hex)
+            move |payload_hex| {
+                hooks.check_lightning_supported()?;
+                (hooks.hooks.read_event)(&peer_pubkey, payload_hex)
+            }
         }),
         process_events: Box::new({
             let hooks = hooks.clone();
-            move || (hooks.process_events)()
+            move || {
+                hooks.check_lightning_supported()?;
+                (hooks.hooks.process_events)()
+            }
         }),
         socket_disconnected: Box::new({
             let hooks = hooks.clone();
             let peer_pubkey = peer_pubkey.clone();
-            move || (hooks.socket_disconnected)(&peer_pubkey)
+            move || (hooks.hooks.socket_disconnected)(&peer_pubkey)
         }),
         take_outbound_frames: Box::new({
             let hooks = hooks.clone();
             let peer_pubkey = peer_pubkey.clone();
-            move || (hooks.take_outbound_frames)(&peer_pubkey)
+            move || {
+                hooks.check_lightning_supported()?;
+                (hooks.hooks.take_outbound_frames)(&peer_pubkey)
+            }
         }),
-        report_error: Box::new(move |error_message| (hooks.report_error)(error_message)),
+        report_error: Box::new(move |error_message| (hooks.hooks.report_error)(error_message)),
     }
 }
 
@@ -455,6 +493,7 @@ pub struct RlnWasmPeerSession {
     peer_pubkey: String,
     adapter: Rc<dyn PeerManagerAdapter>,
     started: Cell<bool>,
+    active_pump: RefCell<Option<Rc<Cell<bool>>>>,
     read_loop_closure: RefCell<Option<Closure<dyn FnMut(JsValue)>>>,
 }
 
@@ -509,6 +548,7 @@ impl RlnWasmPeerSession {
             Rc::new(RefCell::new(VecDeque::new()));
         let draining = Rc::new(Cell::new(false));
         let disconnected = Rc::new(Cell::new(false));
+        self.active_pump.replace(Some(Rc::clone(&disconnected)));
         let outbound_queue: Rc<RefCell<VecDeque<String>>> = Rc::new(RefCell::new(VecDeque::new()));
         let outbound_flush_scheduled = Rc::new(Cell::new(false));
 
@@ -684,6 +724,9 @@ impl RlnWasmPeerSession {
 
     #[wasm_bindgen(js_name = stop)]
     pub fn stop(&self) {
+        if let Some(disconnected) = self.active_pump.borrow_mut().take() {
+            disconnected.set(true);
+        }
         self.socket.stop_read_loop();
         self.read_loop_closure.replace(None);
         self.started.set(false);
@@ -824,8 +867,88 @@ struct RustPeerManagerState {
 }
 
 #[wasm_bindgen]
+#[derive(Clone)]
 pub struct RlnWasmRustPeerManagerBridge {
     inner: Rc<RefCell<RustPeerManagerState>>,
+    node_hooks: Rc<RefCell<Option<Rc<RegisteredPeerManagerHooks>>>>,
+    node_policy: Rc<RefCell<Option<Rc<dyn Fn() -> Result<(), JsValue>>>>>,
+}
+
+impl RlnWasmRustPeerManagerBridge {
+    pub(crate) fn set_node_policy(&self, policy: Rc<dyn Fn() -> Result<(), JsValue>>) {
+        self.node_policy.replace(Some(policy));
+    }
+
+    pub(crate) fn release_node_hooks(&self) {
+        if let Some(owned) = self.node_hooks.borrow_mut().take() {
+            RLN_LDK_PEER_MANAGER_HOOKS.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if slot
+                    .as_ref()
+                    .is_some_and(|current| Rc::ptr_eq(current, &owned))
+                {
+                    *slot = None;
+                }
+            });
+        }
+    }
+
+    pub(crate) fn install_node_hooks(
+        &self,
+        hooks: RlnLdkPeerManagerHooks,
+        check_lightning_supported: Rc<dyn Fn() -> Result<(), JsValue>>,
+    ) {
+        let registration = Rc::new(RegisteredPeerManagerHooks {
+            hooks: Rc::new(hooks),
+            check_lightning_supported: Some(check_lightning_supported),
+        });
+        self.node_hooks.replace(Some(Rc::clone(&registration)));
+        install_registered_peer_manager_hooks(registration);
+    }
+
+    pub(crate) fn connection_hooks_ready(&self) -> Result<(bool, bool), JsValue> {
+        let available = self.hooks_for_connection()?.is_some();
+        let v2_ready = available
+            && (get_rln_ldk_peer_manager_hooks().is_none() || has_peer_manager_hooks_v2());
+        Ok((available, v2_ready))
+    }
+
+    fn hooks_for_connection(&self) -> Result<Option<Rc<RegisteredPeerManagerHooks>>, JsValue> {
+        if let Some(policy) = self.node_policy.borrow().as_ref() {
+            policy()?;
+            if self.node_hooks.borrow().is_none() {
+                return Err(JsValue::from_str("Lightning runtime is not initialized"));
+            }
+        }
+        let node_hooks = self.node_hooks.borrow().clone();
+        if let Some(node) = node_hooks.as_ref() {
+            node.check_lightning_supported()?;
+        }
+        let Some(global) = get_rln_ldk_peer_manager_hooks() else {
+            // Preserve explicit clear, but dropping another node's global registration
+            // must leave this node's own runtime connected to its bridge.
+            return Ok(
+                if RLN_LDK_PEER_MANAGER_HOOKS_EXPLICITLY_CLEARED.with(|cleared| cleared.get()) {
+                    None
+                } else {
+                    node_hooks
+                },
+            );
+        };
+        let Some(node) = node_hooks else {
+            return Ok(Some(global));
+        };
+        if global.check_lightning_supported.is_some() {
+            // Another node's automatic registration must not select this node's runtime/policy.
+            Ok(Some(node))
+        } else {
+            // Preserve explicit custom callbacks, together with this node's dynamic network guard.
+            Ok(Some(Rc::new(RegisteredPeerManagerHooks {
+                hooks: Rc::clone(&global.hooks),
+                check_lightning_supported: node.check_lightning_supported.clone(),
+            })))
+        }
+    }
 }
 
 #[wasm_bindgen]
@@ -844,6 +967,8 @@ impl RlnWasmRustPeerManagerBridge {
                 initial_outbound_hex,
                 ..Default::default()
             })),
+            node_hooks: Rc::new(RefCell::new(None)),
+            node_policy: Rc::new(RefCell::new(None)),
         })
     }
 
@@ -897,7 +1022,9 @@ impl RlnWasmRustPeerManagerBridge {
         peer_addr: String,
         peer_pubkey: String,
     ) -> Result<RlnWasmPeerSession, JsValue> {
-        if let Some(hooks) = get_rln_ldk_peer_manager_hooks() {
+        if let Some(hooks) = self.hooks_for_connection()? {
+            // Check the configured node before even opening the transport socket.
+            hooks.check_lightning_supported()?;
             let callbacks = callbacks_from_hooks(hooks, peer_pubkey.clone());
             return peer_session_connect_rust_callbacks(
                 proxy_url,
@@ -963,7 +1090,9 @@ impl RlnWasmRustPeerManagerBridge {
         peer_pubkey: String,
         options_js: JsValue,
     ) -> Result<RlnWasmPeerSession, JsValue> {
-        if let Some(hooks) = get_rln_ldk_peer_manager_hooks() {
+        if let Some(hooks) = self.hooks_for_connection()? {
+            // Check the configured node before even opening the transport socket.
+            hooks.check_lightning_supported()?;
             let callbacks = callbacks_from_hooks(hooks, peer_pubkey.clone());
             return peer_session_connect_with_adapter_rust_callbacks(
                 proxy_url,
@@ -1055,6 +1184,7 @@ async fn peer_session_connect_with_adapter(
         peer_pubkey,
         adapter,
         started: Cell::new(false),
+        active_pump: RefCell::new(None),
         read_loop_closure: RefCell::new(None),
     })
 }
@@ -1068,4 +1198,84 @@ async fn peer_session_connect_with_adapter_rust_callbacks(
 ) -> Result<RlnWasmPeerSession, JsValue> {
     let adapter = Rc::new(RustPeerManagerAdapter { callbacks });
     peer_session_connect_with_adapter(proxy_url, peer_addr, peer_pubkey, options_js, adapter).await
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod mainnet_bridge_policy_tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    fn marker_hooks(marker: &'static str) -> RlnLdkPeerManagerHooks {
+        RlnLdkPeerManagerHooks {
+            new_outbound_connection: Rc::new(move |_| Ok(marker.to_string())),
+            read_event: Rc::new(|_, _| Ok(())),
+            process_events: Rc::new(|| Ok(())),
+            socket_disconnected: Rc::new(|_| Ok(())),
+            take_outbound_frames: Rc::new(|_| Ok(Vec::new())),
+            report_error: Rc::new(|_| Ok(())),
+        }
+    }
+
+    fn assert_mainnet_error<T>(result: Result<T, JsValue>) {
+        let Err(error) = result else {
+            panic!("mainnet callback unexpectedly succeeded");
+        };
+        assert_eq!(
+            error.as_string().as_deref(),
+            Some(crate::LIGHTNING_UNSUPPORTED_ON_MAINNET)
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn node_bridge_preserves_custom_hooks_clear_and_dynamic_mainnet_policy() {
+        clear_rln_ldk_peer_manager_hooks();
+        let network = Rc::new(RefCell::new("regtest".to_string()));
+        let bridge = RlnWasmRustPeerManagerBridge::new(None).unwrap();
+        bridge.install_node_hooks(marker_hooks("node"), {
+            let network = Rc::clone(&network);
+            Rc::new(move || crate::check_lightning_supported(&network.borrow()))
+        });
+        let own = callbacks_from_hooks(
+            bridge.hooks_for_connection().unwrap().unwrap(),
+            "peer".to_string(),
+        );
+        assert_eq!((own.new_outbound_connection)("peer").unwrap(), "node");
+
+        install_rln_ldk_peer_manager_hooks(marker_hooks("custom"));
+        // A cloned node bridge is also used by reconnect-manager tasks.
+        let callbacks = callbacks_from_hooks(
+            bridge.clone().hooks_for_connection().unwrap().unwrap(),
+            "peer".to_string(),
+        );
+        assert_eq!(
+            (callbacks.new_outbound_connection)("peer").unwrap(),
+            "custom"
+        );
+        let standalone = RlnWasmRustPeerManagerBridge::new(None).unwrap();
+        let standalone_callbacks = callbacks_from_hooks(
+            standalone.hooks_for_connection().unwrap().unwrap(),
+            "peer".to_string(),
+        );
+
+        // Model the existing bare-node wallet-network adoption after callback capture.
+        *network.borrow_mut() = "mainnet".to_string();
+        assert_mainnet_error(bridge.hooks_for_connection());
+        assert_mainnet_error((callbacks.new_outbound_connection)("peer"));
+        assert_mainnet_error((callbacks.read_event)("00"));
+        assert_mainnet_error((callbacks.process_events)());
+        assert_mainnet_error((callbacks.take_outbound_frames)());
+        (callbacks.socket_disconnected)().unwrap();
+        (callbacks.report_error)("cleanup").unwrap();
+        assert_eq!(
+            (standalone_callbacks.new_outbound_connection)("peer").unwrap(),
+            "custom",
+            "standalone custom callbacks have no configured node policy"
+        );
+
+        clear_rln_ldk_peer_manager_hooks();
+        *network.borrow_mut() = "regtest".to_string();
+        assert!(!has_peer_manager_hooks());
+        assert!(bridge.hooks_for_connection().unwrap().is_none());
+        assert!(standalone.hooks_for_connection().unwrap().is_none());
+    }
 }

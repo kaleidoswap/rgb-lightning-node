@@ -17,22 +17,23 @@ use rgb_lib::{
     bdk_wallet::{KeychainKind, SignOptions},
     bitcoin::psbt::Psbt as BitcoinPsbt,
     wallet::{
-        rust_only::{check_proxy_url, ColoringInfo},
-        AssetCFA, AssetIFA, AssetNIA, AssetUDA, Assets, Balance, BtcBalance, Metadata, Online,
-        OperationResult, ReceiveData, Recipient, RefreshFilter, RefreshResult, RgbWalletOpsOffline,
+        rust_only::{check_proxy_url, ColorPrepareResult, ColoringInfo},
+        AssetCFA, AssetFilter, AssetIFA, AssetNIA, AssetUDA, Assets, Balance, BtcBalance,
+        IfaIssuanceType, Media, Metadata, Online, OperationResult, Outpoint, ReceiveData,
+        Recipient, RefreshFilter, RefreshResult, RefreshedTransfer, RgbWalletOpsOffline,
         RgbWalletOpsOnline, SendBeginResult, SinglesigKeys, SyncOptions,
-        Transaction as RgbLibTransaction, Transfer, TransportEndpoint, Unspent,
+        Transaction as RgbLibTransaction, Transfer, TransferKind, TransportEndpoint, Unspent,
         Wallet as RgbLibWallet,
     },
-    AssetSchema, Assignment, BitcoinNetwork, ContractId, Error as RgbLibError, Fascia, RgbTransfer,
-    RgbTransport, RgbTxid, UpdateRes, WitnessOrd,
+    AssetSchema, Assignment, BitcoinNetwork, ConsignmentExt, ContractId, Error as RgbLibError,
+    Fascia, RgbContract, RgbTransfer, RgbTxid, UpdateRes, WitnessOrd,
 };
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::{error::APIError, utils::UnlockedAppState};
+use crate::{error::APIError, utils::CommonState};
 
 /// When `sign_rgb_psbt` fails, internal mode falls back to the local RGB wallet; external mode does not.
 fn resolve_rgb_psbt_signer_failure(
@@ -111,7 +112,7 @@ pub(crate) fn rgb_signer_descriptors_for_psbt_with_context(
     Ok(descriptors)
 }
 
-impl UnlockedAppState {
+impl CommonState {
     fn rgb_signer_descriptors_for_psbt(
         &self,
         unsigned_psbt: &str,
@@ -129,7 +130,7 @@ impl UnlockedAppState {
         &self,
         asset_id: Option<String>,
         assignment: Assignment,
-        expiration_timestamp: Option<u64>,
+        expiration_timestamp: u64,
         transport_endpoints: Vec<String>,
         min_confirmations: u8,
     ) -> Result<ReceiveData, RgbLibError> {
@@ -219,6 +220,32 @@ impl UnlockedAppState {
         self.rgb_wallet_wrapper.get_asset_metadata(contract_id)
     }
 
+    pub(crate) fn rgb_import_transfer_consignment(
+        &self,
+        consignment: RgbTransfer,
+        offchain_txid: String,
+    ) -> Result<(Metadata, bool), RgbLibError> {
+        let contract_id = consignment.contract_id();
+        let already_imported = match self.rgb_get_asset_metadata(contract_id) {
+            Ok(_) => true,
+            Err(RgbLibError::AssetNotFound { .. }) => false,
+            Err(error) => return Err(error),
+        };
+
+        self.rgb_wallet_wrapper
+            .save_new_asset(consignment, offchain_txid)?;
+        let metadata = self.rgb_get_asset_metadata(contract_id)?;
+        Ok((metadata, already_imported))
+    }
+
+    pub(crate) fn rgb_import_asset_contract(
+        &self,
+        contract: RgbContract,
+    ) -> Result<(Metadata, bool), RgbLibError> {
+        let imported = self.rgb_wallet_wrapper.import_asset_contract(contract)?;
+        Ok((imported.metadata, imported.already_imported))
+    }
+
     pub(crate) fn rgb_get_btc_balance(&self, skip_sync: bool) -> Result<BtcBalance, RgbLibError> {
         self.rgb_wallet_wrapper.get_btc_balance(skip_sync)
     }
@@ -242,6 +269,53 @@ impl UnlockedAppState {
     ) -> PathBuf {
         self.rgb_wallet_wrapper
             .get_send_consignment_path(asset_id, transfer_id)
+    }
+
+    pub(crate) fn rgb_burn(
+        &self,
+        asset_id: String,
+        amount: u64,
+        burn_recipient: Option<Vec<u8>>,
+        fee_rate: u64,
+        min_confirmations: u8,
+    ) -> Result<OperationResult, RgbLibError> {
+        if self.external_signer_mode {
+            // Keep preparation, signing and completion serialized against other wallet operations.
+            // Persist Initiated before asking the signer: an interrupted call must retain its inputs.
+            let wrapper = &self.rgb_wallet_wrapper;
+            let mut wallet = wrapper.get_rgb_wallet();
+            let prepared = wallet.burn_begin(
+                wrapper.online,
+                asset_id,
+                amount,
+                burn_recipient,
+                fee_rate,
+                min_confirmations,
+                false,
+            )?;
+            let mut complete = || {
+                let signed = self.rgb_sign_psbt(prepared.psbt.clone())?;
+                let signed = validate_burn_signed_psbt(&prepared.psbt, &signed)?;
+                wallet.burn_end(wrapper.online, signed)
+            };
+            return complete().map_err(|err| {
+                // Never free the reservation or retry here: the signer or broadcaster may have
+                // completed its work even when its response was lost.
+                RgbLibError::Internal {
+                    details: format!(
+                        "external burn completion failed (batch_transfer_idx={:?}); reconcile the transfer before retrying: {err}",
+                        prepared.batch_transfer_idx,
+                    ),
+                }
+            });
+        }
+        self.rgb_wallet_wrapper.burn(
+            asset_id,
+            amount,
+            burn_recipient,
+            fee_rate,
+            min_confirmations,
+        )
     }
 
     pub(crate) fn rgb_inflate(
@@ -276,6 +350,7 @@ impl UnlockedAppState {
         amounts: Vec<u64>,
         inflation_amounts: Vec<u64>,
         reject_list_url: Option<String>,
+        issuance_type: Option<IfaIssuanceType>,
     ) -> Result<AssetIFA, RgbLibError> {
         self.rgb_wallet_wrapper.issue_asset_ifa(
             ticker,
@@ -284,6 +359,45 @@ impl UnlockedAppState {
             amounts,
             inflation_amounts,
             reject_list_url,
+            issuance_type,
+        )
+    }
+
+    pub(crate) fn rgb_find_link_right_outpoint(
+        &self,
+        contract_id: ContractId,
+    ) -> Result<Option<Outpoint>, RgbLibError> {
+        self.rgb_list_unspents(false, false)?;
+        Ok(self
+            .rgb_get_asset_metadata(contract_id)?
+            .unspent_link_right_outpoint)
+    }
+
+    pub(crate) fn rgb_find_link_transfer(
+        &self,
+        contract_id: ContractId,
+    ) -> Result<Option<Transfer>, RgbLibError> {
+        Ok(self
+            .rgb_list_transfers(AssetFilter::Id(contract_id.to_string()), None)?
+            .into_iter()
+            .find(|transfer| transfer.kind == TransferKind::Link))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn rgb_link_ifa(
+        &self,
+        parent_contract_id: String,
+        child_contract_id: String,
+        link_right_outpoint: Outpoint,
+        fee_rate: u64,
+        min_confirmations: u8,
+    ) -> Result<OperationResult, RgbLibError> {
+        self.rgb_wallet_wrapper.link_ifa(
+            parent_contract_id,
+            child_contract_id,
+            link_right_outpoint,
+            fee_rate,
+            min_confirmations,
         )
     }
 
@@ -324,6 +438,13 @@ impl UnlockedAppState {
         self.rgb_wallet_wrapper.list_assets(filter_asset_schemas)
     }
 
+    pub(crate) fn rgb_list_asset_media(
+        &self,
+        asset_id: String,
+    ) -> Result<HashSet<Media>, RgbLibError> {
+        self.rgb_wallet_wrapper.list_asset_media(asset_id)
+    }
+
     pub(crate) fn rgb_list_transactions(
         &self,
         skip_sync: bool,
@@ -333,16 +454,10 @@ impl UnlockedAppState {
 
     pub(crate) fn rgb_list_transfers(
         &self,
-        asset_id: String,
+        filter: AssetFilter,
+        txid: Option<String>,
     ) -> Result<Vec<Transfer>, RgbLibError> {
-        self.rgb_wallet_wrapper.list_transfers(asset_id)
-    }
-
-    pub(crate) fn rgb_list_transfers_by_txid(
-        &self,
-        txid: String,
-    ) -> Result<Vec<Transfer>, RgbLibError> {
-        self.rgb_wallet_wrapper.list_transfers_by_txid(txid)
+        self.rgb_wallet_wrapper.list_transfers(filter, txid)
     }
 
     pub(crate) fn rgb_list_unspents(
@@ -354,21 +469,21 @@ impl UnlockedAppState {
             .list_unspents(settled_only, skip_sync)
     }
 
-    pub(crate) fn rgb_post_consignment<P: AsRef<Path>>(
+    pub(crate) fn rgb_provide_out_of_band_ack(
         &self,
-        proxy_url: &str,
         recipient_id: String,
-        consignment_path: P,
-        txid: String,
-        vout: Option<u32>,
-    ) -> Result<(), RgbLibError> {
-        self.rgb_wallet_wrapper.post_consignment(
-            proxy_url,
-            recipient_id,
-            consignment_path,
-            txid,
-            vout,
-        )
+    ) -> Result<Option<OperationResult>, RgbLibError> {
+        self.rgb_wallet_wrapper
+            .provide_out_of_band_ack(recipient_id)
+    }
+
+    pub(crate) fn rgb_provide_out_of_band_consignment(
+        &self,
+        consignment_path: String,
+        media_file_paths: Vec<String>,
+    ) -> Result<RefreshResult, RgbLibError> {
+        self.rgb_wallet_wrapper
+            .provide_out_of_band_consignment(consignment_path, media_file_paths)
     }
 
     pub(crate) fn rgb_refresh(
@@ -377,6 +492,22 @@ impl UnlockedAppState {
         filter: Vec<RefreshFilter>,
         skip_sync: bool,
     ) -> Result<RefreshResult, RgbLibError> {
+        if self.rgb_wallet_wrapper.bitcoin_network() != BitcoinNetwork::Mainnet {
+            crate::rgb_sweep::reconcile_prepared_sweeps(
+                self.kv_store.as_ref(),
+                |txid| {
+                    self.rgb_wallet_wrapper
+                        .get_tx_height(txid)
+                        .map(|height| height.is_some())
+                        .map_err(|e| e.to_string())
+                },
+                |idx| {
+                    self.rgb_wallet_wrapper
+                        .consume_transfer_fascia(idx)
+                        .map_err(|e| e.to_string())
+                },
+            );
+        }
         self.rgb_wallet_wrapper.refresh(asset_id, filter, skip_sync)
     }
 
@@ -395,7 +526,7 @@ impl UnlockedAppState {
         donation: bool,
         fee_rate: u64,
         min_confirmations: u8,
-        expiration_timestamp: Option<u64>,
+        expiration_timestamp: u64,
     ) -> Result<OperationResult, RgbLibError> {
         self.rgb_wallet_wrapper.send(
             recipient_map,
@@ -413,7 +544,7 @@ impl UnlockedAppState {
         donation: bool,
         fee_rate: u64,
         min_confirmations: u8,
-        expiration_timestamp: Option<u64>,
+        expiration_timestamp: u64,
         dry_run: bool,
         lock_time: Option<u32>,
     ) -> Result<SendBeginResult, RgbLibError> {
@@ -457,6 +588,15 @@ impl UnlockedAppState {
         self.rgb_wallet_wrapper.send_end(signed_psbt)
     }
 
+    /// Broadcast + DB bookkeeping only, without generating or posting consignments. Only for
+    /// channel funding, where the consignment has already been sent to the peer over p2p.
+    pub(crate) fn rgb_send_end_db_update_only(
+        &self,
+        signed_psbt: String,
+    ) -> Result<OperationResult, RgbLibError> {
+        self.rgb_wallet_wrapper.send_end_db_update_only(signed_psbt)
+    }
+
     pub(crate) fn rgb_sign_psbt(&self, unsigned_psbt: String) -> Result<String, RgbLibError> {
         let signer_descriptors = if self.external_signer_mode {
             self.rgb_signer_descriptors_for_psbt(unsigned_psbt.as_str())?
@@ -495,7 +635,7 @@ impl UnlockedAppState {
         &self,
         asset_id: Option<String>,
         assignment: Assignment,
-        expiration_timestamp: Option<u64>,
+        expiration_timestamp: u64,
         transport_endpoints: Vec<String>,
         min_confirmations: u8,
     ) -> Result<ReceiveData, RgbLibError> {
@@ -507,6 +647,44 @@ impl UnlockedAppState {
             min_confirmations,
         )
     }
+}
+
+/// Accept only final signatures from the signer, retaining the prepared transaction and RGB data.
+fn validate_burn_signed_psbt(unsigned: &str, signed: &str) -> Result<String, RgbLibError> {
+    let invalid = |details: &str| RgbLibError::Internal {
+        details: format!("invalid external burn PSBT: {details}"),
+    };
+    let mut prepared = Psbt::from_str(unsigned).map_err(|_| invalid("invalid prepared PSBT"))?;
+    let signed = Psbt::from_str(signed).map_err(|_| invalid("signer returned malformed PSBT"))?;
+    if prepared.unsigned_tx != signed.unsigned_tx {
+        return Err(invalid("signer changed the prepared transaction"));
+    }
+    if prepared.inputs.is_empty() || prepared.inputs.len() != signed.inputs.len() {
+        return Err(invalid("signer returned an invalid input count"));
+    }
+    for (input, signature) in prepared.inputs.iter_mut().zip(signed.inputs) {
+        let has_witness = signature
+            .final_script_witness
+            .as_ref()
+            .is_some_and(|s| !s.is_empty());
+        let has_script_sig = signature
+            .final_script_sig
+            .as_ref()
+            .is_some_and(|s| !s.is_empty());
+        if !has_witness && !has_script_sig {
+            return Err(invalid("signer did not finalize every input"));
+        }
+        input.final_script_sig = signature.final_script_sig;
+        input.final_script_witness = signature.final_script_witness;
+    }
+    let tx = prepared
+        .clone()
+        .extract_tx()
+        .map_err(|_| invalid("invalid finalized transaction"))?;
+    if tx.compute_txid() != prepared.unsigned_tx.compute_txid() {
+        return Err(invalid("finalization changed the prepared transaction ID"));
+    }
+    Ok(prepared.to_string())
 }
 
 pub(crate) struct RgbLibWalletWrapper {
@@ -542,7 +720,7 @@ impl RgbLibWalletWrapper {
     }
 
     /// Returns the wallet's configured `VssBackupClient`, if any. This is the
-    /// client constructed by `configure_vss_backup` in `start_ldk`; callers
+    /// client constructed by `configure_vss_backup` during common wallet startup; callers
     /// (e.g. the manual `/vssbackup` route) reuse it instead of building a
     /// duplicate with the same configuration.
     #[cfg(feature = "vss")]
@@ -564,7 +742,7 @@ impl RgbLibWalletWrapper {
         &self,
         asset_id: Option<String>,
         assignment: Assignment,
-        expiration_timestamp: Option<u64>,
+        expiration_timestamp: u64,
         transport_endpoints: Vec<String>,
         min_confirmations: u8,
     ) -> Result<ReceiveData, RgbLibError> {
@@ -585,13 +763,21 @@ impl RgbLibWalletWrapper {
         self.get_rgb_wallet().consume_fascia(fascia, witness_ord)
     }
 
-    pub(crate) fn color_psbt_and_consume(
+    pub(crate) fn color_psbt_and_prepare_consume(
         &self,
         psbt_to_color: &mut BitcoinPsbt,
         coloring_info: ColoringInfo,
-    ) -> Result<Vec<RgbTransfer>, RgbLibError> {
+    ) -> Result<ColorPrepareResult, RgbLibError> {
         self.get_rgb_wallet()
-            .color_psbt_and_consume(psbt_to_color, coloring_info)
+            .color_psbt_and_prepare_consume(psbt_to_color, coloring_info, 0, None)
+    }
+
+    pub(crate) fn consume_transfer_fascia(
+        &self,
+        batch_transfer_idx: i32,
+    ) -> Result<(), RgbLibError> {
+        self.get_rgb_wallet()
+            .consume_transfer_fascia(self.online, batch_transfer_idx)
     }
 
     pub(crate) fn create_consigments(&self, psbt: String) -> Result<(), RgbLibError> {
@@ -706,7 +892,25 @@ impl RgbLibWalletWrapper {
     }
 
     pub(crate) fn get_tx_height(&self, txid: String) -> Result<Option<u32>, RgbLibError> {
-        self.get_rgb_wallet().get_tx_height(txid)
+        self.get_rgb_wallet().get_tx_height(self.online, txid)
+    }
+
+    pub(crate) fn burn(
+        &self,
+        asset_id: String,
+        amount: u64,
+        burn_recipient: Option<Vec<u8>>,
+        fee_rate: u64,
+        min_confirmations: u8,
+    ) -> Result<OperationResult, RgbLibError> {
+        self.get_rgb_wallet().burn(
+            self.online,
+            asset_id,
+            amount,
+            burn_recipient,
+            fee_rate,
+            min_confirmations,
+        )
     }
 
     pub(crate) fn inflate(
@@ -746,6 +950,7 @@ impl RgbLibWalletWrapper {
         amounts: Vec<u64>,
         inflation_amounts: Vec<u64>,
         reject_list_url: Option<String>,
+        issuance_type: Option<IfaIssuanceType>,
     ) -> Result<AssetIFA, RgbLibError> {
         self.get_rgb_wallet().issue_asset_ifa(
             ticker,
@@ -754,6 +959,26 @@ impl RgbLibWalletWrapper {
             amounts,
             inflation_amounts,
             reject_list_url,
+            issuance_type,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn link_ifa(
+        &self,
+        parent_contract_id: String,
+        child_contract_id: String,
+        link_right_outpoint: Outpoint,
+        fee_rate: u64,
+        min_confirmations: u8,
+    ) -> Result<OperationResult, RgbLibError> {
+        self.get_rgb_wallet().link_ifa(
+            self.online,
+            parent_contract_id,
+            child_contract_id,
+            link_right_outpoint,
+            fee_rate,
+            min_confirmations,
         )
     }
 
@@ -794,6 +1019,10 @@ impl RgbLibWalletWrapper {
         self.get_rgb_wallet().list_assets(filter_asset_schemas)
     }
 
+    pub(crate) fn list_asset_media(&self, asset_id: String) -> Result<HashSet<Media>, RgbLibError> {
+        self.get_rgb_wallet().list_asset_media(asset_id)
+    }
+
     pub(crate) fn list_transactions(
         &self,
         skip_sync: bool,
@@ -802,15 +1031,12 @@ impl RgbLibWalletWrapper {
         self.get_rgb_wallet().list_transactions(online, skip_sync)
     }
 
-    pub(crate) fn list_transfers(&self, asset_id: String) -> Result<Vec<Transfer>, RgbLibError> {
-        self.get_rgb_wallet().list_transfers(Some(asset_id))
-    }
-
-    pub(crate) fn list_transfers_by_txid(
+    pub(crate) fn list_transfers(
         &self,
-        txid: String,
+        filter: AssetFilter,
+        txid: Option<String>,
     ) -> Result<Vec<Transfer>, RgbLibError> {
-        self.get_rgb_wallet().list_transfers_by_txid(txid)
+        self.get_rgb_wallet().list_transfers(filter, txid)
     }
 
     pub(crate) fn list_unspents(
@@ -823,20 +1049,39 @@ impl RgbLibWalletWrapper {
             .list_unspents(online, settled_only, skip_sync)
     }
 
-    pub(crate) fn post_consignment<P: AsRef<Path>>(
+    pub(crate) fn accept_transfer_consignment(
         &self,
-        proxy_url: &str,
-        recipient_id: String,
-        consignment_path: P,
+        consignment_path: PathBuf,
         txid: String,
-        vout: Option<u32>,
-    ) -> Result<(), RgbLibError> {
-        self.get_rgb_wallet().post_consignment(
-            proxy_url,
-            recipient_id,
+        vout: u32,
+        blinding: u64,
+    ) -> Result<(RgbTransfer, Vec<Assignment>, HashSet<String>), RgbLibError> {
+        self.get_rgb_wallet().accept_transfer_consignment(
+            self.online,
             consignment_path,
             txid,
             vout,
+            blinding,
+        )
+    }
+
+    pub(crate) fn provide_out_of_band_ack(
+        &self,
+        recipient_id: String,
+    ) -> Result<Option<OperationResult>, RgbLibError> {
+        self.get_rgb_wallet()
+            .provide_out_of_band_ack(self.online, recipient_id)
+    }
+
+    pub(crate) fn provide_out_of_band_consignment(
+        &self,
+        consignment_path: String,
+        media_file_paths: Vec<String>,
+    ) -> Result<HashMap<i32, RefreshedTransfer>, RgbLibError> {
+        self.get_rgb_wallet().provide_out_of_band_consignment(
+            self.online,
+            consignment_path,
+            media_file_paths,
         )
     }
 
@@ -856,7 +1101,14 @@ impl RgbLibWalletWrapper {
         offchain_txid: String,
     ) -> Result<(), RgbLibError> {
         self.get_rgb_wallet()
-            .save_new_asset(consignment, offchain_txid)
+            .save_new_asset(self.online, consignment, offchain_txid)
+    }
+
+    pub(crate) fn import_asset_contract(
+        &self,
+        contract: RgbContract,
+    ) -> Result<rgb_lib::wallet::rust_only::ImportAssetContractResult, RgbLibError> {
+        self.get_rgb_wallet().import_asset_contract(contract)
     }
 
     pub(crate) fn send(
@@ -865,7 +1117,7 @@ impl RgbLibWalletWrapper {
         donation: bool,
         fee_rate: u64,
         min_confirmations: u8,
-        expiration_timestamp: Option<u64>,
+        expiration_timestamp: u64,
     ) -> Result<OperationResult, RgbLibError> {
         self.get_rgb_wallet().send(
             self.online,
@@ -885,7 +1137,7 @@ impl RgbLibWalletWrapper {
         donation: bool,
         fee_rate: u64,
         min_confirmations: u8,
-        expiration_timestamp: Option<u64>,
+        expiration_timestamp: u64,
         dry_run: bool,
         lock_time: Option<u32>,
     ) -> Result<SendBeginResult, RgbLibError> {
@@ -940,6 +1192,14 @@ impl RgbLibWalletWrapper {
         self.get_rgb_wallet().send_end(self.online, signed_psbt)
     }
 
+    pub(crate) fn send_end_db_update_only(
+        &self,
+        signed_psbt: String,
+    ) -> Result<OperationResult, RgbLibError> {
+        self.get_rgb_wallet()
+            .send_end_db_update_only(self.online, signed_psbt)
+    }
+
     pub(crate) fn sign_psbt(&self, unsigned_psbt: String) -> Result<String, RgbLibError> {
         self.get_rgb_wallet().sign_psbt(unsigned_psbt, None)
     }
@@ -954,7 +1214,7 @@ impl RgbLibWalletWrapper {
         force_witnesses: Vec<RgbTxid>,
     ) -> Result<UpdateRes, RgbLibError> {
         self.get_rgb_wallet()
-            .update_witnesses(after_height, force_witnesses)
+            .update_witnesses(self.online, after_height, force_witnesses)
     }
 
     pub(crate) fn upsert_witness(
@@ -970,7 +1230,7 @@ impl RgbLibWalletWrapper {
         &self,
         asset_id: Option<String>,
         assignment: Assignment,
-        expiration_timestamp: Option<u64>,
+        expiration_timestamp: u64,
         transport_endpoints: Vec<String>,
         min_confirmations: u8,
     ) -> Result<ReceiveData, RgbLibError> {
@@ -1058,24 +1318,35 @@ impl WalletSource for RgbBumpWalletSource {
 impl ChangeDestinationSource for RgbLibWalletWrapper {
     fn get_change_destination_script<'a>(&'a self) -> AsyncResult<'a, ScriptBuf, ()> {
         Box::pin(async move {
-            Ok(Address::from_str(&self.get_address().unwrap())
-                .unwrap()
-                .assume_checked()
-                .script_pubkey())
+            let address = self.get_address().map_err(|e| {
+                tracing::error!("cannot get a change address to sweep outputs, will retry: {e}");
+            })?;
+            let parsed = Address::from_str(&address).map_err(|e| {
+                tracing::error!(error = %e, "invalid change address to sweep outputs");
+            })?;
+            Ok(parsed.assume_checked().script_pubkey())
         })
     }
 }
 
+// Runs in the event handler: failures must return Err(()) (retried later), never panic.
 impl WalletSource for RgbLibWalletWrapper {
     fn list_confirmed_utxos<'a>(&'a self) -> AsyncResult<'a, Vec<Utxo>, ()> {
         Box::pin(async move {
-            let network =
-                Network::from_str(&self.bitcoin_network().to_string().to_lowercase()).unwrap();
-            let mut wallet = self.get_rgb_wallet();
-            Ok(wallet.list_unspents_vanilla(self.online, 1, false).unwrap().iter().filter_map(|u| {
+            let network = Network::from(self.bitcoin_network());
+            let unspents = self
+                .get_rgb_wallet()
+                .list_unspents_vanilla(self.online, 1, false)
+                .map_err(|e| {
+                    tracing::error!(error = %e, "failed to list unspents for fee bumping");
+                })?;
+            Ok(unspents.iter().filter_map(|u| {
                 let script = u.txout.script_pubkey.clone().into_boxed_script();
-                let address = Address::from_script(&script, network).unwrap();
-                let outpoint = OutPoint::from_str(&u.outpoint.to_string()).unwrap();
+                let address = Address::from_script(&script, network).ok()?;
+                // a format mismatch between rgb-lib and bitcoin would be a bug, not a runtime
+                // condition, and skipping the utxo would hide it
+                let outpoint = OutPoint::from_str(&u.outpoint.to_string())
+                    .expect("rgb-lib formats outpoints as txid:vout");
                 let value = u.txout.value;
                 match address.witness_program() {
                     Some(prog) if prog.is_p2wpkh() => {
@@ -1107,12 +1378,13 @@ impl WalletSource for RgbLibWalletWrapper {
 
     fn get_change_script<'a>(&'a self) -> AsyncResult<'a, ScriptBuf, ()> {
         Box::pin(async move {
-            Ok(
-                Address::from_str(&self.get_rgb_wallet().get_address().unwrap())
-                    .unwrap()
-                    .assume_checked()
-                    .script_pubkey(),
-            )
+            let address = self.get_rgb_wallet().get_address().map_err(|e| {
+                tracing::error!(error = %e, "failed to get change address for fee bumping");
+            })?;
+            let parsed = Address::from_str(&address).map_err(|e| {
+                tracing::error!(error = %e, "invalid change address for fee bumping");
+            })?;
+            Ok(parsed.assume_checked().script_pubkey())
         })
     }
 
@@ -1125,16 +1397,21 @@ impl WalletSource for RgbLibWalletWrapper {
             let signed = self
                 .get_rgb_wallet()
                 .sign_psbt(tx.to_string(), Some(sign_options))
-                .unwrap();
-            Ok(Psbt::from_str(&signed).unwrap().extract_tx().unwrap())
+                .map_err(|e| {
+                    tracing::error!(error = %e, "failed to sign fee-bump PSBT");
+                })?;
+            let psbt = Psbt::from_str(&signed).map_err(|e| {
+                tracing::error!(error = %e, "failed to parse signed fee-bump PSBT");
+            })?;
+            psbt.extract_tx().map_err(|e| {
+                tracing::error!(error = %e, "failed to extract fee-bump transaction");
+            })
         })
     }
 }
 
 pub(crate) async fn check_rgb_proxy_endpoint(proxy_endpoint: &str) -> Result<(), APIError> {
-    let rgb_transport =
-        RgbTransport::from_str(proxy_endpoint).map_err(|_| APIError::InvalidProxyEndpoint)?;
-    let proxy_url = TransportEndpoint::try_from(rgb_transport)?.endpoint;
+    let proxy_url = TransportEndpoint::new(proxy_endpoint.to_string())?.endpoint;
     tokio::task::spawn_blocking(move || check_proxy_url(&proxy_url))
         .await
         .unwrap()?;
@@ -1150,6 +1427,133 @@ pub(crate) fn get_rgb_channel_info_optional(
     kv_store
         .read_rgb_channel_info(&channel_id_str, pending)
         .ok()
+}
+
+#[cfg(test)]
+mod burn_psbt_tests {
+    use super::*;
+    use bitcoin::psbt::raw::ProprietaryKey;
+    use bitcoin::{absolute, transaction, Amount, Sequence, TxIn, Witness};
+
+    fn fixture() -> Psbt {
+        let mut psbt = Psbt::from_unsigned_tx(Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(bitcoin::Txid::from_byte_array([1; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(9000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        })
+        .unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(10000),
+            script_pubkey: ScriptBuf::new(),
+        });
+        psbt.proprietary.insert(
+            ProprietaryKey {
+                prefix: b"RGB".to_vec(),
+                subtype: 1,
+                key: vec![],
+            },
+            vec![42],
+        );
+        psbt
+    }
+
+    fn finalized(psbt: &Psbt) -> Psbt {
+        let mut signed = psbt.clone();
+        signed.inputs[0].final_script_witness = Some(Witness::from_slice(&[vec![1; 64]]));
+        signed
+    }
+
+    #[test]
+    fn burn_retains_prepared_metadata_and_only_accepts_signatures() {
+        let prepared = fixture();
+        let mut signed = finalized(&prepared);
+        signed.proprietary.clear();
+        signed.inputs[0].witness_utxo.as_mut().unwrap().value = Amount::from_sat(1);
+        signed.outputs[0].proprietary.insert(
+            ProprietaryKey {
+                prefix: b"unexpected".to_vec(),
+                subtype: 1,
+                key: vec![],
+            },
+            vec![99],
+        );
+        let result = validate_burn_signed_psbt(&prepared.to_string(), &signed.to_string()).unwrap();
+        let result = Psbt::from_str(&result).unwrap();
+        let mut expected = prepared;
+        expected.inputs[0].final_script_witness = signed.inputs[0].final_script_witness.clone();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn burn_rejects_transaction_mutations() {
+        let prepared = fixture();
+        let mutations: [fn(&mut Transaction); 6] = [
+            |tx| tx.output[0].value = Amount::from_sat(1),
+            |tx| tx.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x51]),
+            |tx| tx.input[0].previous_output.vout = 1,
+            |tx| tx.input[0].sequence = Sequence::MAX,
+            |tx| tx.lock_time = absolute::LockTime::from_consensus(1),
+            |tx| tx.version = transaction::Version::ONE,
+        ];
+        for mutate in mutations {
+            let mut signed = finalized(&prepared);
+            mutate(&mut signed.unsigned_tx);
+            let err =
+                validate_burn_signed_psbt(&prepared.to_string(), &signed.to_string()).unwrap_err();
+            assert!(err.to_string().contains("changed the prepared transaction"));
+        }
+    }
+
+    #[test]
+    fn burn_rejects_unfinalized_and_empty_witnesses() {
+        let prepared = fixture();
+        for witness in [None, Some(Witness::new())] {
+            let mut signed = prepared.clone();
+            signed.inputs[0].final_script_witness = witness;
+            let err =
+                validate_burn_signed_psbt(&prepared.to_string(), &signed.to_string()).unwrap_err();
+            assert!(err.to_string().contains("did not finalize every input"));
+        }
+    }
+
+    #[test]
+    fn burn_requires_every_input_to_be_finalized() {
+        let mut prepared = fixture();
+        let mut second = prepared.unsigned_tx.input[0].clone();
+        second.previous_output.vout = 1;
+        prepared.unsigned_tx.input.push(second);
+        prepared.inputs.push(prepared.inputs[0].clone());
+        let signed = finalized(&prepared);
+        let err =
+            validate_burn_signed_psbt(&prepared.to_string(), &signed.to_string()).unwrap_err();
+        assert!(err.to_string().contains("did not finalize every input"));
+    }
+
+    #[test]
+    fn burn_rejects_malformed_psbts() {
+        let prepared = fixture().to_string();
+        assert!(validate_burn_signed_psbt(&prepared, "not a psbt").is_err());
+        assert!(validate_burn_signed_psbt("not a psbt", &prepared).is_err());
+    }
+
+    #[test]
+    fn burn_rejects_final_script_sig_that_changes_txid() {
+        let prepared = fixture();
+        let mut signed = finalized(&prepared);
+        signed.inputs[0].final_script_sig = Some(ScriptBuf::from_bytes(vec![0x51]));
+        let err =
+            validate_burn_signed_psbt(&prepared.to_string(), &signed.to_string()).unwrap_err();
+        assert!(err.to_string().contains("finalization changed"));
+    }
 }
 
 #[cfg(test)]
@@ -1191,5 +1595,58 @@ mod rgb_psbt_signer_failure_tests {
             "{msg}"
         );
         assert!(msg.contains("signer offline"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod wallet_source_tests {
+    use super::*;
+    use rgb_lib::keys::{generate_keys, WitnessVersion};
+    use rgb_lib::wallet::{DatabaseType, WalletData};
+
+    #[test]
+    fn bitcoin_network_conversion_covers_all_variants() {
+        for (rgb_net, expected) in [
+            (BitcoinNetwork::Mainnet, Network::Bitcoin),
+            (BitcoinNetwork::Testnet, Network::Testnet),
+            (BitcoinNetwork::Testnet4, Network::Testnet4),
+            (BitcoinNetwork::Signet, Network::Signet),
+            (BitcoinNetwork::Regtest, Network::Regtest),
+            (BitcoinNetwork::SignetCustom, Network::Signet),
+        ] {
+            assert_eq!(Network::from(rgb_net), expected, "converting {rgb_net:?}");
+        }
+    }
+
+    fn signetcustom_wallet_source() -> RgbLibWalletWrapper {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let keys = generate_keys(BitcoinNetwork::SignetCustom, WitnessVersion::Taproot);
+        let wallet = RgbLibWallet::new(
+            WalletData {
+                data_dir: tmp.keep().display().to_string(),
+                bitcoin_network: BitcoinNetwork::SignetCustom,
+                database_type: DatabaseType::Sqlite,
+                max_allocations_per_utxo: 1,
+                supported_schemas: vec![AssetSchema::Nia],
+                reuse_addresses: false,
+            },
+            SinglesigKeys {
+                account_xpub_vanilla: keys.account_xpub_vanilla,
+                account_xpub_colored: keys.account_xpub_colored,
+                vanilla_keychain: None,
+                master_fingerprint: keys.master_fingerprint,
+                mnemonic: Some(keys.mnemonic),
+                witness_version: WitnessVersion::Taproot,
+            },
+        )
+        .expect("signetcustom wallet");
+        RgbLibWalletWrapper::new(Arc::new(Mutex::new(wallet)), Online { id: 0 })
+    }
+
+    #[tokio::test]
+    async fn wallet_source_does_not_panic_on_signetcustom() {
+        let wrapper = signetcustom_wallet_source();
+        let _ = wrapper.list_confirmed_utxos().await;
+        let _ = wrapper.get_change_script().await;
     }
 }

@@ -22,6 +22,7 @@ import org.utexo.rgblightningnode.SdkCloseChannelRequest
 import org.utexo.rgblightningnode.SdkCreateUtxosRequest
 import org.utexo.rgblightningnode.SdkInitRequest
 import org.utexo.rgblightningnode.SdkIssueAssetNiaRequest
+import org.utexo.rgblightningnode.SdkLdkChainSync
 import org.utexo.rgblightningnode.SdkNode
 import org.utexo.rgblightningnode.SdkOpenChannelRequest
 import org.utexo.rgblightningnode.SdkRefreshTransfersRequest
@@ -113,10 +114,12 @@ class RestartTest {
 
     private fun unlockRequest(password: String) = SdkUnlockRequest(
         password = password,
-        bitcoindRpcUsername = bitcoindUser,
-        bitcoindRpcPassword = bitcoindPass,
-        bitcoindRpcHost = bitcoindHost,
-        bitcoindRpcPort = bitcoindPort.toUShort(),
+        ldkChainSync = SdkLdkChainSync.BlockSync(
+            bitcoindRpcUsername = bitcoindUser,
+            bitcoindRpcPassword = bitcoindPass,
+            bitcoindRpcHost = bitcoindHost,
+            bitcoindRpcPort = bitcoindPort.toUShort(),
+        ),
         indexerUrl = "$bitcoindHost:50001",
         proxyEndpoint = proxyEndpoint,
         announceAddresses = listOf(),
@@ -154,7 +157,8 @@ class RestartTest {
             SdkCreateUtxosRequest(
                 upTo = false,
                 num = utxosNum,
-                size = null,
+                // explicit size keeps fixture balances independent of the default
+                size = 32_000u,
                 feeRate = utxosFeeRate,
                 skipSync = false,
             )
@@ -216,7 +220,7 @@ class RestartTest {
         val deadline = System.currentTimeMillis() + timeoutSec * 1_000L
         while (System.currentTimeMillis() < deadline) {
             node.sync()
-            val tx = node.listTransactions(false).firstOrNull { it.txid == txid }
+            val tx = node.listTransactions(false, null).firstOrNull { it.txid == txid }
             if (tx != null && tx.confirmationTime != null) {
                 log("funding tx confirmed in block: $txid")
                 return

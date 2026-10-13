@@ -14,6 +14,7 @@ import org.utexo.rgblightningnode.SdkCreateUtxosRequest
 import org.utexo.rgblightningnode.SdkInitRequest
 import org.utexo.rgblightningnode.SdkIssueAssetNiaRequest
 import org.utexo.rgblightningnode.SdkKeysendRequest
+import org.utexo.rgblightningnode.SdkLdkChainSync
 import org.utexo.rgblightningnode.SdkNode
 import org.utexo.rgblightningnode.SdkOpenChannelRequest
 import org.utexo.rgblightningnode.SdkRefreshTransfersRequest
@@ -114,10 +115,12 @@ private fun makeNode(storageDir: Path, daemonPort: UShort, peerPort: UShort): Sd
 private fun unlockRequest(password: String): SdkUnlockRequest {
     return SdkUnlockRequest(
         password = password,
-        bitcoindRpcUsername = "user",
-        bitcoindRpcPassword = "password",
-        bitcoindRpcHost = "localhost",
-        bitcoindRpcPort = 18443u,
+        ldkChainSync = SdkLdkChainSync.BlockSync(
+            bitcoindRpcUsername = "user",
+            bitcoindRpcPassword = "password",
+            bitcoindRpcHost = "localhost",
+            bitcoindRpcPort = 18443u,
+        ),
         indexerUrl = "127.0.0.1:50001",
         proxyEndpoint = PROXY_ENDPOINT_LOCAL,
         announceAddresses = emptyList(),
@@ -268,7 +271,7 @@ private fun mineUntilTxConfirmed(
     val deadline = System.currentTimeMillis() + timeoutSec * 1000L
     while (System.currentTimeMillis() < deadline) {
         node.sync()
-        val tx = node.listTransactions(false).firstOrNull { it.txid == txid }
+        val tx = node.listTransactions(false, null).firstOrNull { it.txid == txid }
         if (tx != null && tx.confirmationTime != null) {
             println("funding tx confirmed in block: $txid")
             return

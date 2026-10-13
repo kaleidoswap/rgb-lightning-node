@@ -4,7 +4,7 @@ pub(crate) use rgb_lightning_node::{
     AssetBalanceInfo, AssetRecipients, AssignmentKind, Channel, ContractId, HtlcStatus,
     InvoiceStatus, LnInvoiceRequest, Payment, PaymentHash, RecipientId, RgbRecipient,
     SdkCloseChannelRequest, SdkCreateUtxosRequest, SdkExternalSignerBootstrap, SdkInitRequest,
-    SdkIssueAssetCfaRequest, SdkIssueAssetNiaRequest, SdkKeysendRequest, SdkNode,
+    SdkIssueAssetCfaRequest, SdkIssueAssetNiaRequest, SdkKeysendRequest, SdkLdkChainSync, SdkNode,
     SdkOpenChannelRequest, SdkRefreshTransfersRequest, SdkRgbInvoiceRequest, SdkSendBtcRequest,
     SdkSendPaymentRequest, SdkUnlockRequest, SdkVssClearFenceRequest, SendRgbRequest,
     TransactionType, TransportEndpoint, WitnessData,
@@ -27,8 +27,9 @@ pub(crate) const OPEN_CHANNEL_CAPACITY_SAT: u64 = 100_000;
 pub(crate) const OPEN_CHANNEL_CONFIRM_BLOCKS: u32 = 6;
 pub(crate) const OPEN_CHANNEL_ASSET_AMOUNT: u64 = 600;
 pub(crate) const OPEN_CHANNEL_PUSH_MSAT: u64 = 3_500_000;
+// keep in sync with core_types::HTLC_MIN_MSAT
 pub(crate) const HTLC_MIN_MSAT: u64 = 3_000_000;
-pub(crate) const PAYMENT_MSAT: u64 = HTLC_MIN_MSAT;
+pub(crate) const PAYMENT_MSAT: u64 = 3_000_000;
 pub(crate) const LIQUIDITY_KEYSEND_MSAT: u64 = 10_000_000;
 pub(crate) const CREATE_UTXOS_NUM: u8 = 10;
 pub(crate) const CREATE_UTXOS_FEE_RATE: u64 = 7;
@@ -246,6 +247,63 @@ pub(crate) fn make_node_with_vss(
     )
 }
 
+/// Like [`make_node_with_vss`] but with `--vss-allow-empty-restore`: the
+/// operator's escape hatch for restores refused as inconsistent.
+#[allow(dead_code)] // used by VSS-only tests
+pub(crate) fn make_node_with_vss_allow_empty(
+    storage_dir_path: &Path,
+    daemon_listening_port: u16,
+    ldk_peer_listening_port: u16,
+    vss_url: &str,
+) -> SdkNode {
+    fs::create_dir_all(storage_dir_path).expect("create storage dir");
+    SdkNode::create(SdkInitRequest {
+        storage_dir_path: storage_dir_path.display().to_string(),
+        daemon_listening_port,
+        ldk_peer_listening_port,
+        network: "regtest".to_string(),
+        max_media_upload_size_mb: 20,
+        enable_virtual_channels_v0: Some(false),
+        virtual_peer_pubkeys: None,
+        lsp_base_url: None,
+        lsp_bearer_token: None,
+        vss_url: Some(vss_url.to_string()),
+        vss_allow_http: true,
+        vss_allow_empty_restore: true,
+        reuse_addresses: false,
+    })
+    .expect("create SDK node")
+}
+
+/// Like [`make_node`], but with trusted virtual channels (v0) enabled. `virtual_peer_pubkeys`
+/// is the acceptor-side allowlist: inbound `trusted_no_broadcast` opens are only accepted from
+/// these peers. Openers just need the feature enabled (pass `None`).
+#[allow(dead_code)] // used by the external-signer virtual-channel restart test
+pub(crate) fn make_node_with_virtual(
+    storage_dir_path: &Path,
+    daemon_listening_port: u16,
+    ldk_peer_listening_port: u16,
+    virtual_peer_pubkeys: Option<Vec<bitcoin::secp256k1::PublicKey>>,
+) -> SdkNode {
+    fs::create_dir_all(storage_dir_path).expect("create storage dir");
+    SdkNode::create(SdkInitRequest {
+        storage_dir_path: storage_dir_path.display().to_string(),
+        daemon_listening_port,
+        ldk_peer_listening_port,
+        network: "regtest".to_string(),
+        max_media_upload_size_mb: 20,
+        enable_virtual_channels_v0: Some(true),
+        virtual_peer_pubkeys,
+        lsp_base_url: None,
+        lsp_bearer_token: None,
+        vss_url: None,
+        vss_allow_http: true,
+        vss_allow_empty_restore: false,
+        reuse_addresses: false,
+    })
+    .expect("create SDK node")
+}
+
 fn make_node_inner(
     storage_dir_path: &Path,
     daemon_listening_port: u16,
@@ -274,11 +332,14 @@ fn make_node_inner(
 pub(crate) fn unlock_request(password: &str) -> SdkUnlockRequest {
     SdkUnlockRequest {
         password: password.to_string(),
-        bitcoind_rpc_username: Some("user".to_string()),
-        bitcoind_rpc_password: Some("password".to_string()),
-        bitcoind_rpc_host: Some("localhost".to_string()),
-        bitcoind_rpc_port: Some(18443),
+        ldk_chain_sync: SdkLdkChainSync::BlockSync {
+            bitcoind_rpc_username: "user".to_string(),
+            bitcoind_rpc_password: "password".to_string(),
+            bitcoind_rpc_host: "localhost".to_string(),
+            bitcoind_rpc_port: 18443,
+        },
         indexer_url: Some("127.0.0.1:50001".to_string()),
+        eth_rpc_url: None,
         proxy_endpoint: Some(PROXY_ENDPOINT_LOCAL.to_string()),
         announce_addresses: vec![],
         announce_alias: Some("RLN_alias".to_string()),
@@ -321,7 +382,8 @@ pub(crate) fn fund_and_create_utxos(node: &SdkNode, node_name: &str) {
     node.createutxos(SdkCreateUtxosRequest {
         up_to: false,
         num: Some(CREATE_UTXOS_NUM),
-        size: None,
+        // explicit size keeps fixture balances independent of the default
+        size: Some(32_000),
         fee_rate: CREATE_UTXOS_FEE_RATE,
         skip_sync: false,
     })

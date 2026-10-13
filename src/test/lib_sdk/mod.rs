@@ -7,6 +7,8 @@ mod close_coop_other_side;
 mod close_coop_standard;
 mod close_coop_vanilla;
 mod close_force_standard;
+mod contract_import;
+mod external_burn;
 mod external_signer;
 mod invoice;
 mod multi_hop;
@@ -16,5 +18,9 @@ mod restart;
 mod send_receive;
 mod swap_roundtrip_buy;
 mod vanilla_payment_on_rgb_channel;
+#[cfg(feature = "vss")]
+mod vss_consignment_reimport;
+#[cfg(feature = "vss")]
+mod vss_manager_lag;
 #[cfg(feature = "vss")]
 mod vss_restore;

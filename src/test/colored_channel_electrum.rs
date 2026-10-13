@@ -11,11 +11,11 @@ async fn start_node_electrum_only(node_test_dir: &str, node_peer_port: u16) -> S
 
     let payload = UnlockRequest {
         password,
-        bitcoind_rpc_username: None,
-        bitcoind_rpc_password: None,
-        bitcoind_rpc_host: None,
-        bitcoind_rpc_port: None,
+        ldk_chain_sync: LdkChainSync::TransactionSync {
+            indexer_url: ELECTRUM_URL_REGTEST.to_string(),
+        },
         indexer_url: Some(ELECTRUM_URL_REGTEST.to_string()),
+        eth_rpc_url: None,
         proxy_endpoint: Some(PROXY_ENDPOINT_LOCAL.to_string()),
         announce_addresses: vec![],
         announce_alias: None,

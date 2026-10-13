@@ -16,20 +16,95 @@ mod uniffi_smoke_tests {
     use tokio_util::sync::CancellationToken;
 
     #[test]
+    fn external_unlock_request_preserves_bfa_and_node_settings() {
+        let request: sdk::UnlockRequest = SdkExternalUnlockRequest {
+            ldk_chain_sync: SdkLdkChainSync::TransactionSync {
+                indexer_url: "ssl://ldk-indexer.example:50002".to_string(),
+            },
+            indexer_url: Some("ssl://rgb-indexer.example:50002".to_string()),
+            proxy_endpoint: Some("rpcs://proxy.example/json-rpc".to_string()),
+            announce_addresses: vec!["node.example:9735".to_string()],
+            announce_alias: Some("external-bfa".to_string()),
+            eth_rpc_url: Some("https://ethereum.example/rpc".to_string()),
+        }
+        .into();
+
+        assert!(request.password.is_empty());
+        assert!(matches!(request.ldk_chain_sync,
+            crate::core_types::LdkChainSync::TransactionSync { indexer_url }
+                if indexer_url == "ssl://ldk-indexer.example:50002"));
+        assert_eq!(
+            request.indexer_url.as_deref(),
+            Some("ssl://rgb-indexer.example:50002")
+        );
+        assert_eq!(
+            request.proxy_endpoint.as_deref(),
+            Some("rpcs://proxy.example/json-rpc")
+        );
+        assert_eq!(request.announce_addresses, ["node.example:9735"]);
+        assert_eq!(request.announce_alias.as_deref(), Some("external-bfa"));
+        assert_eq!(
+            request.eth_rpc_url.as_deref(),
+            Some("https://ethereum.example/rpc")
+        );
+        assert!(request.gossip_rgs_server_url.is_none());
+    }
+
+    #[test]
+    fn external_unlock_request_preserves_absent_eth_rpc_and_block_sync() {
+        let request: sdk::UnlockRequest = SdkExternalUnlockRequest {
+            ldk_chain_sync: SdkLdkChainSync::BlockSync {
+                bitcoind_rpc_username: "user".to_string(),
+                bitcoind_rpc_password: "password".to_string(),
+                bitcoind_rpc_host: "localhost".to_string(),
+                bitcoind_rpc_port: 18443,
+            },
+            indexer_url: None,
+            proxy_endpoint: None,
+            announce_addresses: vec![],
+            announce_alias: None,
+            eth_rpc_url: None,
+        }
+        .into();
+
+        assert!(request.password.is_empty());
+        assert!(request.eth_rpc_url.is_none());
+        assert!(request.indexer_url.is_none());
+        assert!(request.proxy_endpoint.is_none());
+        assert!(request.announce_addresses.is_empty());
+        assert!(request.announce_alias.is_none());
+        assert!(request.gossip_rgs_server_url.is_none());
+        match request.ldk_chain_sync {
+            crate::core_types::LdkChainSync::BlockSync {
+                bitcoind_rpc_username,
+                bitcoind_rpc_password,
+                bitcoind_rpc_host,
+                bitcoind_rpc_port,
+            } => {
+                assert_eq!(bitcoind_rpc_username, "user");
+                assert_eq!(bitcoind_rpc_password, "password");
+                assert_eq!(bitcoind_rpc_host, "localhost");
+                assert_eq!(bitcoind_rpc_port, 18443);
+            }
+            _ => panic!("expected block sync"),
+        }
+    }
+
+    #[test]
     #[serial(uniffi_state)]
     fn uniffi_entrypoints_require_initialized_state() {
         clear_uniffi_app_state();
         assert!(!uniffi_is_initialized());
 
         let node_info = sdk_node_info();
-        assert!(matches!(node_info, Err(RlnError::NotInitialized)));
+        assert!(matches!(node_info, Err(RlnError::NotInitialized(_))));
         let channel_id = sdk_get_channel_id(lightning::ln::types::ChannelId([0u8; 32]));
-        assert!(matches!(channel_id, Err(RlnError::NotInitialized)));
+        assert!(matches!(channel_id, Err(RlnError::NotInitialized(_))));
         let payment_hash = lightning::types::payment::PaymentHash([0u8; 32]);
         let payment = sdk_get_payment(payment_hash, PaymentType::Outbound);
-        assert!(matches!(payment, Err(RlnError::NotInitialized)));
+        assert!(matches!(payment, Err(RlnError::NotInitialized(_))));
         let swap = sdk_get_swap(lightning::types::payment::PaymentHash([0u8; 32]), true);
-        assert!(matches!(swap, Err(RlnError::NotInitialized)));
+        assert!(matches!(swap, Err(RlnError::NotInitialized(_))));
         let bootstrap = SdkExternalSignerBootstrap {
             node_id: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
                 .to_string(),
@@ -40,7 +115,7 @@ mod uniffi_smoke_tests {
             api_level: 1,
         };
         let init_external = sdk_init_with_external_signer(bootstrap);
-        assert!(matches!(init_external, Err(RlnError::NotInitialized)));
+        assert!(matches!(init_external, Err(RlnError::NotInitialized(_))));
 
         let invoice = sdk_ln_invoice(LnInvoiceRequest {
             amt_msat: Some(1000),
@@ -48,22 +123,23 @@ mod uniffi_smoke_tests {
             asset_id: None,
             asset_amount: None,
             payment_hash: None,
+            description: None,
             description_hash: None,
             min_final_cltv_expiry_delta: None,
         });
-        assert!(matches!(invoice, Err(RlnError::NotInitialized)));
+        assert!(matches!(invoice, Err(RlnError::NotInitialized(_))));
 
         let hodl_hash = lightning::types::payment::PaymentHash([3u8; 32]);
         let cancel_hodl = sdk_cancelhodlinvoice(CancelHodlInvoiceRequest {
             payment_hash: hodl_hash,
         });
-        assert!(matches!(cancel_hodl, Err(RlnError::NotInitialized)));
+        assert!(matches!(cancel_hodl, Err(RlnError::NotInitialized(_))));
 
         let claim_hodl = sdk_claimhodlinvoice(ClaimHodlInvoiceRequest {
             payment_hash: hodl_hash,
             payment_preimage: "11".repeat(32),
         });
-        assert!(matches!(claim_hodl, Err(RlnError::NotInitialized)));
+        assert!(matches!(claim_hodl, Err(RlnError::NotInitialized(_))));
 
         let inflate_asset_id =
             ContractId::from_str("rgb:CJkb4YZw-jRiz2sk-~PARPio-wtVYI1c-XAEYCqO-wTfvRZ8").unwrap();
@@ -73,7 +149,7 @@ mod uniffi_smoke_tests {
             fee_rate: 1,
             min_confirmations: 1,
         });
-        assert!(matches!(inflate, Err(RlnError::NotInitialized)));
+        assert!(matches!(inflate, Err(RlnError::NotInitialized(_))));
 
         let send_rgb = sdk_send_rgb(SendRgbRequest {
             donation: false,
@@ -81,7 +157,15 @@ mod uniffi_smoke_tests {
             min_confirmations: 1,
             recipient_groups: vec![],
         });
-        assert!(matches!(send_rgb, Err(RlnError::NotInitialized)));
+        assert!(matches!(send_rgb, Err(RlnError::NotInitialized(_))));
+
+        let contract_id =
+            ContractId::from_str("rgb:CJkb4YZw-jRiz2sk-~PARPio-wtVYI1c-XAEYCqO-wTfvRZ8").unwrap();
+        let contract_import = sdk_import_rgb_contract(ImportRgbContractRequest {
+            contract_base64: String::new(),
+            expected_asset_id: contract_id,
+        });
+        assert!(matches!(contract_import, Err(RlnError::NotInitialized(_))));
 
         let invalid_recipient =
             <RecipientId as UniffiCustomTypeConverter>::into_custom("not-recipient-id".to_string());
@@ -89,6 +173,10 @@ mod uniffi_smoke_tests {
     }
 
     fn mock_locked_state() -> Arc<AppState> {
+        mock_locked_state_for_network(BitcoinNetwork::Regtest)
+    }
+
+    fn mock_locked_state_for_network(network: BitcoinNetwork) -> Arc<AppState> {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("rln_db");
         let connection_string = format!("sqlite:{}?mode=rwc", db_path.display());
@@ -97,12 +185,17 @@ mod uniffi_smoke_tests {
                 .expect("mock database connection");
         Arc::new(AppState {
             static_state: Arc::new(StaticState {
+                config: Default::default(),
                 ldk_peer_listening_port: 9735,
-                network: BitcoinNetwork::Regtest,
+                network,
                 storage_dir_path: tmp.path().to_path_buf(),
                 ldk_data_dir: tmp.path().join(".ldk"),
                 logger: Arc::new(FilesystemLogger::new(tmp.path().to_path_buf())),
                 max_media_upload_size_mb: 1,
+                max_aggregated_media_size_per_channel_mb:
+                    crate::rgb_file_transfer::MAX_MEDIA_MB_PER_CHANNEL,
+                max_pending_consignments: crate::rgb_file_transfer::MAX_PENDING_CONSIGNMENTS,
+                max_media_files_per_channel: crate::rgb_file_transfer::MAX_MEDIA_FILES_PER_CHANNEL,
                 enable_virtual_channels_v0: false,
                 virtual_peer_pubkeys: vec![],
                 database: RwLock::new(Arc::new(database)),
@@ -111,6 +204,7 @@ mod uniffi_smoke_tests {
                 vss_url: None,
                 vss_allow_empty_restore: false,
                 reuse_addresses: false,
+                remote_signer_listen_addr: None,
             }),
             cancel_token: CancellationToken::new(),
             unlocked_app_state: Arc::new(TokioMutex::new(None)),
@@ -122,25 +216,84 @@ mod uniffi_smoke_tests {
         })
     }
 
+    fn ln_invoice_request() -> LnInvoiceRequest {
+        LnInvoiceRequest {
+            amt_msat: Some(1000),
+            expiry_sec: 3600,
+            asset_id: None,
+            asset_amount: None,
+            payment_hash: None,
+            description: None,
+            description_hash: None,
+            min_final_cltv_expiry_delta: None,
+        }
+    }
+
+    #[test]
+    #[serial(uniffi_state)]
+    fn uniffi_global_mainnet_lightning_restriction_preserves_wallet_requirements() {
+        for network in [BitcoinNetwork::Mainnet, BitcoinNetwork::Regtest] {
+            set_uniffi_app_state(mock_locked_state_for_network(network));
+            match sdk_ln_invoice(ln_invoice_request()) {
+                Err(RlnError::LightningUnsupportedOnMainnet(message))
+                    if network == BitcoinNetwork::Mainnet =>
+                {
+                    assert_eq!(message, "RLN on mainnet currently supports only on-chain methods. Lightning APIs are not supported.");
+                }
+                Err(RlnError::NotInitialized(_)) if network == BitcoinNetwork::Regtest => {}
+                _ => panic!("unexpected Lightning result for {network:?}"),
+            }
+            assert!(matches!(
+                sdk_btc_balance(true),
+                Err(RlnError::NotInitialized(_))
+            ));
+            assert!(matches!(sdk_node_info(), Err(RlnError::NotInitialized(_))));
+            clear_uniffi_app_state();
+        }
+    }
+
+    #[test]
+    fn uniffi_instance_mainnet_lightning_restriction_preserves_wallet_requirements() {
+        for network in [BitcoinNetwork::Mainnet, BitcoinNetwork::Regtest] {
+            let node = SdkNode {
+                handle: crate::NodeHandle::from_app_state(mock_locked_state_for_network(network)),
+            };
+            match node.ln_invoice(ln_invoice_request()) {
+                Err(RlnError::LightningUnsupportedOnMainnet(message))
+                    if network == BitcoinNetwork::Mainnet =>
+                {
+                    assert_eq!(message, "RLN on mainnet currently supports only on-chain methods. Lightning APIs are not supported.");
+                }
+                Err(RlnError::NotInitialized(_)) if network == BitcoinNetwork::Regtest => {}
+                _ => panic!("unexpected Lightning result for {network:?}"),
+            }
+            assert!(matches!(
+                node.btc_balance(true),
+                Err(RlnError::NotInitialized(_))
+            ));
+            assert!(matches!(node.node_info(), Err(RlnError::NotInitialized(_))));
+        }
+    }
+
     #[test]
     #[serial(uniffi_state)]
     fn uniffi_entrypoints_use_registered_state() {
         set_uniffi_app_state(mock_locked_state());
         assert!(uniffi_is_initialized());
         let node_info = sdk_node_info();
-        assert!(matches!(node_info, Err(RlnError::NotInitialized)));
+        assert!(matches!(node_info, Err(RlnError::NotInitialized(_))));
         let channel_id = sdk_get_channel_id(lightning::ln::types::ChannelId([0u8; 32]));
-        assert!(matches!(channel_id, Err(RlnError::NotInitialized)));
+        assert!(matches!(channel_id, Err(RlnError::NotInitialized(_))));
         let hodl_hash = lightning::types::payment::PaymentHash([4u8; 32]);
         let cancel_hodl = sdk_cancelhodlinvoice(CancelHodlInvoiceRequest {
             payment_hash: hodl_hash,
         });
-        assert!(matches!(cancel_hodl, Err(RlnError::NotInitialized)));
+        assert!(matches!(cancel_hodl, Err(RlnError::NotInitialized(_))));
         let claim_hodl = sdk_claimhodlinvoice(ClaimHodlInvoiceRequest {
             payment_hash: hodl_hash,
             payment_preimage: "22".repeat(32),
         });
-        assert!(matches!(claim_hodl, Err(RlnError::NotInitialized)));
+        assert!(matches!(claim_hodl, Err(RlnError::NotInitialized(_))));
 
         let send_rgb = sdk_send_rgb(SendRgbRequest {
             donation: false,
@@ -148,7 +301,7 @@ mod uniffi_smoke_tests {
             min_confirmations: 1,
             recipient_groups: vec![],
         });
-        assert!(matches!(send_rgb, Err(RlnError::InvalidRequest)));
+        assert!(matches!(send_rgb, Err(RlnError::InvalidRequest(_))));
         clear_uniffi_app_state();
         assert!(!uniffi_is_initialized());
     }
@@ -163,17 +316,17 @@ mod uniffi_smoke_tests {
             handle: crate::NodeHandle::from_app_state(mock_locked_state()),
         };
         let node_info = node.node_info();
-        assert!(matches!(node_info, Err(RlnError::NotInitialized)));
+        assert!(matches!(node_info, Err(RlnError::NotInitialized(_))));
         let hodl_hash = lightning::types::payment::PaymentHash([5u8; 32]);
         let cancel_hodl = node.cancelhodlinvoice(CancelHodlInvoiceRequest {
             payment_hash: hodl_hash,
         });
-        assert!(matches!(cancel_hodl, Err(RlnError::NotInitialized)));
+        assert!(matches!(cancel_hodl, Err(RlnError::NotInitialized(_))));
         let claim_hodl = node.claimhodlinvoice(ClaimHodlInvoiceRequest {
             payment_hash: hodl_hash,
             payment_preimage: "33".repeat(32),
         });
-        assert!(matches!(claim_hodl, Err(RlnError::NotInitialized)));
+        assert!(matches!(claim_hodl, Err(RlnError::NotInitialized(_))));
 
         let send_rgb = node.send_rgb(SendRgbRequest {
             donation: false,
@@ -181,7 +334,15 @@ mod uniffi_smoke_tests {
             min_confirmations: 1,
             recipient_groups: vec![],
         });
-        assert!(matches!(send_rgb, Err(RlnError::InvalidRequest)));
+        assert!(matches!(send_rgb, Err(RlnError::InvalidRequest(_))));
+
+        let contract_id =
+            ContractId::from_str("rgb:CJkb4YZw-jRiz2sk-~PARPio-wtVYI1c-XAEYCqO-wTfvRZ8").unwrap();
+        let contract_import = node.importrgbcontract(ImportRgbContractRequest {
+            contract_base64: String::new(),
+            expected_asset_id: contract_id,
+        });
+        assert!(matches!(contract_import, Err(RlnError::InvalidRequest(_))));
 
         // Keep global slot untouched for compatibility wrappers.
         assert!(!uniffi_is_initialized());
@@ -256,104 +417,168 @@ mod uniffi_smoke_tests {
     fn uniffi_error_mapping_is_stable_for_core_api_errors() {
         assert!(matches!(
             super::super::state::map_api_error(crate::error::APIError::LockedNode),
-            RlnError::NotInitialized
+            RlnError::NotInitialized(_)
         ));
         assert!(matches!(
             super::super::state::map_api_error(crate::error::APIError::PaymentNotFound(
                 "x".to_string()
             )),
-            RlnError::NotFound
+            RlnError::NotFound(_)
         ));
         assert!(matches!(
             super::super::state::map_api_error(crate::error::APIError::SwapNotFound(
                 "x".to_string()
             )),
-            RlnError::NotFound
+            RlnError::NotFound(_)
         ));
         assert!(matches!(
             super::super::state::map_api_error(crate::error::APIError::FailedBitcoindConnection(
                 "down".to_string()
             )),
-            RlnError::FailedBitcoindConnection
+            RlnError::FailedBitcoindConnection(_)
         ));
         assert!(matches!(
             super::super::state::map_api_error(crate::error::APIError::FailedBdkSync(
                 "sync".to_string()
             )),
-            RlnError::FailedBdkSync
+            RlnError::FailedBdkSync(_)
         ));
         assert!(matches!(
             super::super::state::map_api_error(crate::error::APIError::FailedBroadcast(
                 "broadcast".to_string()
             )),
-            RlnError::FailedBroadcast
+            RlnError::FailedBroadcast(_)
         ));
         assert!(matches!(
             super::super::state::map_api_error(crate::error::APIError::FailedPeerConnection),
-            RlnError::FailedPeerConnection
+            RlnError::FailedPeerConnection(_)
         ));
         assert!(matches!(
             super::super::state::map_api_error(crate::error::APIError::IO(std::io::Error::other(
                 "invalid"
             ))),
-            RlnError::Internal
+            RlnError::Internal(_)
         ));
         assert!(matches!(
             super::super::state::map_api_error(crate::error::APIError::InvalidPeerInfo(
                 "invalid peer".to_string()
             )),
-            RlnError::InvalidRequest
+            RlnError::InvalidRequest(_)
         ));
         assert!(matches!(
             super::super::state::map_api_error(crate::error::APIError::NoAvailableUtxos),
-            RlnError::NoAvailableUtxos
+            RlnError::NoAvailableUtxos(_)
         ));
         assert!(matches!(
             super::super::state::map_api_error(crate::error::APIError::InsufficientFunds(42)),
-            RlnError::InsufficientFunds
+            RlnError::InsufficientFunds(_)
         ));
         assert!(matches!(
             super::super::state::map_api_error(crate::error::APIError::InsufficientCapacity(42)),
-            RlnError::InsufficientCapacity
+            RlnError::InsufficientCapacity(_)
         ));
         assert!(matches!(
             super::super::state::map_api_error(crate::error::APIError::NoRoute),
-            RlnError::NoRoute
+            RlnError::NoRoute(_)
         ));
         assert!(matches!(
             super::super::state::map_api_error(crate::error::APIError::NoValidTransportEndpoint),
-            RlnError::Conflict
+            RlnError::Conflict(_)
         ));
         assert!(matches!(
             super::super::state::map_api_error(crate::error::APIError::ExternalSignerRequired),
-            RlnError::ExternalSignerRequired
+            RlnError::ExternalSignerRequired(_)
         ));
         assert!(matches!(
             super::super::state::map_api_error(crate::error::APIError::ExternalSignerMismatch),
-            RlnError::ExternalSignerMismatch
+            RlnError::ExternalSignerMismatch(_)
         ));
         assert!(matches!(
             super::super::state::map_api_error(crate::error::APIError::ExternalSignerUnavailable(
                 "down".to_string()
             )),
-            RlnError::ExternalSignerUnavailable
+            RlnError::ExternalSignerUnavailable(_)
         ));
         assert!(matches!(
             super::super::state::map_api_error(
                 crate::error::APIError::ExternalSignerProtocolError("decode".to_string())
             ),
-            RlnError::ExternalSignerProtocolError
+            RlnError::ExternalSignerProtocolError(_)
         ));
         assert!(matches!(
             super::super::state::map_api_error(
                 crate::error::APIError::UnsupportedInExternalSignerMode("x".to_string())
             ),
-            RlnError::UnsupportedInExternalSignerMode
+            RlnError::UnsupportedInExternalSignerMode(_)
         ));
         assert!(matches!(
             super::super::state::map_api_error(crate::error::APIError::WrongPassword),
-            RlnError::InvalidRequest
+            RlnError::InvalidRequest(_)
         ));
+    }
+
+    #[test]
+    fn uniffi_mainnet_lightning_error_preserves_category_and_message() {
+        let err = super::super::state::map_api_error(
+            crate::error::APIError::LightningUnsupportedOnMainnet,
+        );
+        assert!(matches!(err, RlnError::LightningUnsupportedOnMainnet(_)));
+        let expected = "RLN on mainnet currently supports only on-chain methods. Lightning APIs are not supported.";
+        assert_eq!(err.to_string(), expected);
+        assert_eq!(
+            super::super::state::take_last_api_error_detail().as_deref(),
+            Some(expected)
+        );
+        assert!(super::super::state::take_last_api_error_detail().is_none());
+    }
+
+    #[test]
+    fn uniffi_errors_preserve_category_and_message() {
+        let err = super::super::state::map_api_error(crate::error::APIError::Unexpected(
+            "backup file corrupted".to_string(),
+        ));
+        assert!(matches!(err, RlnError::Internal(_)));
+        assert!(err.to_string().contains("backup file corrupted"));
+
+        let err = super::super::state::map_api_error(crate::error::APIError::CannotCloseChannel(
+            "peer disconnected".to_string(),
+        ));
+        assert!(matches!(err, RlnError::Conflict(_)));
+        assert!(err.to_string().contains("peer disconnected"));
+
+        let err = super::super::state::map_api_error(crate::error::APIError::FailedBdkSync(
+            "indexer timeout".to_string(),
+        ));
+        assert!(matches!(err, RlnError::FailedBdkSync(_)));
+        assert!(err.to_string().contains("indexer timeout"));
+
+        let err = super::super::state::map_api_error(crate::error::APIError::LockedNode);
+        assert!(matches!(err, RlnError::NotInitialized(_)));
+        assert!(err.to_string().contains("unlock"));
+
+        let err = super::super::state::map_api_error(crate::error::APIError::InvalidRightOutpoint(
+            "stale outpoint".to_string(),
+        ));
+        assert!(matches!(err, RlnError::InvalidRequest(_)));
+        assert!(err.to_string().contains("stale outpoint"));
+
+        let err = super::super::state::map_api_error(
+            crate::error::APIError::RestoredBackupInconsistent("backup gap".to_string()),
+        );
+        assert!(matches!(err, RlnError::Internal(_)));
+        assert!(err.to_string().contains("backup gap"));
+    }
+
+    #[cfg(feature = "vss")]
+    #[test]
+    fn uniffi_vss_init_errors_keep_category_and_instructions() {
+        let err = super::super::state::map_api_error(crate::error::APIError::FailedVssInit(
+            "VSS restore refused; retry with vss_allow_empty_restore".to_string(),
+        ));
+        assert!(matches!(err, RlnError::FailedVssInit(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("Failed to initialize VSS"));
+        assert!(msg.contains("vss_allow_empty_restore"));
     }
 
     #[test]
@@ -372,6 +597,7 @@ mod uniffi_smoke_tests {
             payee_pubkey: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
                 .to_string(),
             preimage: expected_preimage.clone(),
+            description: None,
             description_hash: None,
         };
 
@@ -398,7 +624,7 @@ mod uniffi_smoke_tests {
             vss_allow_empty_restore: false,
             reuse_addresses: false,
         });
-        assert!(matches!(res, Err(RlnError::InvalidRequest)));
+        assert!(matches!(res, Err(RlnError::InvalidRequest(_))));
     }
 }
 

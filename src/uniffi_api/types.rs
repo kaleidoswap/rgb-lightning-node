@@ -14,49 +14,61 @@ pub struct SdkNode {
     pub(crate) handle: NodeHandle,
 }
 
+// Flat UniFFI error: bindings expose the variant as the category and the
+// `Display` string (the payload) as the exception message.
 #[derive(Debug, thiserror::Error)]
 pub enum RlnError {
-    #[error("node is not initialized")]
-    NotInitialized,
-    #[error("invalid request")]
-    InvalidRequest,
-    #[error("resource not found")]
-    NotFound,
-    #[error("conflict with current node state")]
-    Conflict,
-    #[error("failed bitcoind connection")]
-    FailedBitcoindConnection,
-    #[error("failed bdk sync")]
-    FailedBdkSync,
-    #[error("failed broadcast")]
-    FailedBroadcast,
-    #[error("failed peer connection")]
-    FailedPeerConnection,
-    #[error("insufficient capacity")]
-    InsufficientCapacity,
-    #[error("insufficient funds")]
-    InsufficientFunds,
-    #[error("no available utxos")]
-    NoAvailableUtxos,
-    #[error("no route")]
-    NoRoute,
-    #[error("external signer required")]
-    ExternalSignerRequired,
-    #[error("external signer mismatch")]
-    ExternalSignerMismatch,
-    #[error("external signer unavailable")]
-    ExternalSignerUnavailable,
-    #[error("external signer protocol error")]
-    ExternalSignerProtocolError,
-    #[error("unsupported in external signer mode")]
-    UnsupportedInExternalSignerMode,
-    #[error("internal error")]
-    Internal,
+    #[error("{0}")]
+    NotInitialized(String),
+    #[error("{0}")]
+    InvalidRequest(String),
+    #[error("{0}")]
+    NotFound(String),
+    #[error("{0}")]
+    Conflict(String),
+    #[error("{0}")]
+    FailedBitcoindConnection(String),
+    #[error("{0}")]
+    FailedBdkSync(String),
+    #[error("{0}")]
+    FailedBroadcast(String),
+    #[error("{0}")]
+    FailedPeerConnection(String),
+    #[error("{0}")]
+    InsufficientCapacity(String),
+    #[error("{0}")]
+    InsufficientFunds(String),
+    #[error("{0}")]
+    NoAvailableUtxos(String),
+    #[error("{0}")]
+    NoRoute(String),
+    #[error("{0}")]
+    ExternalSignerRequired(String),
+    #[error("{0}")]
+    ExternalSignerMismatch(String),
+    #[error("{0}")]
+    ExternalSignerUnavailable(String),
+    #[error("{0}")]
+    ExternalSignerProtocolError(String),
+    #[error("{0}")]
+    UnsupportedInExternalSignerMode(String),
+    #[error("{0}")]
+    FailedVssInit(String),
+    #[error("{0}")]
+    Internal(String),
+    #[error("{0}")]
+    LightningUnsupportedOnMainnet(String),
+}
+
+impl RlnError {
+    pub(crate) fn internal(msg: impl std::fmt::Display) -> Self {
+        Self::Internal(msg.to_string())
+    }
 }
 
 impl From<uniffi::UnexpectedUniFFICallbackError> for RlnError {
-    fn from(_: uniffi::UnexpectedUniFFICallbackError) -> Self {
-        Self::Internal
+    fn from(e: uniffi::UnexpectedUniFFICallbackError) -> Self {
+        Self::Internal(e.to_string())
     }
 }
 
@@ -106,6 +118,10 @@ pub struct SignMessageResponse {
     pub signed_message: String,
 }
 
+pub struct VerifyMessageResponse {
+    pub valid: bool,
+}
+
 pub struct EstimateFeeResponse {
     pub fee_rate: f64,
 }
@@ -125,6 +141,7 @@ pub struct Payment {
     pub updated_at: u64,
     pub payee_pubkey: PublicKey,
     pub preimage: Option<String>,
+    pub description: Option<String>,
     pub description_hash: Option<String>,
 }
 
@@ -231,6 +248,13 @@ pub struct AssetBalanceInfo {
     pub offchain_inbound: u64,
 }
 
+pub struct AssetLinkRecord {
+    pub parent_asset_id: ContractId,
+    pub child_asset_id: Option<ContractId>,
+    pub created_at: Option<u64>,
+    pub txid: Option<Txid>,
+}
+
 pub struct AssetMetadataInfo {
     pub asset_schema: String,
     pub initial_supply: u64,
@@ -242,6 +266,9 @@ pub struct AssetMetadataInfo {
     pub ticker: Option<String>,
     pub details: Option<String>,
     pub token: Option<Token>,
+    pub unspent_link_right_outpoint: Option<RgbOutpoint>,
+    pub linked_from_asset_id: Option<String>,
+    pub linked_to_asset_id: Option<String>,
 }
 
 pub struct AssetMediaResponse {
@@ -342,6 +369,28 @@ pub struct AssetIfa {
     pub balance: AssetBalanceInfo,
     pub media: Option<Media>,
     pub reject_list_url: Option<String>,
+    pub issuance_link_right_outpoint: Option<RgbOutpoint>,
+    pub linked_from_asset_id: Option<String>,
+    pub linked_to_asset_id: Option<String>,
+}
+
+pub struct AssetBfa {
+    pub asset_id: ContractId,
+    pub ticker: String,
+    pub name: String,
+    pub details: Option<String>,
+    pub precision: u8,
+    pub initial_supply: u64,
+    pub timestamp: i64,
+    pub added_at: i64,
+    pub balance: AssetBalanceInfo,
+    pub media: Option<Media>,
+    pub reject_list_url: Option<String>,
+}
+
+pub struct RgbOutpoint {
+    pub txid: String,
+    pub vout: u32,
 }
 
 pub struct ListAssetsResponse {
@@ -349,6 +398,7 @@ pub struct ListAssetsResponse {
     pub uda: Option<Vec<AssetUda>>,
     pub cfa: Option<Vec<AssetCfa>>,
     pub ifa: Option<Vec<AssetIfa>>,
+    pub bfa: Option<Vec<AssetBfa>>,
 }
 
 pub struct DecodeLnInvoiceResponse {
@@ -357,6 +407,8 @@ pub struct DecodeLnInvoiceResponse {
     pub timestamp: u64,
     pub asset_id: Option<ContractId>,
     pub asset_amount: Option<u64>,
+    pub description: Option<String>,
+    pub description_hash: Option<String>,
     pub payment_hash: PaymentHash,
     pub payment_secret: String,
     pub payee_pubkey: Option<PublicKey>,
@@ -366,6 +418,7 @@ pub struct DecodeLnInvoiceResponse {
 
 pub struct DecodeRgbInvoiceResponse {
     pub recipient_id: String,
+    pub proxy_recipient_id: String,
     pub recipient_type: String,
     pub asset_schema: Option<String>,
     pub asset_id: Option<ContractId>,
@@ -401,6 +454,7 @@ pub struct Transfer {
     pub kind: String,
     pub txid: Option<Txid>,
     pub recipient_id: Option<String>,
+    pub proxy_recipient_id: Option<String>,
     pub receive_utxo: Option<String>,
     pub change_utxo: Option<String>,
     pub expiration: Option<i64>,
@@ -417,6 +471,7 @@ pub struct Utxo {
     pub outpoint: String,
     pub btc_amount: u64,
     pub colorable: bool,
+    pub exists: bool,
 }
 
 pub struct Unspent {
@@ -431,6 +486,7 @@ pub struct LnInvoiceRequest {
     pub asset_id: Option<ContractId>,
     pub asset_amount: Option<u64>,
     pub payment_hash: Option<PaymentHash>,
+    pub description: Option<String>,
     pub description_hash: Option<String>,
     pub min_final_cltv_expiry_delta: Option<u16>,
 }
@@ -448,6 +504,20 @@ pub struct ClaimHodlInvoiceResponse {
     pub changed: bool,
 }
 
+pub struct BurnRequest {
+    pub asset_id: ContractId,
+    pub amount: u64,
+    /// Required for BFA assets: the 32-byte recipient the burned amount is released to.
+    pub burn_recipient: Option<Vec<u8>>,
+    pub fee_rate: u64,
+    pub min_confirmations: u8,
+}
+
+pub struct BurnResponse {
+    pub txid: Txid,
+    pub batch_transfer_idx: i32,
+}
+
 pub struct InflateRequest {
     pub asset_id: ContractId,
     pub inflation_amounts: Vec<u64>,
@@ -459,13 +529,47 @@ pub struct InflateResponse {
     pub txid: Txid,
 }
 
+/// How LDK follows the chain. Mirrors `core_types::LdkChainSync`, minus the cargo-feature
+/// gating the generated bindings cannot express.
+pub enum SdkLdkChainSync {
+    BlockSync {
+        bitcoind_rpc_username: String,
+        bitcoind_rpc_password: String,
+        bitcoind_rpc_host: String,
+        bitcoind_rpc_port: u16,
+    },
+    TransactionSync {
+        indexer_url: String,
+    },
+}
+
+impl From<SdkLdkChainSync> for crate::core_types::LdkChainSync {
+    fn from(value: SdkLdkChainSync) -> Self {
+        match value {
+            SdkLdkChainSync::BlockSync {
+                bitcoind_rpc_username,
+                bitcoind_rpc_password,
+                bitcoind_rpc_host,
+                bitcoind_rpc_port,
+            } => Self::BlockSync {
+                bitcoind_rpc_username,
+                bitcoind_rpc_password,
+                bitcoind_rpc_host,
+                bitcoind_rpc_port,
+            },
+            SdkLdkChainSync::TransactionSync { indexer_url } => {
+                Self::TransactionSync { indexer_url }
+            }
+        }
+    }
+}
+
 pub struct SdkUnlockRequest {
     pub password: String,
-    pub bitcoind_rpc_username: Option<String>,
-    pub bitcoind_rpc_password: Option<String>,
-    pub bitcoind_rpc_host: Option<String>,
-    pub bitcoind_rpc_port: Option<u16>,
+    pub ldk_chain_sync: SdkLdkChainSync,
     pub indexer_url: Option<String>,
+    // Some(url) → the wallet supports BFA assets, validating them against this Ethereum RPC.
+    pub eth_rpc_url: Option<String>,
     pub proxy_endpoint: Option<String>,
     pub announce_addresses: Vec<String>,
     pub announce_alias: Option<String>,
@@ -480,6 +584,32 @@ pub struct SdkExternalSignerBootstrap {
     pub master_fingerprint: String,
     pub protocol_version: String,
     pub api_level: u32,
+}
+
+/// Unlock parameters for an external signer; no private key or password is accepted.
+pub struct SdkExternalUnlockRequest {
+    pub ldk_chain_sync: SdkLdkChainSync,
+    pub indexer_url: Option<String>,
+    pub proxy_endpoint: Option<String>,
+    pub announce_addresses: Vec<String>,
+    pub announce_alias: Option<String>,
+    /// Ethereum RPC used for BFA validation. None preserves the node config fallback.
+    pub eth_rpc_url: Option<String>,
+}
+
+impl From<SdkExternalUnlockRequest> for crate::sdk::UnlockRequest {
+    fn from(request: SdkExternalUnlockRequest) -> Self {
+        Self {
+            password: String::new(),
+            ldk_chain_sync: request.ldk_chain_sync.into(),
+            indexer_url: request.indexer_url,
+            eth_rpc_url: request.eth_rpc_url,
+            proxy_endpoint: request.proxy_endpoint,
+            announce_addresses: request.announce_addresses,
+            announce_alias: request.announce_alias,
+            gossip_rgs_server_url: None,
+        }
+    }
 }
 
 pub struct SdkVssClearFenceRequest {
@@ -543,6 +673,20 @@ pub struct SdkFailTransfersResponse {
     pub transfers_changed: bool,
 }
 
+pub struct SdkRefreshFailure {
+    pub name: String,
+    pub message: String,
+}
+
+pub struct SdkRefreshedTransfer {
+    pub updated_status: Option<String>,
+    pub failure: Option<SdkRefreshFailure>,
+}
+
+pub struct SdkRefreshTransfersResponse {
+    pub transfers: std::collections::HashMap<i32, SdkRefreshedTransfer>,
+}
+
 pub struct SdkCreateUtxosRequest {
     pub up_to: bool,
     pub num: Option<u8>,
@@ -573,6 +717,22 @@ pub struct SdkIssueAssetIfaRequest {
     pub name: String,
     pub precision: u8,
     pub reject_list_url: Option<String>,
+    pub issuance_type: Option<IfaIssuanceType>,
+}
+
+pub enum IfaIssuanceType {
+    Legacy,
+    LinkRightOnly,
+    LinkedFromParent {
+        contract_id: ContractId,
+        request_link_right: bool,
+    },
+}
+
+pub struct SdkAssetLinkRequest {
+    pub parent_asset_id: ContractId,
+    pub child_asset_id: ContractId,
+    pub min_confirmations: u8,
 }
 
 pub struct SdkIssueAssetUdaRequest {
@@ -660,6 +820,29 @@ pub struct SdkRgbInvoiceResponse {
     pub invoice: String,
     pub expiration_timestamp: Option<i64>,
     pub batch_transfer_idx: i32,
+}
+
+pub struct ImportRgbTransferConsignmentRequest {
+    pub consignment_base64: String,
+    pub offchain_txid: String,
+    pub expected_asset_id: Option<ContractId>,
+}
+
+pub struct ImportRgbTransferConsignmentResponse {
+    pub asset_id: ContractId,
+    pub already_imported: bool,
+    pub metadata: AssetMetadataInfo,
+}
+
+pub struct ImportRgbContractRequest {
+    pub contract_base64: String,
+    pub expected_asset_id: ContractId,
+}
+
+pub struct ImportRgbContractResponse {
+    pub asset_id: ContractId,
+    pub already_imported: bool,
+    pub metadata: AssetMetadataInfo,
 }
 
 pub struct LnInvoiceResponse {

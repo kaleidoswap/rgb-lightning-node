@@ -491,6 +491,12 @@ pub trait LdkRuntimeManager {
         Ok(Vec::new())
     }
 
+    /// `(funding txid, vout)` pairs the chain monitor watches for spends; see
+    /// `LdkLiveBackend::chain_watched_outputs`.
+    fn chain_watched_outputs(&self) -> Result<Vec<(String, u32)>, JsValue> {
+        Ok(Vec::new())
+    }
+
     fn chain_apply_best_block(&self, _height: u32, _header_hex: &str) -> Result<(), JsValue> {
         Ok(())
     }
@@ -1096,6 +1102,8 @@ impl LdkRuntimeManager for WasmNativeRuntimeManager {
     }
 
     fn set_live_node_seed_hex(&self, seed_hex: String) -> Result<(), JsValue> {
+        #[cfg(test)]
+        crate::ln_node::test_utils::record_startup_call("seed_assignment");
         let seed_hex = seed_hex.trim();
         if seed_hex.is_empty() {
             return Err(JsValue::from_str("seed_hex cannot be empty"));
@@ -1168,6 +1176,11 @@ impl LdkRuntimeManager for WasmNativeRuntimeManager {
     fn chain_relevant_txids(&self) -> Result<Vec<String>, JsValue> {
         let backend = self.ensure_live_backend()?;
         backend.chain_relevant_txids()
+    }
+
+    fn chain_watched_outputs(&self) -> Result<Vec<(String, u32)>, JsValue> {
+        let backend = self.ensure_live_backend()?;
+        backend.chain_watched_outputs()
     }
 
     fn chain_apply_best_block(&self, height: u32, header_hex: &str) -> Result<(), JsValue> {
@@ -1851,6 +1864,8 @@ fn runtime_key_fingerprint(runtime_key: &str) -> String {
 const WASM_NATIVE_LDK_BACKEND_LABEL: &str = "wasm_native_ldk";
 
 pub fn ldk_runtime_manager(runtime_key: String) -> Result<Rc<dyn LdkRuntimeManager>, JsValue> {
+    #[cfg(test)]
+    crate::ln_node::test_utils::record_startup_call("manager");
     let runtime_key = canonicalize_runtime_key(&runtime_key);
     let manager_registry_key = runtime_key.clone();
     if let Some(manager) = RUNTIME_MANAGER_REGISTRY.with(|registry| {
@@ -1874,7 +1889,46 @@ pub fn ldk_runtime_manager(runtime_key: String) -> Result<Rc<dyn LdkRuntimeManag
     Ok(manager)
 }
 
-pub fn release_runtime_manager_if_last(runtime_key: &str, manager: &Rc<dyn LdkRuntimeManager>) {
+/// A node scope owns this lease until its last compatible handle is dropped. Refuse
+/// a pre-existing owner instead of reseeding and replacing its live backend.
+pub(crate) fn claim_node_runtime_manager(
+    runtime_key: String,
+) -> Result<Rc<dyn LdkRuntimeManager>, JsValue> {
+    let key = canonicalize_runtime_key(&runtime_key);
+    if RUNTIME_MANAGER_REGISTRY.with(|registry| {
+        registry
+            .borrow()
+            .get(&key)
+            .and_then(Weak::upgrade)
+            .is_some()
+    }) {
+        return Err(JsValue::from_str(
+            "runtime scope is already owned by another Lightning runtime",
+        ));
+    }
+    ldk_runtime_manager(runtime_key)
+}
+
+pub(crate) fn release_node_runtime_manager(runtime_key: &str, manager: &Rc<dyn LdkRuntimeManager>) {
+    RUNTIME_MANAGER_REGISTRY.with(|registry| {
+        let key = canonicalize_runtime_key(runtime_key);
+        let mut registry = registry.borrow_mut();
+        if registry
+            .get(&key)
+            .and_then(Weak::upgrade)
+            .is_some_and(|existing| Rc::ptr_eq(&existing, manager))
+        {
+            registry.remove(&key);
+        }
+    });
+}
+
+/// Returns `true` when this was the last live handle for `runtime_key` (the registry
+/// entry was removed), so per-runtime teardown (e.g. VSS replication guards) may run.
+pub fn release_runtime_manager_if_last(
+    runtime_key: &str,
+    manager: &Rc<dyn LdkRuntimeManager>,
+) -> bool {
     let runtime_key = canonicalize_runtime_key(runtime_key);
     RUNTIME_MANAGER_REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
@@ -1887,7 +1941,8 @@ pub fn release_runtime_manager_if_last(runtime_key: &str, manager: &Rc<dyn LdkRu
             registry.remove(&runtime_key);
         }
         registry.retain(|_, weak| weak.strong_count() > 0);
-    });
+        should_remove
+    })
 }
 
 fn canonicalize_runtime_key(runtime_key: &str) -> String {

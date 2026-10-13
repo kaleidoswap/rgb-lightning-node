@@ -23,9 +23,7 @@ interface SdkNode {
     [Throws=RlnError]
     sequence<Peer> list_peers();
     [Throws=RlnError]
-    sequence<Transaction> list_transactions(boolean skip_sync);
-    [Throws=RlnError]
-    sequence<Transaction> list_transactions_by_txid(string txid, boolean skip_sync);
+    sequence<Transaction> list_transactions(boolean skip_sync, string? txid);
     [Throws=RlnError]
     NetworkInfo network_info();
     [Throws=RlnError]
@@ -36,6 +34,8 @@ interface SdkNode {
     BtcBalanceInfo btc_balance(boolean skip_sync);
     [Throws=RlnError]
     SignMessageResponse sign_message(string message);
+    [Throws=RlnError]
+    VerifyMessageResponse verify_message(string message, string signature);
     [Throws=RlnError]
     string init(string password, string? mnemonic);
     [Throws=RlnError]
@@ -55,6 +55,8 @@ interface SdkNode {
     [Throws=RlnError]
     void createutxos(SdkCreateUtxosRequest request);
     [Throws=RlnError]
+    AssetLinkRecord asset_link(SdkAssetLinkRequest request);
+    [Throws=RlnError]
     AssetNia issueassetnia(SdkIssueAssetNiaRequest request);
     [Throws=RlnError]
     AssetCfa issueassetcfa(SdkIssueAssetCfaRequest request);
@@ -66,6 +68,10 @@ interface SdkNode {
     SdkPostAssetMediaResponse postassetmedia(SdkPostAssetMediaRequest request);
     [Throws=RlnError]
     SdkRgbInvoiceResponse rgbinvoice(SdkRgbInvoiceRequest request);
+    [Throws=RlnError]
+    ImportRgbTransferConsignmentResponse importrgbtransferconsignment(ImportRgbTransferConsignmentRequest request);
+    [Throws=RlnError]
+    ImportRgbContractResponse importrgbcontract(ImportRgbContractRequest request);
     [Throws=RlnError]
     SdkKeysendResponse keysend(SdkKeysendRequest request);
     [Throws=RlnError]
@@ -83,7 +89,7 @@ interface SdkNode {
     [Throws=RlnError]
     SdkSendPaymentResponse sendpayment(SdkSendPaymentRequest request);
     [Throws=RlnError]
-    void refreshtransfers(SdkRefreshTransfersRequest request);
+    SdkRefreshTransfersResponse refreshtransfers(SdkRefreshTransfersRequest request);
     [Throws=RlnError]
     SdkFailTransfersResponse failtransfers(SdkFailTransfersRequest request);
     [Throws=RlnError]
@@ -109,9 +115,7 @@ interface SdkNode {
     [Throws=RlnError]
     InvoiceStatus invoice_status(Bolt11Invoice invoice);
     [Throws=RlnError]
-    sequence<Transfer> list_transfers(ContractId asset_id);
-    [Throws=RlnError]
-    sequence<Transfer> list_transfers_by_txid(string txid);
+    sequence<Transfer> list_transfers(ContractId? asset_id, string? txid);
     [Throws=RlnError]
     sequence<Unspent> list_unspents(boolean skip_sync);
     [Throws=RlnError]
@@ -120,6 +124,12 @@ interface SdkNode {
     void cancelhodlinvoice(CancelHodlInvoiceRequest request);
     [Throws=RlnError]
     ClaimHodlInvoiceResponse claimhodlinvoice(ClaimHodlInvoiceRequest request);
+    [Throws=RlnError]
+    BurnResponse burn(BurnRequest request);
+    [Throws=RlnError]
+    bytes get_consignment(ContractId asset_id, Txid txid);
+    [Throws=RlnError]
+    string get_consignment_path(ContractId asset_id, Txid txid);
     [Throws=RlnError]
     InflateResponse inflate(InflateRequest request);
     [Throws=RlnError]
@@ -149,7 +159,9 @@ enum RlnError {
     "ExternalSignerUnavailable",
     "ExternalSignerProtocolError",
     "UnsupportedInExternalSignerMode",
+    "FailedVssInit",
     "Internal",
+    "LightningUnsupportedOnMainnet",
 };
 
 dictionary NodeInfo {
@@ -198,6 +210,10 @@ dictionary SignMessageResponse {
     string signed_message;
 };
 
+dictionary VerifyMessageResponse {
+    boolean valid;
+};
+
 dictionary EstimateFeeResponse {
     f64 fee_rate;
 };
@@ -217,6 +233,7 @@ dictionary Payment {
     u64 updated_at;
     PublicKey payee_pubkey;
     string? preimage;
+    string? description;
     string? description_hash;
 };
 
@@ -323,6 +340,13 @@ dictionary AssetBalanceInfo {
     u64 offchain_inbound;
 };
 
+dictionary AssetLinkRecord {
+    ContractId parent_asset_id;
+    ContractId? child_asset_id;
+    u64? created_at;
+    Txid? txid;
+};
+
 dictionary AssetMetadataInfo {
     string asset_schema;
     u64 initial_supply;
@@ -334,6 +358,9 @@ dictionary AssetMetadataInfo {
     string? ticker;
     string? details;
     Token? token;
+    RgbOutpoint? unspent_link_right_outpoint;
+    string? linked_from_asset_id;
+    string? linked_to_asset_id;
 };
 
 dictionary AssetMediaResponse {
@@ -434,6 +461,28 @@ dictionary AssetIfa {
     AssetBalanceInfo balance;
     Media? media;
     string? reject_list_url;
+    RgbOutpoint? issuance_link_right_outpoint;
+    string? linked_from_asset_id;
+    string? linked_to_asset_id;
+};
+
+dictionary AssetBfa {
+    ContractId asset_id;
+    string ticker;
+    string name;
+    string? details;
+    u8 precision;
+    u64 initial_supply;
+    i64 timestamp;
+    i64 added_at;
+    AssetBalanceInfo balance;
+    Media? media;
+    string? reject_list_url;
+};
+
+dictionary RgbOutpoint {
+    string txid;
+    u32 vout;
 };
 
 dictionary ListAssetsResponse {
@@ -441,6 +490,7 @@ dictionary ListAssetsResponse {
     sequence<AssetUda>? uda;
     sequence<AssetCfa>? cfa;
     sequence<AssetIfa>? ifa;
+    sequence<AssetBfa>? bfa = null;
 };
 
 dictionary DecodeLnInvoiceResponse {
@@ -449,6 +499,8 @@ dictionary DecodeLnInvoiceResponse {
     u64 timestamp;
     ContractId? asset_id;
     u64? asset_amount;
+    string? description;
+    string? description_hash;
     PaymentHash payment_hash;
     string payment_secret;
     PublicKey? payee_pubkey;
@@ -458,6 +510,7 @@ dictionary DecodeLnInvoiceResponse {
 
 dictionary DecodeRgbInvoiceResponse {
     string recipient_id;
+    string proxy_recipient_id;
     string recipient_type;
     string? asset_schema;
     ContractId? asset_id;
@@ -493,6 +546,7 @@ dictionary Transfer {
     string kind;
     Txid? txid;
     string? recipient_id;
+    string? proxy_recipient_id;
     string? receive_utxo;
     string? change_utxo;
     i64? expiration;
@@ -509,6 +563,7 @@ dictionary Utxo {
     string outpoint;
     u64 btc_amount;
     boolean colorable;
+    boolean exists;
 };
 
 dictionary Unspent {
@@ -523,6 +578,7 @@ dictionary LnInvoiceRequest {
     ContractId? asset_id;
     u64? asset_amount;
     PaymentHash? payment_hash;
+    string? description = null;
     string? description_hash;
     u16? min_final_cltv_expiry_delta;
 };
@@ -542,6 +598,19 @@ dictionary ClaimHodlInvoiceRequest {
 
 dictionary ClaimHodlInvoiceResponse {
     boolean changed;
+};
+
+dictionary BurnRequest {
+    ContractId asset_id;
+    u64 amount;
+    bytes? burn_recipient;
+    u64 fee_rate;
+    u8 min_confirmations;
+};
+
+dictionary BurnResponse {
+    Txid txid;
+    i32 batch_transfer_idx;
 };
 
 dictionary InflateRequest {
@@ -571,17 +640,21 @@ dictionary SdkInitRequest {
     boolean reuse_addresses = false;
 };
 
+[Enum]
+interface SdkLdkChainSync {
+    BlockSync(string bitcoind_rpc_username, string bitcoind_rpc_password, string bitcoind_rpc_host, u16 bitcoind_rpc_port);
+    TransactionSync(string indexer_url);
+};
+
 dictionary SdkUnlockRequest {
     string password;
-    string? bitcoind_rpc_username;
-    string? bitcoind_rpc_password;
-    string? bitcoind_rpc_host;
-    u16? bitcoind_rpc_port;
+    SdkLdkChainSync ldk_chain_sync;
     string? indexer_url;
     string? proxy_endpoint;
     sequence<string> announce_addresses;
     string? announce_alias;
     string? gossip_rgs_server_url = null;
+    string? eth_rpc_url = null;
 };
 
 dictionary SdkExternalSignerBootstrap {
@@ -591,6 +664,15 @@ dictionary SdkExternalSignerBootstrap {
     string master_fingerprint;
     string protocol_version;
     u32 api_level;
+};
+
+dictionary SdkExternalUnlockRequest {
+    SdkLdkChainSync ldk_chain_sync;
+    string? indexer_url = null;
+    string? proxy_endpoint = null;
+    sequence<string> announce_addresses = [];
+    string? announce_alias = null;
+    string? eth_rpc_url = null;
 };
 
 dictionary SdkVssClearFenceRequest {
@@ -640,6 +722,20 @@ dictionary SdkFailTransfersResponse {
     boolean transfers_changed;
 };
 
+dictionary SdkRefreshFailure {
+    string name;
+    string message;
+};
+
+dictionary SdkRefreshedTransfer {
+    string? updated_status;
+    SdkRefreshFailure? failure;
+};
+
+dictionary SdkRefreshTransfersResponse {
+    record<i32, SdkRefreshedTransfer> transfers;
+};
+
 dictionary SdkCreateUtxosRequest {
     boolean up_to;
     u8? num;
@@ -670,6 +766,21 @@ dictionary SdkIssueAssetIfaRequest {
     string name;
     u8 precision;
     string? reject_list_url;
+    IfaIssuanceType? issuance_type = null;
+};
+
+[Enum]
+interface IfaIssuanceType {
+    Legacy();
+    LinkRightOnly();
+    LinkedFromParent(ContractId contract_id, boolean request_link_right);
+};
+
+
+dictionary SdkAssetLinkRequest {
+    ContractId parent_asset_id;
+    ContractId child_asset_id;
+    u8 min_confirmations;
 };
 
 dictionary SdkIssueAssetUdaRequest {
@@ -757,6 +868,29 @@ dictionary SdkRgbInvoiceResponse {
     string invoice;
     i64? expiration_timestamp;
     i32 batch_transfer_idx;
+};
+
+dictionary ImportRgbTransferConsignmentRequest {
+    string consignment_base64;
+    string offchain_txid;
+    ContractId? expected_asset_id;
+};
+
+dictionary ImportRgbTransferConsignmentResponse {
+    ContractId asset_id;
+    boolean already_imported;
+    AssetMetadataInfo metadata;
+};
+
+dictionary ImportRgbContractRequest {
+    string contract_base64;
+    ContractId expected_asset_id;
+};
+
+dictionary ImportRgbContractResponse {
+    ContractId asset_id;
+    boolean already_imported;
+    AssetMetadataInfo metadata;
 };
 
 dictionary SdkSendPaymentRequest {

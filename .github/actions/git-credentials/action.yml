@@ -1,0 +1,14 @@
+name: 'Set up git credentials for private UTEXO-Protocol repos'
+description: 'Configure git to authenticate with private UTEXO-Protocol repositories'
+inputs:
+  token:
+    description: 'GitHub PAT with read access to private UTEXO-Protocol repositories'
+    required: true
+runs:
+  using: 'composite'
+  steps:
+    - name: Configure git credentials
+      shell: bash
+      run: |
+        git config --global url."https://x-access-token:${{ inputs.token }}@github.com/".insteadOf "https://github.com/"
+        echo "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> $GITHUB_ENV

@@ -106,24 +106,26 @@ fn format_error_for_ffi(e: &Error) -> String {
 /// compile error here rather than a silent downstream string mismatch.
 fn rln_variant_tag(e: &RlnError) -> &'static str {
     match e {
-        RlnError::NotInitialized => "NotInitialized",
-        RlnError::InvalidRequest => "InvalidRequest",
-        RlnError::NotFound => "NotFound",
-        RlnError::Conflict => "Conflict",
-        RlnError::FailedBitcoindConnection => "FailedBitcoindConnection",
-        RlnError::FailedBdkSync => "FailedBdkSync",
-        RlnError::FailedBroadcast => "FailedBroadcast",
-        RlnError::FailedPeerConnection => "FailedPeerConnection",
-        RlnError::InsufficientCapacity => "InsufficientCapacity",
-        RlnError::InsufficientFunds => "InsufficientFunds",
-        RlnError::NoAvailableUtxos => "NoAvailableUtxos",
-        RlnError::NoRoute => "NoRoute",
-        RlnError::ExternalSignerRequired => "ExternalSignerRequired",
-        RlnError::ExternalSignerMismatch => "ExternalSignerMismatch",
-        RlnError::ExternalSignerUnavailable => "ExternalSignerUnavailable",
-        RlnError::ExternalSignerProtocolError => "ExternalSignerProtocolError",
-        RlnError::UnsupportedInExternalSignerMode => "UnsupportedInExternalSignerMode",
-        RlnError::Internal => "Internal",
+        RlnError::NotInitialized(_) => "NotInitialized",
+        RlnError::InvalidRequest(_) => "InvalidRequest",
+        RlnError::NotFound(_) => "NotFound",
+        RlnError::Conflict(_) => "Conflict",
+        RlnError::FailedBitcoindConnection(_) => "FailedBitcoindConnection",
+        RlnError::FailedBdkSync(_) => "FailedBdkSync",
+        RlnError::FailedBroadcast(_) => "FailedBroadcast",
+        RlnError::FailedPeerConnection(_) => "FailedPeerConnection",
+        RlnError::InsufficientCapacity(_) => "InsufficientCapacity",
+        RlnError::InsufficientFunds(_) => "InsufficientFunds",
+        RlnError::NoAvailableUtxos(_) => "NoAvailableUtxos",
+        RlnError::NoRoute(_) => "NoRoute",
+        RlnError::ExternalSignerRequired(_) => "ExternalSignerRequired",
+        RlnError::ExternalSignerMismatch(_) => "ExternalSignerMismatch",
+        RlnError::ExternalSignerUnavailable(_) => "ExternalSignerUnavailable",
+        RlnError::ExternalSignerProtocolError(_) => "ExternalSignerProtocolError",
+        RlnError::UnsupportedInExternalSignerMode(_) => "UnsupportedInExternalSignerMode",
+        RlnError::FailedVssInit(_) => "FailedVssInit",
+        RlnError::Internal(_) => "Internal",
+        RlnError::LightningUnsupportedOnMainnet(_) => "LightningUnsupportedOnMainnet",
     }
 }
 
@@ -256,4 +258,22 @@ pub(crate) fn require_signer(
     signer: &COpaqueStruct,
 ) -> Result<&mut Arc<NativeExternalSigner>, Error> {
     <Arc<NativeExternalSigner>>::from_opaque(signer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mainnet_lightning_error_preserves_category_and_message() {
+        let _ = rgb_lightning_node::take_last_api_error_detail();
+        let err = Error::from(RlnError::LightningUnsupportedOnMainnet(
+            "RLN on mainnet currently supports only on-chain methods. Lightning APIs are not supported."
+                .to_string(),
+        ));
+        assert_eq!(
+            format_error_for_ffi(&err),
+            "Rln(LightningUnsupportedOnMainnet): RLN on mainnet currently supports only on-chain methods. Lightning APIs are not supported."
+        );
+    }
 }

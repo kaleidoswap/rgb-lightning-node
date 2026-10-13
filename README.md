@@ -17,6 +17,48 @@ More context on how RGB works on the Lightning Network can be found
 The node supports the regtest, signet, testnet3, testnet4 and mainnet networks,
 selected at startup via the `--network` flag (accepted values: `regtest`,
 `signet`, `signetcustom`, `testnet`/`testnet3`, `testnet4`, `mainnet`/`bitcoin`).
+On mainnet, Lightning APIs return `LightningUnsupportedOnMainnet`:
+
+> RLN on mainnet currently supports only on-chain methods. Lightning APIs are not supported.
+
+This applies to channel and peer operations, Lightning invoices (including decoding and
+HODL invoices), payments, async payments, swaps (including swap-string decoding), and
+onion messages. REST returns HTTP 403 with the usual `name`, `code`, and `error` fields;
+native SDK/bindings return the corresponding typed error. The configured node network
+controls this restriction, even while the node is locked. REST authentication and request
+extraction still apply first; SDK argument conversion still applies before SDK execution.
+
+Mainnet unlock starts the Bitcoin/RGB wallet, identity, signer and configured wallet
+backup services without constructing the Lightning runtime. It does not start Lightning
+chain synchronization, peer listeners, reconnect, gossip, event processing or sweeping.
+The peer port is unused. The existing required `ldk_chain_sync` request field remains
+accepted for compatibility; its backend and gossip settings are unused on mainnet.
+The RGB wallet still requires a valid mainnet indexer and its existing proxy configuration.
+
+After unlock, Bitcoin/RGB on-chain APIs, including RGB invoices and transfers, remain
+available under their existing requirements. Node identity and message signing retain
+the same keys. `nodeinfo` reports zero active Lightning counts and balances and a null
+RGS timestamp; these values are not wallet BTC balances. Mainnet `networkinfo` reads the
+wallet indexer's current height on demand and returns an error if it cannot be read or
+the indexer is on another network. Non-mainnet `networkinfo` continues to use LDK's height.
+Lightning and wallet/signing policies on supported non-mainnet networks are unchanged.
+
+Mainnet startup permits records left by older releases, including empty Lightning snapshots
+from wallets that only used on-chain methods. These records remain inactive: RLN does not
+decode or recover them, replay their pending replication, or start LDK to inspect them.
+Native persistence may update only the six existing common configuration mirrors in the
+node KV store; historical Lightning records and their pending writes/deletes remain
+untouched locally and in VSS. RGB wallet backup and restore keep their existing separate
+store and ownership requirements.
+
+This release assumes the supported mainnet rollout has no unresolved historical Lightning
+channel, funding, HTLC, claim, sweep or RGB Lightning obligations. Successful unlock does
+not verify that assumption, discover other devices or remote histories, or monitor old
+channels. A wallet with such obligations needs a separately reviewed recovery path before
+using this release. Preserving records is not a migration or a guarantee of compatibility
+with a future LDK version. Future mainnet Lightning enablement must address restoration,
+channel monitoring, ownership and downgrade handling before accepting activity.
+
 Please be careful, this software is early alpha, we do not take any
 responsibility for loss of funds or any other issue you may encounter.
 
@@ -47,34 +89,74 @@ docker build -t rgb-lightning-node .
 See [UniFFI SDK documentation](src/uniffi_api/README.md) for setup, runtime
 model, binding generation, test commands, and artifact packaging details.
 
+## AI code review
+The repository supports AI-assisted pull request reviews.
+Setup details for Claude, Codex, and extendable provider onboarding are documented in
+[`/.github/ai-review-bots.md`](.github/ai-review-bots.md).
+
+### Indexer support
+
+Support for the indexer protocols is behind cargo features, `electrum` and
+`esplora` (both enabled by default). At least one of them needs to be enabled.
+
+To support electrum indexers only:
+```sh
+cargo install --locked --path . --no-default-features --features electrum,block-sync,transaction-sync
+```
+
+To support esplora indexers only:
+```sh
+cargo install --locked --path . --no-default-features --features esplora,block-sync,transaction-sync
+```
+
+### Chain sync support
+
+Support for the chain sync backends is behind cargo features, `block-sync` and
+`transaction-sync` (both enabled by default). At least one of them needs to be
+enabled. See [Sync modes](#sync-modes) for what each backend does.
+
+To support the block-sync backend only:
+```sh
+cargo install --locked --path . --no-default-features --features block-sync,electrum,esplora
+```
+
+To support the transaction-sync backend only:
+```sh
+cargo install --locked --path . --no-default-features --features transaction-sync,electrum,esplora
+```
+
 ## Run
 
 In order to operate, the node will need:
-- a chain backend, either:
-  - a bitcoind node (drives LDK chain sync via RPC), or
-  - an esplora server (drives LDK chain sync over HTTP)
+- a bitcoind node (only for non-mainnet `BlockSync` [sync mode](#sync-modes))
 - an indexer instance for RGB (electrum or esplora — forwarded to rgb-lib)
-- an [RGB proxy server] instance
 
 Once services are running, daemons can be started.
 Each daemon needs to be started in a separate shell with `rgb-lightning-node`,
 specifying:
-- node data directory
-- node listening port
-- LN peer listening port
-- network
+- node data directory (positional argument)
+- node listening port (`--daemon-listening-port`, default: 3001)
+- LN peer listening port (`--ldk-peer-listening-port`, default: 9735)
+- network (`--network`, default: testnet)
 
 Chain-backend credentials are supplied at `/unlock` time, not on the CLI. The
-body must include exactly one of:
-- all four `bitcoind_rpc_*` fields — LDK chain sync runs via bitcoind RPC.
-  An optional electrum `indexer_url` is forwarded to rgb-lib only.
-- esplora `indexer_url` (no `bitcoind_rpc_*` fields) — LDK chain sync runs
-  over esplora, same URL forwarded to rgb-lib.
-- electrum `indexer_url` (no `bitcoind_rpc_*` fields) — LDK chain sync runs
-  over electrum, same URL forwarded to rgb-lib.
+body must include `ldk_chain_sync`, which names the [sync mode](#sync-modes) and
+carries that mode's own configuration. The RGB wallet's `indexer_url` is
+independent of it: any indexer can be paired with any sync mode, so `BlockSync`
+against bitcoind with an esplora `indexer_url` is a valid combination.
+`indexer_url` and `proxy_endpoint` may be omitted from the body, in which case
+they come from the `[chain]` section of the config file; if neither supplies an
+indexer URL the unlock fails with `MissingIndexerUrl`.
 
-`bitcoind + esplora` returns `400 AmbiguousChainBackend`. No credentials at
-all returns `400 MissingChainBackend`.
+### Configuration file
+
+The node can be configured via a TOML file, loaded from
+`<storage_directory_path>/config.toml` if it exists, or from the path given
+with `--config <path>`. All settings are optional and documented, along with
+their defaults, in [sample-config.toml](sample-config.toml). Values are
+resolved in order: built-in defaults, then the config file, then explicit CLI
+options; `/unlock` body params override the corresponding config values at
+runtime. Invalid values and unknown keys abort startup with an error.
 
 ### Regtest
 
@@ -84,9 +166,12 @@ To easily start the required services on a regtest network, run:
 ```
 
 This command will create the directories needed by the services, start the
-docker containers and mine some blocks. The test environment will always start
-in a clean state, taking down previous running services (if any) and
-re-creating data directories.
+docker containers and mine some blocks. The regtest docker stack also starts
+an RGB proxy on port 3000; it is only needed when using proxy-based
+`transport_endpoints` (see [RGB consignment transport](#rgb-consignment-transport)).
+
+The test environment will always start in a clean state, taking down previous
+running services (if any) and re-creating data directories.
 
 Here's an example of how to start three regtest nodes, each one using the
 shared regtest services provided by docker compose:
@@ -121,8 +206,13 @@ docker run \
         --disable-authentication \
         RLNdata
 ```
-Note: this persists data across runs in the `RLNdata1` volume; to start from
-scratch delete it with `docker volume rm RLNdata1`
+Notes:
+- this persists data across runs in the `RLNdata1` volume; to start from
+  scratch delete it with `docker volume rm RLNdata1`
+- the container runs as an unprivileged user (uid/gid `1000:1000`). A fresh
+  named volume, as in the example above, is automatically owned by that user.
+  If a bind-mount is used instead, the host directory needs to be writable by
+  uid/gid `1000:1000` before starting the container
 
 To send some bitcoins to a node, first get a bitcoin address with the POST
 `/address` API, then run:
@@ -151,7 +241,6 @@ When unlocking regtest nodes use the following local services:
 - bitcoind_rpc_host: localhost
 - bitcoind_rpc_port: 18443
 - indexer_url: 127.0.0.1:50001
-- proxy_endpoint: rpc://127.0.0.1:3000/json-rpc
 
 To unlock a regtest nodes running in docker use the following local services:
 - bitcoind_rpc_username: user
@@ -159,7 +248,6 @@ To unlock a regtest nodes running in docker use the following local services:
 - bitcoind_rpc_host: bitcoind
 - bitcoind_rpc_port: 18443
 - indexer_url: electrs:50001
-- proxy_endpoint: rpc://proxy:3000/json-rpc
 
 ### Testnet
 
@@ -194,7 +282,6 @@ When unlocking testnet3 nodes you can use the following services:
 - bitcoind_rpc_host: electrum.iriswallet.com
 - bitcoind_rpc_port: 18332
 - indexer_url: ssl://electrum.iriswallet.com:50013
-- proxy_endpoint: rpcs://proxy.iriswallet.com/0.2/json-rpc
 
 #### Testnet4
 
@@ -219,9 +306,11 @@ The node currently exposes the following APIs:
 - `/apay/new` (POST)
 - `/apay/outboundinvoice` (POST)
 - `/assetbalance` (POST)
+- `/assetlink` (POST)
 - `/assetmetadata` (POST)
 - `/backup` (POST)
 - `/btcbalance` (POST)
+- `/burn` (POST)
 - `/cancelhodlinvoice` (POST)
 - `/changepassword` (POST)
 - `/checkindexerurl` (POST)
@@ -238,6 +327,7 @@ The node currently exposes the following APIs:
 - `/failtransfers` (POST)
 - `/getassetmedia` (POST)
 - `/getchannelid` (POST)
+- `/getconsignment` (POST)
 - `/getpayment` (POST)
 - `/getswap` (POST)
 - `/inflate` (POST)
@@ -264,6 +354,8 @@ The node currently exposes the following APIs:
 - `/nodeinfo` (GET)
 - `/openchannel` (POST)
 - `/postassetmedia` (POST)
+- `/provideoutofbandack` (POST)
+- `/provideoutofbandconsignment` (POST)
 - `/refreshtransfers` (POST)
 - `/restore` (POST)
 - `/revoketoken` (POST)
@@ -391,6 +483,43 @@ The node exposes a `/revoketoken` endpoint for this purpose.
 Internally, the node extracts the token’s revocation identifiers and adds them
 to its revocation list. Every request checks this list before authenticating.
 
+### RGB consignment transport
+
+RGB consignments can be exchanged in three ways:
+
+- **Lightning P2P**: automatic during channel opening and LN RGB payments.
+- **Out-of-band**: pass empty `transport_endpoints` to `/rgbinvoice` and
+  `/sendrgb`, then exchange the consignment and ACK manually via
+  `/getconsignment`, `/provideoutofbandconsignment`, and
+  `/provideoutofbandack`. No extra service required.
+- **RGB proxy**: pass proxy URLs in `transport_endpoints`; consignments and
+  ACKs are relayed automatically by an [RGB proxy server]. Use
+  `/checkproxyendpoint` to validate a URL.
+
+Example proxy URLs (only when using proxy transport):
+
+| Environment | `transport_endpoints` |
+|-------------|-----------------------|
+| Local | `rpc://127.0.0.1:3000/json-rpc` |
+| Public | `rpcs://proxy.iriswallet.com/0.2/json-rpc` |
+
+## Sync modes
+
+The node keeps LDK in sync with the chain in one of two ways, selected at unlock
+time via the `ldk_chain_sync` field of the `/unlock` payload (see the
+`UnlockRequest` schema in `openapi.yaml` for the exact shape):
+
+- `BlockSync`: consume full blocks from a trusted/local `bitcoind` over JSON-RPC.
+  The `bitcoind_rpc_*` parameters are provided under this mode's `config`. This
+  is the more trust-minimized option, since the node does not rely on an indexer
+  to tell it which transactions are relevant.
+- `TransactionSync`: sync through an electrum/esplora indexer, so no `bitcoind`
+  is needed. The indexer LDK syncs against is given under this mode's `config`
+  via `indexer_url` and can differ from the one the RGB wallet uses.
+
+Both modes are available in a stock build. See
+[Chain sync support](#chain-sync-support) to build with only one of them.
+
 ## Test
 
 Tests for a few scenarios using the regtest network are included. The same
@@ -401,6 +530,23 @@ Tests can be executed with:
 ```sh
 cargo test
 ```
+
+### Coverage
+
+Tests can also be run gathering code coverage, using [cargo-llvm-cov].
+
+To run the tests and generate an HTML coverage report:
+```sh
+./coverage.sh
+```
+The report path is output at the end of the run.
+
+To only run some test(s):
+```sh
+./coverage.sh -t <test_name>
+```
+
+See `./coverage.sh --help` for the available options.
 
 ## Projects using RLN
 
@@ -423,9 +569,7 @@ the node behaves exactly as before.
 
 Two independent data streams are backed up:
 
-- **Node KV state** — channel manager, channel monitors, payment info, swap
-  data and RGB channel info. Every update is written to both the local SQLite
-  database and the remote VSS server.
+- **Node KV state** — on supported non-mainnet networks, channel manager, channel monitors, payment info, swap data and RGB channel info. Every update is written to both the local SQLite database and the remote VSS server; channel-monitor updates are persisted remote-first, completing only once the VSS server has durably stored them. Mainnet replicates only the existing common wallet configuration mirrors; historical Lightning records and their pending replication remain inactive.
 - **RGB wallet data** — the wallet files managed by rgb-lib, backed up
   automatically after every state-changing wallet operation.
 
@@ -470,31 +614,18 @@ read and restored by a node initialized with the same mnemonic.
 
 ### Recovery
 
-On a fresh start `unlock` restores both replicated streams from VSS before
+On a fresh start `unlock` restores the applicable streams from VSS before
 the node finishes coming up:
 
 - the **KV stream** (channel manager, monitors, payments, scorer, swap data,
-  RGB channel info) is restored when the local database has no
-  channel-manager state;
+  RGB channel info) is restored on supported non-mainnet networks when the local
+  database has no channel-manager state. Mainnet does not restore this stream;
 - the **RGB wallet directory** (assets, transfers, allocations) is restored
   when the local wallet directory for this mnemonic's fingerprint is absent.
 
-Together these recover BTC balance, channels, and RGB assets without any
-extra calls — `unlock` is the only entry point. Each VSS store is owned by a
-single running node instance, so a second node pointed at the same store
-refuses to start to avoid corrupting state. After a previous owner shuts
-down its fence is intentionally left behind; on a legitimate device wipe and
-restore the operator must call `POST /vssclearfence` (or
-`SdkNode::vss_clear_fence`) once between `init` and `unlock` to take over
-the store. In internal-mnemonic mode this is authenticated by the wallet
-password; in external-signer mode (no mnemonic on the node) the password is
-ignored and the VSS identity is reconstructed from the persisted
-`key_source.json`, matching the identity the node acquires the fence under.
+These recover the on-chain wallet, including BTC and RGB assets, and on supported non-mainnet networks also Lightning state, without any extra calls — `unlock` is the only entry point, provided the node was initialized (`/init`) with the same mnemonic as the original device and started with the same `--vss-url` and `--network`. A different mnemonic maps to a different VSS store, so the node finds no backup and starts fresh without an error. Each VSS store is owned by a single running node instance, so a second node pointed at the same store refuses to start to avoid corrupting state. A graceful teardown (lock, shutdown, signal) releases the fence; after a crash or hard kill it is left behind and the operator must call `POST /vssclearfence` (or `SdkNode::vss_clear_fence`) once between `init` and `unlock` to take over the store. In internal-mnemonic mode this is authenticated by the wallet password; in external-signer mode (no mnemonic on the node) the password is ignored and the VSS identity is reconstructed from the persisted `key_source.json`, matching the identity the node acquires the fence under.
 
-VSS replication is best-effort: a write that fails to reach the server is
-queued and retried on later successful writes. The number of pending writes is
-reported by `GET /vssbackupinfo` so monitoring can alert on persistent
-staleness.
+Replication guarantees differ per stream. On supported non-mainnet networks, channel-monitor writes are remote-first: each write completes only after the VSS server durably stores it, and transient server failures are retried with capped exponential backoff until the server recovers. All other KV writes land in the local database first and are replicated to VSS best-effort: a write that fails to reach the server is queued and retried on later successful writes. The number of pending best-effort writes is reported by `GET /vssbackupinfo` so monitoring can alert on persistent staleness. On mainnet this counts only active common configuration retries; preserved historical Lightning intents are not loaded into the retry queue or included in this count.
 
 ### API endpoints (when VSS is enabled)
 - `POST /vssbackup` — trigger a manual RGB wallet backup
@@ -515,3 +646,4 @@ staleness.
 [Spectrum]: https://rgbspectrum.pages.dev/
 [Thunderstack]: https://thunderstack.org/
 [Tiramisu Wallet]: https://mainnet.tiramisuwallet.com/
+[cargo-llvm-cov]: https://github.com/taiki-e/cargo-llvm-cov

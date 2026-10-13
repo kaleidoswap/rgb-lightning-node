@@ -50,13 +50,17 @@ impl TunableNativeSignerHost {
 impl rgb_lightning_node::ExternalSignerHost for TunableNativeSignerHost {
     fn call(&self, request: Vec<u8>) -> Result<Vec<u8>, rgb_lightning_node::RlnError> {
         if !self.available.load(Ordering::Relaxed) {
-            return Err(rgb_lightning_node::RlnError::Internal);
+            return Err(rgb_lightning_node::RlnError::Internal(
+                "signer unavailable".to_string(),
+            ));
         }
         if self.fail_sign_rgb_psbt.load(Ordering::Relaxed) {
             let req = decode_signer_request_wire(&request)
-                .map_err(|_| rgb_lightning_node::RlnError::Internal)?;
+                .map_err(|e| rgb_lightning_node::RlnError::Internal(e.to_string()))?;
             if matches!(&req, SignerRequest::SignRgbPsbt { .. }) {
-                return Err(rgb_lightning_node::RlnError::Internal);
+                return Err(rgb_lightning_node::RlnError::Internal(
+                    "sign_rgb_psbt failure injected".to_string(),
+                ));
             }
         }
         self.inner.call(request)
@@ -74,10 +78,12 @@ fn attach_external_signer_host(
 
 fn unlock_with_attached_external_signer(node: &SdkNode, announce_alias: &str) {
     node.unlock_with_attached_external_signer(
-        Some("user".to_string()),
-        Some("password".to_string()),
-        Some("localhost".to_string()),
-        Some(18443),
+        SdkLdkChainSync::BlockSync {
+            bitcoind_rpc_username: "user".to_string(),
+            bitcoind_rpc_password: "password".to_string(),
+            bitcoind_rpc_host: "localhost".to_string(),
+            bitcoind_rpc_port: 18443,
+        },
         Some("127.0.0.1:50001".to_string()),
         Some(PROXY_ENDPOINT_LOCAL.to_string()),
         vec![],
@@ -89,6 +95,25 @@ fn unlock_with_attached_external_signer(node: &SdkNode, announce_alias: &str) {
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Block until every `127.0.0.1:<port>` in `ports` is bindable (i.e. released by a prior node),
+/// or `timeout` elapses. `SdkNode::shutdown()` returns before the OS tears down its listeners,
+/// so restarting a node on the same ports needs this to avoid an "Address already in use" race.
+fn wait_ports_free(ports: &[u16], timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    for &port in ports {
+        loop {
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "port {port} was not released within {timeout:?}"
+            );
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
 }
 
 fn make_native_signer(
@@ -104,6 +129,25 @@ fn make_native_signer(
     let _ = storage_dir; // kept to minimize churn in test callsites
     rgb_lightning_node::NativeExternalSigner::new(seed_hex, "regtest".to_string(), Some(true))
         .expect("create native signer")
+}
+
+/// Like [`make_native_signer`], but with a disk-backed VLS store: required whenever the test
+/// simulates a process restart with channels that must stay usable (a stateful validating
+/// signer cannot validate commitment state it never tracked).
+fn make_native_signer_with_storage(
+    storage_dir: &std::path::Path,
+    seed_hex: Option<String>,
+) -> Arc<rgb_lightning_node::NativeExternalSigner> {
+    let seed_hex = seed_hex.unwrap_or_else(|| {
+        std::env::var("RLN_TEST_NATIVE_SIGNER_SEED_HEX").unwrap_or_else(|_| "11".repeat(32))
+    });
+    rgb_lightning_node::NativeExternalSigner::new_with_storage(
+        seed_hex,
+        "regtest".to_string(),
+        Some(true),
+        storage_dir.display().to_string(),
+    )
+    .expect("create native signer with storage")
 }
 
 #[test]
@@ -129,10 +173,12 @@ fn external_init_unlock_and_restart_same_signer() {
             .expect("external init");
         node.unlock_with_native_external_signer(
             signer.clone(),
-            Some("user".to_string()),
-            Some("password".to_string()),
-            Some("localhost".to_string()),
-            Some(18443),
+            SdkLdkChainSync::BlockSync {
+                bitcoind_rpc_username: "user".to_string(),
+                bitcoind_rpc_password: "password".to_string(),
+                bitcoind_rpc_host: "localhost".to_string(),
+                bitcoind_rpc_port: 18443,
+            },
             Some("127.0.0.1:50001".to_string()),
             Some(PROXY_ENDPOINT_LOCAL.to_string()),
             vec![],
@@ -150,10 +196,12 @@ fn external_init_unlock_and_restart_same_signer() {
         restarted
             .unlock_with_native_external_signer(
                 signer.clone(),
-                Some("user".to_string()),
-                Some("password".to_string()),
-                Some("localhost".to_string()),
-                Some(18443),
+                SdkLdkChainSync::BlockSync {
+                    bitcoind_rpc_username: "user".to_string(),
+                    bitcoind_rpc_password: "password".to_string(),
+                    bitcoind_rpc_host: "localhost".to_string(),
+                    bitcoind_rpc_port: 18443,
+                },
                 Some("127.0.0.1:50001".to_string()),
                 Some(PROXY_ENDPOINT_LOCAL.to_string()),
                 vec![],
@@ -192,10 +240,12 @@ fn external_restart_with_mismatched_signer_fails_unlock() {
             .expect("external init");
         node.unlock_with_native_external_signer(
             signer_a.clone(),
-            Some("user".to_string()),
-            Some("password".to_string()),
-            Some("localhost".to_string()),
-            Some(18443),
+            SdkLdkChainSync::BlockSync {
+                bitcoind_rpc_username: "user".to_string(),
+                bitcoind_rpc_password: "password".to_string(),
+                bitcoind_rpc_host: "localhost".to_string(),
+                bitcoind_rpc_port: 18443,
+            },
             Some("127.0.0.1:50001".to_string()),
             Some(PROXY_ENDPOINT_LOCAL.to_string()),
             vec![],
@@ -211,20 +261,25 @@ fn external_restart_with_mismatched_signer_fails_unlock() {
         let err = restarted
             .unlock_with_native_external_signer(
                 signer_b,
-                Some("user".to_string()),
-                Some("password".to_string()),
-                Some("localhost".to_string()),
-                Some(18443),
+                SdkLdkChainSync::BlockSync {
+                    bitcoind_rpc_username: "user".to_string(),
+                    bitcoind_rpc_password: "password".to_string(),
+                    bitcoind_rpc_host: "localhost".to_string(),
+                    bitcoind_rpc_port: 18443,
+                },
                 Some("127.0.0.1:50001".to_string()),
                 Some(PROXY_ENDPOINT_LOCAL.to_string()),
                 vec![],
                 Some("RLN_external".to_string()),
             )
             .expect_err("unlock must fail for mismatched signer");
-        let msg = err.to_string().to_lowercase();
         assert!(
-            msg.contains("conflict") || msg.contains("mismatch"),
-            "unexpected error for mismatched signer: {msg}"
+            matches!(
+                err,
+                rgb_lightning_node::RlnError::ExternalSignerMismatch(_)
+                    | rgb_lightning_node::RlnError::Conflict(_)
+            ),
+            "unexpected error for mismatched signer: {err}"
         );
         restarted.shutdown();
     }));
@@ -376,6 +431,132 @@ fn external_signer_sign_rgb_psbt_failure_surfaces_on_send_btc_mock() {
     }
 }
 
+/// Regression: a vanilla channel's `FundingGenerationReady` whose `SignRgbPsbt` fails (a remote
+/// signer briefly unreachable, or a malformed reply) used to panic the event task at
+/// `rgb_sign_psbt(..).unwrap()`, killing the funding permanently. The handler must instead take
+/// the cooperative path: abort the staged pending vanilla tx — at that point the
+/// `PENDING_FUNDING_NAMESPACE` mapping does not exist yet, so nothing else could ever abort it —
+/// and replay the event. Once the signer recovers, the replayed event re-stages the funding from
+/// the *released* UTXOs and broadcasts: that recovery is also the proof of cleanup, since a leaked
+/// pending vanilla tx would keep the coins locked and the replay could never fund the channel.
+#[test]
+#[serial]
+fn external_signer_vanilla_funding_sign_failure_is_retryable() {
+    ensure_regtest_available();
+    let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+
+    const PORT_OFF: u16 = 330;
+    let da = NODE_A_DAEMON_PORT + PORT_OFF;
+    let pa = NODE_A_PEER_PORT + PORT_OFF;
+    let db = NODE_B_DAEMON_PORT + PORT_OFF;
+    let pb = NODE_B_PEER_PORT + PORT_OFF;
+
+    let test_dir = test_dir("sdk_external_vanilla_funding_sign_fail");
+    if test_dir.exists() {
+        fs::remove_dir_all(&test_dir).expect("remove previous lib_sdk test dir");
+    }
+    fs::create_dir_all(&test_dir).expect("create lib_sdk test dir");
+    let node_a_dir = test_dir.join("node_a");
+    let node_b_dir = test_dir.join("node_b");
+    let signer_a_dir = test_dir.join("signer_a");
+
+    let signer = make_native_signer(&signer_a_dir, None);
+    let bootstrap = signer.bootstrap().expect("bootstrap");
+    let host = Arc::new(TunableNativeSignerHost::new(signer));
+
+    let node_a = make_node(&node_a_dir, da, pa);
+    let node_b = make_node(&node_b_dir, db, pb);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        node_a
+            .init_with_external_signer(clone_bootstrap(&bootstrap))
+            .expect("node A external init");
+        attach_external_signer_host(&node_a, host.clone(), &bootstrap);
+        unlock_with_attached_external_signer(&node_a, "RLN_ext_vanilla_fund_fail");
+
+        node_b
+            .init("nodeBpass".to_string(), None)
+            .expect("node B init");
+        node_b
+            .unlock(unlock_request("nodeBpass"))
+            .expect("node B unlock");
+
+        ensure_funded(
+            &node_a,
+            2 * OPEN_CHANNEL_CAPACITY_SAT,
+            "node A vanilla funding",
+        );
+
+        let peer_uri = format!(
+            "{}@127.0.0.1:{pb}",
+            node_b.node_info().expect("node B node_info").pubkey
+        );
+        node_a.connectpeer(peer_uri.clone()).expect("connectpeer");
+
+        // Fail SignRgbPsbt from before the open so the very first `FundingGenerationReady` hits
+        // it. The vanilla open itself returns right after `create_channel`; the signing happens in
+        // the background event task.
+        host.set_fail_sign_rgb_psbt(true);
+        node_a
+            .openchannel(SdkOpenChannelRequest {
+                peer_pubkey_and_opt_addr: peer_uri,
+                capacity_sat: OPEN_CHANNEL_CAPACITY_SAT,
+                push_msat: OPEN_CHANNEL_PUSH_MSAT,
+                public: false,
+                with_anchors: true,
+                fee_base_msat: None,
+                fee_proportional_millionths: None,
+                temporary_channel_id: None,
+                asset_id: None,
+                asset_amount: None,
+                push_asset_amount: None,
+                virtual_open_mode: None,
+            })
+            .expect("openchannel (vanilla)");
+
+        // Give the event task time to hit the failing signer at least once. The node must stay
+        // responsive (no panicked event task) and must not have broadcast any funding tx.
+        thread::sleep(Duration::from_secs(5));
+        let channels = node_a
+            .list_channels()
+            .expect("list_channels while the signer is failing");
+        assert!(
+            channels.iter().all(|c| c.funding_txid.is_none()),
+            "no funding tx may be broadcast while SignRgbPsbt fails"
+        );
+
+        // Signer recovers: the replayed event must be able to stage a fresh funding tx from the
+        // released UTXOs and broadcast it.
+        host.set_fail_sign_rgb_psbt(false);
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        loop {
+            node_a.sync().expect("node A sync");
+            let funded = node_a
+                .list_channels()
+                .expect("list_channels while waiting for funding tx")
+                .iter()
+                .any(|c| c.funding_txid.is_some());
+            if funded {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "channel funding was never broadcast after the signer recovered — the \
+                 FundingGenerationReady retry path is broken"
+            );
+            thread::sleep(Duration::from_secs(1));
+        }
+
+        node_a.shutdown();
+        node_b.shutdown();
+        thread::sleep(Duration::from_millis(300));
+    }));
+
+    if result.is_err() {
+        panic!("external signer vanilla funding sign-failure retry lib_sdk test failed");
+    }
+}
+
 /// RGB payment with node A (internal signer) and node B (native in-process VLS signer).
 ///
 /// Regtest: `./regtest.sh start`, then:
@@ -427,10 +608,12 @@ fn rgb_native_external_signer_mixed_one_hop_payment_quick() {
         node_b
             .unlock_with_native_external_signer(
                 signer_b.clone(),
-                Some("user".to_string()),
-                Some("password".to_string()),
-                Some("localhost".to_string()),
-                Some(18443),
+                SdkLdkChainSync::BlockSync {
+                    bitcoind_rpc_username: "user".to_string(),
+                    bitcoind_rpc_password: "password".to_string(),
+                    bitcoind_rpc_host: "localhost".to_string(),
+                    bitcoind_rpc_port: 18443,
+                },
                 Some("127.0.0.1:50001".to_string()),
                 Some(PROXY_ENDPOINT_LOCAL.to_string()),
                 vec![],
@@ -443,7 +626,7 @@ fn rgb_native_external_signer_mixed_one_hop_payment_quick() {
             .createutxos(SdkCreateUtxosRequest {
                 up_to: false,
                 num: Some(25),
-                size: None,
+                size: Some(32_000),
                 fee_rate: CREATE_UTXOS_FEE_RATE,
                 skip_sync: false,
             })
@@ -499,6 +682,7 @@ fn rgb_native_external_signer_mixed_one_hop_payment_quick() {
                 asset_id: Some(asset_id.clone()),
                 asset_amount: Some(PAY_ASSET),
                 payment_hash: None,
+                description: None,
                 description_hash: None,
                 min_final_cltv_expiry_delta: None,
             })
@@ -572,10 +756,12 @@ fn rgb_native_external_signer_mixed_one_hop_payment_roundtrip() {
         node_b
             .unlock_with_native_external_signer(
                 signer_b.clone(),
-                Some("user".to_string()),
-                Some("password".to_string()),
-                Some("localhost".to_string()),
-                Some(18443),
+                SdkLdkChainSync::BlockSync {
+                    bitcoind_rpc_username: "user".to_string(),
+                    bitcoind_rpc_password: "password".to_string(),
+                    bitcoind_rpc_host: "localhost".to_string(),
+                    bitcoind_rpc_port: 18443,
+                },
                 Some("127.0.0.1:50001".to_string()),
                 Some(PROXY_ENDPOINT_LOCAL.to_string()),
                 vec![],
@@ -588,7 +774,7 @@ fn rgb_native_external_signer_mixed_one_hop_payment_roundtrip() {
             .createutxos(SdkCreateUtxosRequest {
                 up_to: false,
                 num: Some(25),
-                size: None,
+                size: Some(32_000),
                 fee_rate: CREATE_UTXOS_FEE_RATE,
                 skip_sync: false,
             })
@@ -642,6 +828,7 @@ fn rgb_native_external_signer_mixed_one_hop_payment_roundtrip() {
                 asset_id: Some(asset_id.clone()),
                 asset_amount: Some(PAY_ASSET),
                 payment_hash: None,
+                description: None,
                 description_hash: None,
                 min_final_cltv_expiry_delta: None,
             })
@@ -665,6 +852,7 @@ fn rgb_native_external_signer_mixed_one_hop_payment_roundtrip() {
                 asset_id: Some(asset_id.clone()),
                 asset_amount: Some(PAY_ASSET),
                 payment_hash: None,
+                description: None,
                 description_hash: None,
                 min_final_cltv_expiry_delta: None,
             })
@@ -734,10 +922,12 @@ fn rgb_native_external_signer_mixed_one_hop_payment_coop_close_settles_to_chain(
         node_b
             .unlock_with_native_external_signer(
                 signer_b.clone(),
-                Some("user".to_string()),
-                Some("password".to_string()),
-                Some("localhost".to_string()),
-                Some(18443),
+                SdkLdkChainSync::BlockSync {
+                    bitcoind_rpc_username: "user".to_string(),
+                    bitcoind_rpc_password: "password".to_string(),
+                    bitcoind_rpc_host: "localhost".to_string(),
+                    bitcoind_rpc_port: 18443,
+                },
                 Some("127.0.0.1:50001".to_string()),
                 Some(PROXY_ENDPOINT_LOCAL.to_string()),
                 vec![],
@@ -750,7 +940,7 @@ fn rgb_native_external_signer_mixed_one_hop_payment_coop_close_settles_to_chain(
             .createutxos(SdkCreateUtxosRequest {
                 up_to: false,
                 num: Some(25),
-                size: None,
+                size: Some(32_000),
                 fee_rate: CREATE_UTXOS_FEE_RATE,
                 skip_sync: false,
             })
@@ -809,6 +999,7 @@ fn rgb_native_external_signer_mixed_one_hop_payment_coop_close_settles_to_chain(
                 asset_id: Some(asset_id.clone()),
                 asset_amount: Some(PAY_ASSET),
                 payment_hash: None,
+                description: None,
                 description_hash: None,
                 min_final_cltv_expiry_delta: None,
             })
@@ -847,5 +1038,415 @@ fn rgb_native_external_signer_mixed_one_hop_payment_coop_close_settles_to_chain(
         panic!(
             "rgb_native_external_signer_mixed_one_hop_payment_coop_close_settles_to_chain failed"
         );
+    }
+}
+
+/// End-to-end regression for the restored-virtual-channel signing failure: a
+/// `trusted_no_broadcast` virtual channel opened by a node with an in-process
+/// `NativeExternalSigner` (disk-backed VLS store) must keep settling payments in both
+/// directions after the LDK node restarts on the same storage.
+///
+/// This exercises the two-part fix together:
+/// 1. `NativeExternalSigner::new_with_storage` persists the VLS node (channels, commitment
+///    counters, dbid high-water mark) so a stateful validating signer can still validate
+///    commitment state after a restart — without it, the restored channel force-closes with
+///    "Failed to validate our commitment".
+/// 2. The signer-external `derive_stub_per_commitment_point` fix keeps the synthesized
+///    pre-setup commitment-point fallback from panicking on a 41-byte CLN-style `ChannelId`
+///    (`copy_from_slice: source slice length (41) does not match destination slice length (32)`
+///    at vls-core `channel.rs:119`), which on a tokio worker poisoned the LDK `ChannelManager`
+///    mutex and bricked the node.
+///
+/// The unit-level proof that the fallback no longer panics (and now derives the same point a
+/// real vls-core node would) lives in signer-external's
+/// `stub_per_commitment_point_matches_vls_node_derivation` parity test; this integration test
+/// covers the surrounding restart-and-pay flow.
+#[test]
+#[serial]
+fn external_signer_virtual_channel_survives_restart() {
+    ensure_regtest_available();
+    let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+
+    const PORT_OFF: u16 = 150;
+    let da = NODE_A_DAEMON_PORT + PORT_OFF;
+    let pa = NODE_A_PEER_PORT + PORT_OFF;
+    let db = NODE_B_DAEMON_PORT + PORT_OFF;
+    let pb = NODE_B_PEER_PORT + PORT_OFF;
+
+    let test_dir = test_dir("sdk_external_signer_virtual_restart");
+    if test_dir.exists() {
+        fs::remove_dir_all(&test_dir).expect("remove previous lib_sdk test dir");
+    }
+    fs::create_dir_all(&test_dir).expect("create lib_sdk test dir");
+    let host_dir = test_dir.join("host");
+    let device_dir = test_dir.join("device");
+    let signer_dir = test_dir.join("signer_device");
+
+    // The device holds the in-process VLS signer and is the side that restarts. Its node id is
+    // known up front (derived from the signer seed), which lets us allowlist it on the host
+    // before either node runs.
+    let signer = make_native_signer_with_storage(&signer_dir, None);
+    let device_pubkey = signer
+        .bootstrap()
+        .expect("signer bootstrap")
+        .node_id
+        .parse::<bitcoin::secp256k1::PublicKey>()
+        .expect("device pubkey");
+
+    let host = make_node_with_virtual(&host_dir, da, pa, Some(vec![device_pubkey]));
+    let device = make_node_with_virtual(&device_dir, db, pb, None);
+
+    let unlock_device = |node: &SdkNode, signer: &Arc<rgb_lightning_node::NativeExternalSigner>| {
+        node.unlock_with_native_external_signer(
+            signer.clone(),
+            SdkLdkChainSync::BlockSync {
+                bitcoind_rpc_username: "user".to_string(),
+                bitcoind_rpc_password: "password".to_string(),
+                bitcoind_rpc_host: "localhost".to_string(),
+                bitcoind_rpc_port: 18443,
+            },
+            Some("127.0.0.1:50001".to_string()),
+            Some(PROXY_ENDPOINT_LOCAL.to_string()),
+            vec![],
+            Some("RLN_virtual_device".to_string()),
+        )
+    };
+
+    let wait_virtual_channel_usable = |node: &SdkNode, peer: &str, label: &str| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let usable = node
+                .list_channels()
+                .unwrap_or_default()
+                .into_iter()
+                .any(|c| c.peer_pubkey.to_string() == peer && c.ready && c.is_usable);
+            if usable {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "virtual channel not usable within 60s ({label})"
+            );
+            thread::sleep(Duration::from_millis(500));
+        }
+    };
+
+    let pay = |payer: &SdkNode, payee: &SdkNode, amt_msat: u64, label: &str| {
+        let invoice = payee
+            .ln_invoice(LnInvoiceRequest {
+                amt_msat: Some(amt_msat),
+                expiry_sec: 900,
+                asset_id: None,
+                asset_amount: None,
+                payment_hash: None,
+                description: None,
+                description_hash: None,
+                min_final_cltv_expiry_delta: None,
+            })
+            .unwrap_or_else(|e| panic!("{label}: ln_invoice: {e:?}"))
+            .invoice;
+        let send = payer
+            .sendpayment(SdkSendPaymentRequest {
+                invoice: invoice.to_string(),
+                amt_msat: None,
+                asset_id: None,
+                asset_amount: None,
+            })
+            .unwrap_or_else(|e| panic!("{label}: sendpayment: {e:?}"));
+        let payment_hash = send.payment_hash.expect("payment_hash");
+        wait_for_payment_status(payer, &payment_hash, Duration::from_secs(120));
+        wait_for_payment_status(payee, &payment_hash, Duration::from_secs(120));
+    };
+
+    let host_pubkey_cell: OnceLock<String> = OnceLock::new();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        host.init("hostPass".to_string(), None).expect("host init");
+        device
+            .init_with_native_external_signer(signer.clone())
+            .expect("device init with signer");
+
+        host.unlock(unlock_request("hostPass"))
+            .expect("host unlock");
+        unlock_device(&device, &signer).expect("device unlock");
+
+        let host_pubkey = host.node_info().expect("host node_info").pubkey.to_string();
+        host_pubkey_cell.set(host_pubkey.clone()).unwrap();
+
+        // The device (opener) needs on-chain funds for the never-broadcast virtual funding.
+        ensure_funded(&device, 200_000, "device");
+        mine(1);
+        device.sync().expect("device sync after fund");
+        host.sync().expect("host sync");
+
+        let host_uri = format!("{host_pubkey}@127.0.0.1:{pa}");
+        device.connectpeer(host_uri.clone()).expect("connectpeer");
+
+        device
+            .openchannel(SdkOpenChannelRequest {
+                peer_pubkey_and_opt_addr: host_uri,
+                capacity_sat: 100_000,
+                push_msat: 30_000_000,
+                public: false,
+                with_anchors: true,
+                fee_base_msat: None,
+                fee_proportional_millionths: None,
+                temporary_channel_id: None,
+                asset_id: None,
+                asset_amount: None,
+                push_asset_amount: None,
+                virtual_open_mode: Some("trusted_no_broadcast".to_string()),
+            })
+            .expect("device opens trusted virtual channel");
+
+        wait_virtual_channel_usable(&device, &host_pubkey, "device, fresh");
+        let device_pubkey_str = device_pubkey.to_string();
+        wait_virtual_channel_usable(&host, &device_pubkey_str, "host, fresh");
+
+        // Fresh-channel baseline (works even without the fix).
+        pay(&device, &host, PAYMENT_MSAT, "fresh device->host");
+        pay(&host, &device, PAYMENT_MSAT, "fresh host->device");
+
+        // Restart the device process: same storage, same signer seed — the virtual channel is
+        // restored from persistence while the in-process VLS node starts over.
+        device.shutdown();
+        thread::sleep(Duration::from_millis(500));
+    }));
+    if result.is_err() {
+        host.shutdown();
+        panic!("external_signer_virtual_channel_survives_restart failed before restart");
+    }
+
+    // Release the pre-restart device node (its LDK state persists to `device_dir`).
+    drop(device);
+
+    // Wait for the device node's daemon + peer listeners to actually free their ports before
+    // rebinding them for the restarted node. `shutdown()` returns before the OS has fully
+    // released the sockets, so on a loaded machine an immediate rebind races the old listener
+    // and the restarted node fails to start ("Address already in use") — a failure that shows
+    // up under load but not on an idle box.
+    wait_ports_free(&[db, pb], Duration::from_secs(30));
+
+    // Restart the device node on the same storage, REUSING the signer instance.
+    //
+    // This is an in-process restart: a fresh `NativeExternalSigner::new_with_storage` cannot
+    // open the redb store while the pre-restart signer still holds its exclusive lock (only a
+    // real process exit releases it, which a single test process cannot do). The signer's VLS
+    // store is write-through to disk, so its live in-memory state is byte-identical to what a
+    // fresh process would restore from `signer_dir` — reusing the instance exercises the same
+    // restored-channel-state code path without fighting the single-writer lock. What actually
+    // restarts is the LDK node (a new `SdkNode` over the persisted channel).
+    //
+    // The persistent store (`new_with_storage`) is what makes the restored channel usable at
+    // all; the signer-external fix is what keeps its stub commitment-point fallback from
+    // panicking in `ldk_channel_keys_id()`. With the ephemeral `NativeExternalSigner::new`
+    // (no disk store) this scenario is unrecoverable after a real restart.
+    let device = make_node_with_virtual(&device_dir, db, pb, None);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        unlock_device(&device, &signer).expect("device unlock after restart");
+
+        let host_pubkey = host_pubkey_cell.get().expect("host pubkey").clone();
+        let host_uri = format!("{host_pubkey}@127.0.0.1:{pa}");
+        // Reconnect may briefly race the restarted node's peer-handler coming up; retry.
+        let reconnect_deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            match device.connectpeer(host_uri.clone()) {
+                Ok(_) => break,
+                Err(_) if std::time::Instant::now() < reconnect_deadline => {
+                    thread::sleep(Duration::from_millis(500));
+                }
+                Err(e) => panic!("reconnect after restart failed: {e:?}"),
+            }
+        }
+        wait_virtual_channel_usable(&device, &host_pubkey, "device, restored");
+
+        // The regression: the first payments over the RESTORED virtual channel. Pre-fix, the
+        // background commitment signing panicked in ldk_channel_keys_id() and the payment
+        // never settled (node bricked with a poisoned ChannelManager mutex).
+        pay(&device, &host, PAYMENT_MSAT, "restored device->host");
+        pay(&host, &device, PAYMENT_MSAT, "restored host->device");
+
+        device.shutdown();
+        host.shutdown();
+        thread::sleep(Duration::from_millis(300));
+    }));
+
+    if result.is_err() {
+        panic!("external_signer_virtual_channel_survives_restart failed after restart");
+    }
+}
+
+/// `/sendrgb` in external-signer mode goes through the begin/sign/end split, so the `send_end`
+/// variant it calls must still generate and post the consignment. Guards against regressing it to
+/// `send_end_db_update_only`, which broadcasts and updates the DB but produces no consignment: the
+/// sender would look fine while the recipient could never receive the asset.
+#[test]
+#[serial]
+fn external_signer_send_rgb_delivers_consignment_to_recipient() {
+    ensure_regtest_available();
+    let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+
+    const PORT_OFF: u16 = 270;
+    const SEED_AMOUNT: u64 = 500;
+    const SEND_AMOUNT: u64 = 200;
+    let da = NODE_A_DAEMON_PORT + PORT_OFF;
+    let pa = NODE_A_PEER_PORT + PORT_OFF;
+    let db = NODE_B_DAEMON_PORT + PORT_OFF;
+    let pb = NODE_B_PEER_PORT + PORT_OFF;
+
+    let test_dir = test_dir("sdk_external_signer_send_rgb");
+    if test_dir.exists() {
+        fs::remove_dir_all(&test_dir).expect("remove previous lib_sdk test dir");
+    }
+    fs::create_dir_all(&test_dir).expect("create lib_sdk test dir");
+    let node_a_dir = test_dir.join("node_a");
+    let node_b_dir = test_dir.join("node_b");
+    let signer_a_dir = test_dir.join("signer_a");
+
+    // node A (the sender) runs in external-signer mode, node B receives normally
+    let signer_a = make_native_signer(&signer_a_dir, None);
+    let node_a = make_node(&node_a_dir, da, pa);
+    let node_b = make_node(&node_b_dir, db, pb);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        node_a
+            .init_with_native_external_signer(signer_a.clone())
+            .expect("node A init native external signer");
+        node_b
+            .init("nodeBpass".to_string(), None)
+            .expect("node B init");
+
+        node_a
+            .unlock_with_native_external_signer(
+                signer_a.clone(),
+                SdkLdkChainSync::BlockSync {
+                    bitcoind_rpc_username: "user".to_string(),
+                    bitcoind_rpc_password: "password".to_string(),
+                    bitcoind_rpc_host: "localhost".to_string(),
+                    bitcoind_rpc_port: 18443,
+                },
+                Some("127.0.0.1:50001".to_string()),
+                Some(PROXY_ENDPOINT_LOCAL.to_string()),
+                vec![],
+                Some("RLN_external_send_rgb".to_string()),
+            )
+            .expect("node A unlock native external signer");
+        node_b
+            .unlock(unlock_request("nodeBpass"))
+            .expect("node B unlock");
+
+        fund_and_create_utxos(&node_a, "node A external send_rgb");
+        fund_and_create_utxos(&node_b, "node B external send_rgb");
+        mine(1);
+        node_a.sync().expect("node A sync after fund");
+        node_b.sync().expect("node B sync after fund");
+
+        // asset issuance is not supported in external-signer mode, so node B issues and seeds
+        // node A; the send under test is the one node A (external signer) makes back to node B
+        let asset_id = node_b
+            .issueassetnia(SdkIssueAssetNiaRequest {
+                amounts: vec![1_000],
+                ticker: "EXTS".to_string(),
+                name: "ExternalSend".to_string(),
+                precision: 0,
+            })
+            .expect("node B issueassetnia")
+            .asset_id;
+
+        let seed_recipient_id = node_a
+            .rgbinvoice(SdkRgbInvoiceRequest {
+                asset_id: None,
+                assignment_kind: None,
+                assignment_amount: None,
+                duration_seconds: Some(3600),
+                min_confirmations: 1,
+                witness: false,
+            })
+            .expect("node A rgbinvoice (seed)")
+            .recipient_id;
+        node_b
+            .send_rgb(SendRgbRequest {
+                donation: true,
+                fee_rate: CREATE_UTXOS_FEE_RATE,
+                min_confirmations: 1,
+                recipient_groups: vec![AssetRecipients {
+                    asset_id: asset_id.clone(),
+                    recipients: vec![RgbRecipient {
+                        recipient_id: RecipientId(seed_recipient_id.0),
+                        witness_data: None,
+                        assignment_kind: AssignmentKind::Fungible,
+                        assignment_amount: Some(SEED_AMOUNT),
+                        transport_endpoints: vec![TransportEndpoint(
+                            PROXY_ENDPOINT_LOCAL.to_string(),
+                        )],
+                    }],
+                }],
+            })
+            .expect("node B send_rgb (seed)");
+        mine(1);
+        refresh_transfers(&node_a);
+        refresh_transfers(&node_a);
+        refresh_transfers(&node_b);
+        assert_eq!(
+            asset_balance_spendable(&node_a, &asset_id),
+            SEED_AMOUNT,
+            "external-signer node must first receive the asset"
+        );
+
+        // the send under test: node A runs in external-signer mode, so /sendrgb goes through the
+        // begin/sign/end split and must still generate and post a consignment
+        let recipient_id = node_b
+            .rgbinvoice(SdkRgbInvoiceRequest {
+                asset_id: None,
+                assignment_kind: None,
+                assignment_amount: None,
+                duration_seconds: Some(3600),
+                min_confirmations: 1,
+                witness: false,
+            })
+            .expect("node B rgbinvoice")
+            .recipient_id;
+        node_a
+            .send_rgb(SendRgbRequest {
+                donation: true,
+                fee_rate: CREATE_UTXOS_FEE_RATE,
+                min_confirmations: 1,
+                recipient_groups: vec![AssetRecipients {
+                    asset_id: asset_id.clone(),
+                    recipients: vec![RgbRecipient {
+                        recipient_id: RecipientId(recipient_id.0),
+                        witness_data: None,
+                        assignment_kind: AssignmentKind::Fungible,
+                        assignment_amount: Some(SEND_AMOUNT),
+                        transport_endpoints: vec![TransportEndpoint(
+                            PROXY_ENDPOINT_LOCAL.to_string(),
+                        )],
+                    }],
+                }],
+            })
+            .expect("node A (external signer) send_rgb");
+
+        mine(1);
+        refresh_transfers(&node_b);
+        refresh_transfers(&node_b);
+        refresh_transfers(&node_a);
+
+        // the recipient can only settle this if the consignment was generated and posted
+        assert_eq!(
+            asset_balance_spendable(&node_b, &asset_id),
+            1_000 - SEED_AMOUNT + SEND_AMOUNT,
+            "recipient must receive the asset sent by an external-signer node"
+        );
+        assert_eq!(
+            asset_balance_spendable(&node_a, &asset_id),
+            SEED_AMOUNT - SEND_AMOUNT,
+        );
+
+        node_a.shutdown();
+        node_b.shutdown();
+        thread::sleep(Duration::from_millis(300));
+    }));
+
+    if result.is_err() {
+        panic!("external_signer_send_rgb_delivers_consignment_to_recipient failed");
     }
 }

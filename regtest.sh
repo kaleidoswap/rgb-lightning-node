@@ -65,12 +65,42 @@ _wait_for_electrs() {
     done
 }
 
+_wait_for_proxy() {
+    # wait for proxy to be responding to requests
+    start_time=$(date +%s)
+    until curl -s http://127.0.0.1:3000 >/dev/null 2>&1; do
+        current_time=$(date +%s)
+        if [ $((current_time - start_time)) -gt $TIMEOUT ]; then
+            echo "Timeout waiting for proxy to start"
+            $COMPOSE logs proxy
+            exit 1
+        fi
+        sleep 1
+    done
+}
+
+_wait_for_esplora() {
+    start_time=$(date +%s)
+    until curl --fail --silent "http://127.0.0.1:3002/block-height/0" >/dev/null; do
+        current_time=$(date +%s)
+        if [ $((current_time - start_time)) -gt $TIMEOUT ]; then
+            echo "Timeout waiting for Esplora to start"
+            $COMPOSE --profile esplora logs esplora
+            exit 1
+        fi
+        sleep 1
+    done
+}
+
 _start_services() {
     _stop_services
 
     mkdir -p data{core,index,ldk0,ldk1,ldk2,rgs}
     # see compose.yaml for the exposed ports
     EXPOSED_PORTS=(3000 50001)
+    if [ "${ESPLORA:-}" = "1" ]; then
+        EXPOSED_PORTS+=(3002)
+    fi
     for port in "${EXPOSED_PORTS[@]}"; do
         if _is_port_bound "$port"; then
             _die "port $port is already bound, services can't be started"
@@ -85,6 +115,15 @@ _start_services() {
     $COMPOSE up -d
     echo "waiting for electrs to have completed startup"
     _wait_for_electrs
+    echo "waiting for proxy to be ready"
+    _wait_for_proxy
+
+    if [ "${ESPLORA:-}" = "1" ]; then
+        echo "starting Esplora server..."
+        $COMPOSE --profile esplora up -d esplora
+        _wait_for_esplora
+        echo "Esplora server available at http://localhost:3002"
+    fi
 
     # optionally start VSS server
     if [ "${VSS:-}" = "1" ]; then
@@ -95,7 +134,7 @@ _start_services() {
 }
 
 _stop_services() {
-    $COMPOSE --profile gossip down -v --remove-orphans
+    $COMPOSE --profile gossip --profile vss --profile esplora down -v --remove-orphans
     rm -rf data{core,index,ldk0,ldk1,ldk2,rgs} 2>/dev/null || sudo rm -rf data{core,index,ldk0,ldk1,ldk2,rgs}
 }
 

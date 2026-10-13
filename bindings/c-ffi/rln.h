@@ -37,9 +37,14 @@ struct CResultString rln_address(const struct COpaqueStruct *node);
 
 struct CResultString rln_asset_balance(const struct COpaqueStruct *node, const char *asset_id);
 
+struct CResultString rln_asset_link_create(const struct COpaqueStruct *node,
+                                           const char *request_json);
+
 struct CResultString rln_asset_metadata(const struct COpaqueStruct *node, const char *asset_id);
 
 struct CResultString rln_btc_balance(const struct COpaqueStruct *node, bool skip_sync);
+
+struct CResultString rln_burn(const struct COpaqueStruct *node, const char *request_json);
 
 struct CResultString rln_cancel_hodl_invoice(const struct COpaqueStruct *node,
                                              const char *request_json);
@@ -81,6 +86,22 @@ struct CResultString rln_get_asset_media(const struct COpaqueStruct *node, const
 struct CResultString rln_get_channel_id(const struct COpaqueStruct *node,
                                         const char *temporary_channel_id_hex);
 
+/**
+ * Returns `{"bytes_hex": ...}` with the consignment of an outgoing transfer (send, burn,
+ * inflation, link), e.g. the proof of a burn to hand to whoever releases the burned amount.
+ */
+struct CResultString rln_get_consignment(const struct COpaqueStruct *node,
+                                         const char *asset_id,
+                                         const char *txid);
+
+/**
+ * Returns `{"path": ...}`: the local path of the same consignment [`rln_get_consignment`]
+ * returns, to read or share the file without copying it through the FFI.
+ */
+struct CResultString rln_get_consignment_path(const struct COpaqueStruct *node,
+                                              const char *asset_id,
+                                              const char *txid);
+
 struct CResultString rln_get_payment(const struct COpaqueStruct *node,
                                      const char *payment_hash_hex,
                                      const char *payment_type);
@@ -88,6 +109,12 @@ struct CResultString rln_get_payment(const struct COpaqueStruct *node,
 struct CResultString rln_get_swap(const struct COpaqueStruct *node,
                                   const char *payment_hash,
                                   bool taker_flag);
+
+struct CResultString rln_import_rgb_contract(const struct COpaqueStruct *node,
+                                             const char *request_json);
+
+struct CResultString rln_import_rgb_transfer_consignment(const struct COpaqueStruct *node,
+                                                         const char *request_json);
 
 struct CResultString rln_inflate(const struct COpaqueStruct *node, const char *request_json);
 
@@ -118,15 +145,13 @@ struct CResultString rln_list_peers(const struct COpaqueStruct *node);
 
 struct CResultString rln_list_swaps(const struct COpaqueStruct *node);
 
-struct CResultString rln_list_transactions(const struct COpaqueStruct *node, bool skip_sync);
+struct CResultString rln_list_transactions(const struct COpaqueStruct *node,
+                                           bool skip_sync,
+                                           const char *txid_opt);
 
-struct CResultString rln_list_transactions_by_txid(const struct COpaqueStruct *node,
-                                                   const char *txid,
-                                                   bool skip_sync);
-
-struct CResultString rln_list_transfers(const struct COpaqueStruct *node, const char *asset_id);
-
-struct CResultString rln_list_transfers_by_txid(const struct COpaqueStruct *node, const char *txid);
+struct CResultString rln_list_transfers(const struct COpaqueStruct *node,
+                                        const char *asset_id_opt,
+                                        const char *txid_opt);
 
 struct CResultString rln_list_unspents(const struct COpaqueStruct *node, bool skip_sync);
 
@@ -242,3 +267,7 @@ struct CResultString rln_taker(const struct COpaqueStruct *node, const char *req
 struct CResultString rln_uniffi_healthcheck(void);
 
 struct CResultString rln_uniffi_is_initialized(void);
+
+struct CResultString rln_verify_message(const struct COpaqueStruct *node,
+                                        const char *message,
+                                        const char *signature);

@@ -103,7 +103,7 @@ fn success() {
             node.createutxos(SdkCreateUtxosRequest {
                 up_to: false,
                 num: Some(CREATE_UTXOS_NUM),
-                size: None,
+                size: Some(32_000),
                 fee_rate: CREATE_UTXOS_FEE_RATE,
                 skip_sync: false,
             })
@@ -171,6 +171,7 @@ fn success() {
                 asset_id: Some(asset_id.clone()),
                 asset_amount: Some(asset_amount),
                 payment_hash: None,
+                description: None,
                 description_hash: None,
                 min_final_cltv_expiry_delta: None,
             })
@@ -238,6 +239,7 @@ fn success() {
                 asset_id: Some(asset_id.clone()),
                 asset_amount: Some(asset_amount),
                 payment_hash: None,
+                description: None,
                 description_hash: None,
                 min_final_cltv_expiry_delta: None,
             })
@@ -274,6 +276,7 @@ fn success() {
                 asset_id: Some(asset_id.clone()),
                 asset_amount: Some(asset_amount),
                 payment_hash: None,
+                description: None,
                 description_hash: None,
                 min_final_cltv_expiry_delta: None,
             })
@@ -308,6 +311,7 @@ fn success() {
                 asset_id: Some(asset_id.clone()),
                 asset_amount: Some(asset_amount),
                 payment_hash: None,
+                description: None,
                 description_hash: None,
                 min_final_cltv_expiry_delta: None,
             })
@@ -447,7 +451,7 @@ fn success() {
         assert_eq!(asset_balance_spendable(&node_c, &asset_id), 950);
 
         let transactions = node_a
-            .list_transactions(false)
+            .list_transactions(false, None)
             .expect("node A list_transactions");
         let tx_user = transactions
             .iter()
@@ -473,7 +477,7 @@ fn success() {
         assert!(tx_utxos.confirmation_time.is_some());
 
         let transfers = node_a
-            .list_transfers(asset_id.clone())
+            .list_transfers(Some(asset_id.clone()), None)
             .expect("node A list_transfers");
         let xfer_1 = transfers
             .iter()
@@ -504,8 +508,9 @@ fn success() {
         assert!(xfer_2.recipient_id.is_some());
         assert!(xfer_2.receive_utxo.is_none());
         assert!(xfer_2.change_utxo.is_some());
-        assert!(xfer_2.expiration.is_none());
-        assert!(!xfer_2.transport_endpoints.is_empty());
+        assert!(xfer_2.expiration.is_some());
+        // the channel funding consignment travels over the p2p link, so no proxy is involved
+        assert!(xfer_2.transport_endpoints.is_empty());
 
         let xfer_3 = transfers
             .iter()
@@ -518,21 +523,30 @@ fn success() {
         assert!(xfer_3.recipient_id.is_some());
         assert!(xfer_3.receive_utxo.is_some());
         assert!(xfer_3.change_utxo.is_none());
-        assert!(xfer_3.expiration.is_none());
-        assert!(!xfer_3.transport_endpoints.is_empty());
+        assert!(xfer_3.expiration.is_some());
+        assert!(xfer_3.transport_endpoints.is_empty());
 
-        // txid-based binding lookups resolve the same on-chain transaction
+        // txid filters resolve the same on-chain transaction
         let send_txid = xfer_2.txid.as_ref().expect("send txid").to_string();
         let by_txid = node_a
-            .list_transfers_by_txid(send_txid.clone())
-            .expect("node A list_transfers_by_txid");
+            .list_transfers(None, Some(send_txid.clone()))
+            .expect("node A list_transfers by txid");
         assert!(!by_txid.is_empty());
         assert!(by_txid.iter().all(|t| t.txid == xfer_2.txid));
         assert!(by_txid.iter().any(|t| t.idx == xfer_2.idx));
 
+        // asset_id + txid combine as an intersection
+        let both = node_a
+            .list_transfers(Some(asset_id.clone()), Some(send_txid.clone()))
+            .expect("node A list_transfers asset+txid");
+        assert_eq!(
+            both.iter().map(|t| t.idx).collect::<Vec<_>>(),
+            by_txid.iter().map(|t| t.idx).collect::<Vec<_>>()
+        );
+
         let txs_by_txid = node_a
-            .list_transactions_by_txid(send_txid.clone(), false)
-            .expect("node A list_transactions_by_txid");
+            .list_transactions(false, Some(send_txid.clone()))
+            .expect("node A list_transactions by txid");
         assert_eq!(txs_by_txid.len(), 1);
         assert_eq!(txs_by_txid[0].txid.to_string(), send_txid);
         assert!(matches!(
@@ -541,9 +555,12 @@ fn success() {
         ));
 
         assert!(node_a
-            .list_transfers_by_txid("0".repeat(64))
-            .expect("node A list_transfers_by_txid unknown")
+            .list_transfers(None, Some("0".repeat(64)))
+            .expect("node A list_transfers unknown txid")
             .is_empty());
+
+        // neither asset_id nor txid is rejected
+        assert!(node_a.list_transfers(None, None).is_err());
     }));
 
     node_a.shutdown();

@@ -25,6 +25,78 @@ Native external signer note:
 - Usage guide:
   - `src/uniffi_api/native-external-signer.md`
 
+## BFA validation with an external signer
+
+Use `SdkExternalUnlockRequest` to supply the Ethereum RPC endpoint when unlocking.
+The request contains no wallet password or private keys. For an initialized node
+and a `NativeExternalSigner` named `signer`, the generated Python API is:
+
+```python
+request = SdkExternalUnlockRequest(
+    ldk_chain_sync=SdkLdkChainSync.TRANSACTION_SYNC(
+        indexer_url="ssl://bitcoin-indexer.example:50002",
+    ),
+    indexer_url="ssl://bitcoin-indexer.example:50002",
+    proxy_endpoint="rpcs://rgb-proxy.example/json-rpc",
+    eth_rpc_url="https://ethereum-rpc.example",
+)
+node.unlock_with_native_external_signer_request(signer, request)
+```
+
+For a previously attached signer, call
+`node.unlock_with_attached_external_signer_request(request)`. A foreign signer is
+attached with `attach_external_signer(host, bootstrap)`; an in-process native
+signer can be attached with `attach_native_external_signer(signer)`.
+
+The Ethereum URL is forwarded to the existing RLN/rgb-lib BFA validation path.
+An explicit endpoint overrides the node's chain configuration. An omitted or
+null endpoint leaves that fallback unchanged; without either source, BFA remains
+disabled. Embedded `SdkNode.create(...)` instances use the default node config,
+so they must pass the endpoint in the request. Endpoint errors fail unlock.
+Use an RPC service for the Ethereum network backing the asset; this API does not
+add Ethereum chain-ID or finality checks.
+
+The existing flat unlock methods remain available with their original arguments
+and behavior. Existing generated clients do not need to adopt the new request
+methods unless they need BFA validation. Burn support is unchanged.
+
+Node.js/Bare bindings use the existing C entrypoints with an optional JSON field;
+see the [C binding request example](../../bindings/c-ffi/README.md#external-signer-unlock).
+
+## Mainnet API availability
+
+For a node configured for mainnet, Lightning channel/peer operations, invoices
+(including decoding and HODL invoices), payments, async payments, swaps, and onion
+messages return `RlnError::LightningUnsupportedOnMainnet` with the message:
+
+> RLN on mainnet currently supports only on-chain methods. Lightning APIs are not supported.
+
+The same guard covers `SdkNode` methods and the global `sdk_*` compatibility functions,
+and propagates through the C ABI used by Node.js/Bare integrations. It runs before
+Lightning execution, including while locked; binding argument conversion still applies.
+Bitcoin/RGB on-chain methods (including `rgbinvoice`, `decode_rgb_invoice`, asset linking,
+and transfers) and shared administration/identity methods keep their existing requirements.
+Mainnet unlock initializes the wallet and signer without the Lightning runtime. This
+applies to internal, attached-external and native-external signer entry points. The
+required `ldk_chain_sync` payload is retained but its backend is unused on mainnet.
+`node_info` reports zero active Lightning values and no RGS timestamp; `network_info`
+queries the wallet indexer on demand and can fail if that indexer is unavailable.
+Identity, signing and configured RGB VSS backup keep their existing keys and stores.
+
+Existing Lightning records do not prevent mainnet unlock; they remain inactive and are
+not decoded, replayed or recovered. Mainnet node-store persistence updates only common
+configuration, while RGB wallet backup/restore retains its existing separate store.
+This assumes no unresolved historical mainnet Lightning obligations in the supported
+rollout; unlock is not a history audit or channel recovery. See the [mainnet startup
+assumption and limitations](../../README.md) before upgrading an existing wallet.
+Lightning remains available on supported non-mainnet networks with the same wallet and
+signing policies.
+
+On all networks, canceling an asynchronous Rust SDK unlock caller does not abandon
+the unlock operation. Shutdown waits for an in-progress unlock to complete before
+stopping the node, and a shut-down handle cannot unlock again. Lock and shutdown also
+wait for an already admitted manual wallet backup before releasing its storage fence.
+
 ## Dependency layering
 
 Current internal layering is:
@@ -36,7 +108,7 @@ Important notes:
 
 - UniFFI does not call HTTP route handlers; it calls SDK methods directly.
 - SDK is expected to depend on LDK core logic (it is a wrapper, not a separate node implementation).
-- `ldk::start_ldk` now accepts `core_types::UnlockRequest` and SDK unlock uses `sdk::UnlockRequest`, so unlock flow is not typed against route-layer DTOs.
+- `ldk::start_node` accepts `core_types::UnlockRequest` and SDK unlock uses `sdk::UnlockRequest`, so unlock flow is not typed against route-layer DTOs.
 - A small `routes` diff remains for shared `AppState` transition helpers (`pub(crate)` visibility), used by SDK unlock lifecycle handling.
 
 ## E2E and parity harnesses
@@ -353,3 +425,36 @@ CI artifact packaging workflow:
   - Swift: `RGBLightningNode.xcframework`
   - Kotlin JVM host bundle: generated Kotlin sources + Linux `librgb_lightning_node.so`
   - Kotlin Android: `jniLibs` + generated Kotlin sources
+
+## External-signer burn
+
+`SdkNode.burn` accepts the same request for password and external signers. For an
+external signer, RLN prepares the burn with rgb-lib, persists an `Initiated`
+transfer to reserve its inputs, signs through `sign_rgb_psbt`, checks that the
+transaction is unchanged and finalized, then completes it through `burn_end`.
+The native external signer and attached signer host use this same path. The
+HTTP `/burn` and C `rln_burn` entry points share the implementation.
+
+BFA burns require a 32-byte `burn_recipient` and a node unlocked with the
+appropriate `eth_rpc_url`. Successful completion returns `txid` and
+`batch_transfer_idx`; use the existing consignment APIs to retrieve the burn
+proof. This burns the RGB assets, not an automatic Ethereum payout.
+
+Do not automatically retry a failed or interrupted burn. A completion error
+identifies the pending batch transfer; its reservation is deliberately retained.
+Inspect transfer history and the transaction on-chain before explicitly failing
+an unbroadcast transfer or requesting another burn. Applications still need
+durable operation tracking for lost responses and process crashes.
+
+Local funded regression (regtest services must already be running):
+
+```sh
+cargo test --locked --features uniffi,vls,test-utils --test lib_sdk \
+  external_burn_funded_and_recovery -- --nocapture
+```
+
+`RLN_BURN_BITCOIND`, `RLN_BURN_INDEXER` and `RLN_BURN_PROXY` override the default
+local regtest endpoints. The test checks the Bitcoin chain identity before
+funding and never resets or deletes the existing stack.
+
+For the funded BFA proof scenario, see [external-burn.md](../../test/external-burn.md).
