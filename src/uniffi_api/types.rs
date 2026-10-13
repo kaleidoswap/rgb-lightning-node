@@ -374,20 +374,6 @@ pub struct AssetIfa {
     pub linked_to_asset_id: Option<String>,
 }
 
-pub struct AssetBfa {
-    pub asset_id: ContractId,
-    pub ticker: String,
-    pub name: String,
-    pub details: Option<String>,
-    pub precision: u8,
-    pub initial_supply: u64,
-    pub timestamp: i64,
-    pub added_at: i64,
-    pub balance: AssetBalanceInfo,
-    pub media: Option<Media>,
-    pub reject_list_url: Option<String>,
-}
-
 pub struct RgbOutpoint {
     pub txid: String,
     pub vout: u32,
@@ -398,7 +384,6 @@ pub struct ListAssetsResponse {
     pub uda: Option<Vec<AssetUda>>,
     pub cfa: Option<Vec<AssetCfa>>,
     pub ifa: Option<Vec<AssetIfa>>,
-    pub bfa: Option<Vec<AssetBfa>>,
 }
 
 pub struct DecodeLnInvoiceResponse {
@@ -504,20 +489,6 @@ pub struct ClaimHodlInvoiceResponse {
     pub changed: bool,
 }
 
-pub struct BurnRequest {
-    pub asset_id: ContractId,
-    pub amount: u64,
-    /// Required for BFA assets: the 32-byte recipient the burned amount is released to.
-    pub burn_recipient: Option<Vec<u8>>,
-    pub fee_rate: u64,
-    pub min_confirmations: u8,
-}
-
-pub struct BurnResponse {
-    pub txid: Txid,
-    pub batch_transfer_idx: i32,
-}
-
 pub struct InflateRequest {
     pub asset_id: ContractId,
     pub inflation_amounts: Vec<u64>,
@@ -568,8 +539,6 @@ pub struct SdkUnlockRequest {
     pub password: String,
     pub ldk_chain_sync: SdkLdkChainSync,
     pub indexer_url: Option<String>,
-    // Some(url) → the wallet supports BFA assets, validating them against this Ethereum RPC.
-    pub eth_rpc_url: Option<String>,
     pub proxy_endpoint: Option<String>,
     pub announce_addresses: Vec<String>,
     pub announce_alias: Option<String>,
@@ -584,32 +553,6 @@ pub struct SdkExternalSignerBootstrap {
     pub master_fingerprint: String,
     pub protocol_version: String,
     pub api_level: u32,
-}
-
-/// Unlock parameters for an external signer; no private key or password is accepted.
-pub struct SdkExternalUnlockRequest {
-    pub ldk_chain_sync: SdkLdkChainSync,
-    pub indexer_url: Option<String>,
-    pub proxy_endpoint: Option<String>,
-    pub announce_addresses: Vec<String>,
-    pub announce_alias: Option<String>,
-    /// Ethereum RPC used for BFA validation. None preserves the node config fallback.
-    pub eth_rpc_url: Option<String>,
-}
-
-impl From<SdkExternalUnlockRequest> for crate::sdk::UnlockRequest {
-    fn from(request: SdkExternalUnlockRequest) -> Self {
-        Self {
-            password: String::new(),
-            ldk_chain_sync: request.ldk_chain_sync.into(),
-            indexer_url: request.indexer_url,
-            eth_rpc_url: request.eth_rpc_url,
-            proxy_endpoint: request.proxy_endpoint,
-            announce_addresses: request.announce_addresses,
-            announce_alias: request.announce_alias,
-            gossip_rgs_server_url: None,
-        }
-    }
 }
 
 pub struct SdkVssClearFenceRequest {

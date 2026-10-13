@@ -90,8 +90,6 @@ impl Default for NodeSection {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ChainSection {
     pub(crate) indexer_url: Option<String>,
-    // Ethereum RPC used to validate BFA consignments; the BFA schema is enabled only when set
-    pub(crate) eth_rpc_url: Option<String>,
     pub(crate) proxy_endpoint: Option<String>,
     pub(crate) indexer_timeout_secs: u64,
     pub(crate) fee_refresh_interval_secs: u64,
@@ -101,7 +99,6 @@ impl Default for ChainSection {
     fn default() -> Self {
         Self {
             indexer_url: None,
-            eth_rpc_url: None,
             proxy_endpoint: None,
             indexer_timeout_secs: DEFAULT_INDEXER_TIMEOUT_SECS,
             fee_refresh_interval_secs: DEFAULT_FEE_REFRESH_INTERVAL_SECS,
@@ -362,9 +359,6 @@ impl Config {
         if let Some(chain) = &toml.chain {
             if chain.indexer_url.is_some() {
                 self.chain.indexer_url = chain.indexer_url.clone();
-            }
-            if chain.eth_rpc_url.is_some() {
-                self.chain.eth_rpc_url = chain.eth_rpc_url.clone();
             }
             if chain.proxy_endpoint.is_some() {
                 self.chain.proxy_endpoint = chain.proxy_endpoint.clone();

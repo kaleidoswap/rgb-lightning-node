@@ -3039,7 +3039,6 @@ fn unlock_req_with(password: &str, ldk_chain_sync: LdkChainSync) -> UnlockReques
         password: password.to_string(),
         ldk_chain_sync,
         indexer_url: Some(ELECTRUM_URL_REGTEST.to_string()),
-        eth_rpc_url: None,
         proxy_endpoint: Some(PROXY_ENDPOINT_LOCAL.to_string()),
         announce_addresses: vec![],
         announce_alias: Some(s!("RLN_alias")),

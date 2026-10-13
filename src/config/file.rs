@@ -48,7 +48,6 @@ pub(crate) struct TomlAuth {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlChain {
     pub(crate) indexer_url: Option<String>,
-    pub(crate) eth_rpc_url: Option<String>,
     pub(crate) proxy_endpoint: Option<String>,
     pub(crate) indexer_timeout_secs: Option<u64>,
     pub(crate) fee_refresh_interval_secs: Option<u64>,

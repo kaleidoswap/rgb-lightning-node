@@ -658,7 +658,7 @@ def openchannel_fail_no_utxos_scenario():
             raise RuntimeError("openchannel should fail when no uncolored UTXOs are available")
         except Exception as e:
             no_utxos_err = getattr(rln.RlnError, "NoAvailableUtxos", None)
-            if isinstance(e, (rln.RlnError.Conflict, rln.RlnError.InsufficientFunds)) or (
+            if isinstance(e, rln.RlnError.Conflict) or (
                 no_utxos_err is not None and isinstance(e, no_utxos_err)
             ):
                 pass

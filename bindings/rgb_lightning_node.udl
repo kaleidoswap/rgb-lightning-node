@@ -125,12 +125,6 @@ interface SdkNode {
     [Throws=RlnError]
     ClaimHodlInvoiceResponse claimhodlinvoice(ClaimHodlInvoiceRequest request);
     [Throws=RlnError]
-    BurnResponse burn(BurnRequest request);
-    [Throws=RlnError]
-    bytes get_consignment(ContractId asset_id, Txid txid);
-    [Throws=RlnError]
-    string get_consignment_path(ContractId asset_id, Txid txid);
-    [Throws=RlnError]
     InflateResponse inflate(InflateRequest request);
     [Throws=RlnError]
     SendRgbResponse send_rgb(SendRgbRequest request);
@@ -466,20 +460,6 @@ dictionary AssetIfa {
     string? linked_to_asset_id;
 };
 
-dictionary AssetBfa {
-    ContractId asset_id;
-    string ticker;
-    string name;
-    string? details;
-    u8 precision;
-    u64 initial_supply;
-    i64 timestamp;
-    i64 added_at;
-    AssetBalanceInfo balance;
-    Media? media;
-    string? reject_list_url;
-};
-
 dictionary RgbOutpoint {
     string txid;
     u32 vout;
@@ -490,7 +470,6 @@ dictionary ListAssetsResponse {
     sequence<AssetUda>? uda;
     sequence<AssetCfa>? cfa;
     sequence<AssetIfa>? ifa;
-    sequence<AssetBfa>? bfa = null;
 };
 
 dictionary DecodeLnInvoiceResponse {
@@ -600,19 +579,6 @@ dictionary ClaimHodlInvoiceResponse {
     boolean changed;
 };
 
-dictionary BurnRequest {
-    ContractId asset_id;
-    u64 amount;
-    bytes? burn_recipient;
-    u64 fee_rate;
-    u8 min_confirmations;
-};
-
-dictionary BurnResponse {
-    Txid txid;
-    i32 batch_transfer_idx;
-};
-
 dictionary InflateRequest {
     ContractId asset_id;
     sequence<u64> inflation_amounts;
@@ -654,7 +620,6 @@ dictionary SdkUnlockRequest {
     sequence<string> announce_addresses;
     string? announce_alias;
     string? gossip_rgs_server_url = null;
-    string? eth_rpc_url = null;
 };
 
 dictionary SdkExternalSignerBootstrap {
@@ -664,15 +629,6 @@ dictionary SdkExternalSignerBootstrap {
     string master_fingerprint;
     string protocol_version;
     u32 api_level;
-};
-
-dictionary SdkExternalUnlockRequest {
-    SdkLdkChainSync ldk_chain_sync;
-    string? indexer_url = null;
-    string? proxy_endpoint = null;
-    sequence<string> announce_addresses = [];
-    string? announce_alias = null;
-    string? eth_rpc_url = null;
 };
 
 dictionary SdkVssClearFenceRequest {

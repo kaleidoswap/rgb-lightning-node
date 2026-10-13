@@ -173,9 +173,6 @@ pub enum APIError {
     #[error("Invalid asset ID: {0}")]
     InvalidAssetID(String),
 
-    #[error("Invalid burn recipient: {0}")]
-    InvalidBurnRecipient(String),
-
     #[error("Invalid assignment")]
     InvalidAssignment,
 
@@ -211,9 +208,6 @@ pub enum APIError {
 
     #[error("Trying to request fee estimation for an invalid block number")]
     InvalidEstimationBlocks,
-
-    #[error("Invalid Ethereum RPC URL: {0}")]
-    InvalidEthRpcUrl(String),
 
     #[error("Invalid expiration")]
     InvalidExpiration,
@@ -411,9 +405,6 @@ pub enum APIError {
     #[error("The provided backup has an unsupported version: {version}")]
     UnsupportedBackupVersion { version: String },
 
-    #[error("Burn is not supported by schema {0}")]
-    UnsupportedBurn(String),
-
     #[error("Inflation is not supported by schema {0}")]
     UnsupportedInflation(String),
 
@@ -505,16 +496,6 @@ impl From<RgbLibError> for APIError {
             RgbLibError::InvalidDetails { details } => APIError::InvalidDetails(details),
             RgbLibError::InvalidElectrum { details } => APIError::InvalidIndexer(details),
             RgbLibError::InvalidEstimationBlocks => APIError::InvalidEstimationBlocks,
-            RgbLibError::InvalidEthRpcUrl { details } => APIError::InvalidEthRpcUrl(details),
-            RgbLibError::InvalidBurnRecipient { len } => {
-                APIError::InvalidBurnRecipient(format!("must be 32 bytes, got {len}"))
-            }
-            RgbLibError::MissingBurnRecipient => {
-                APIError::InvalidBurnRecipient(s!("required for a BFA burn"))
-            }
-            RgbLibError::NoBurnAmount => {
-                APIError::InvalidAmount(s!("burn request with zero amount"))
-            }
             RgbLibError::InvalidExpiration => APIError::InvalidExpiration,
             RgbLibError::InvalidFeeRate { details } => APIError::InvalidFeeRate(details),
             RgbLibError::InvalidFilePath { .. } => APIError::MediaFileNotProvided,
@@ -559,9 +540,6 @@ impl From<RgbLibError> for APIError {
             }
             RgbLibError::TooHighIssuanceAmounts => {
                 APIError::InvalidAmount(s!("trying to issue too many assets"))
-            }
-            RgbLibError::UnsupportedBurn { asset_schema } => {
-                APIError::UnsupportedBurn(format!("{asset_schema}"))
             }
             RgbLibError::UnsupportedInflation { asset_schema } => {
                 APIError::UnsupportedInflation(format!("{asset_schema}"))
@@ -616,7 +594,6 @@ impl IntoResponse for APIError {
             | APIError::InvalidAttachments(_)
             | APIError::InvalidBackupPath
             | APIError::InvalidBiscuitToken
-            | APIError::InvalidBurnRecipient(_)
             | APIError::InvalidChannelID
             | APIError::InvalidConsignment
             | APIError::InvalidContractLink(_)
@@ -625,7 +602,6 @@ impl IntoResponse for APIError {
             | APIError::InvalidDescriptionHash(_)
             | APIError::InvalidDetails(_)
             | APIError::InvalidEstimationBlocks
-            | APIError::InvalidEthRpcUrl(_)
             | APIError::InvalidExpiration
             | APIError::InvalidFeeRate(_)
             | APIError::InvalidInvoice(_)
@@ -704,7 +680,6 @@ impl IntoResponse for APIError {
             | APIError::UnknownLNInvoice
             | APIError::UnknownTemporaryChannelId
             | APIError::UnlockedNode
-            | APIError::UnsupportedBurn(_)
             | APIError::UnsupportedInflation(_)
             | APIError::UnsupportedLayer1(_)
             | APIError::UnsupportedSchema(_)
@@ -847,33 +822,5 @@ mod tests {
             err.to_string(),
             "Asset schema Ifa is not supported on this network"
         );
-    }
-
-    #[test]
-    fn burn_errors_map_to_client_errors() {
-        assert!(matches!(
-            APIError::from(RgbLibError::MissingBurnRecipient),
-            APIError::InvalidBurnRecipient(_)
-        ));
-        assert!(matches!(
-            APIError::from(RgbLibError::InvalidBurnRecipient { len: 20 }),
-            APIError::InvalidBurnRecipient(_)
-        ));
-        assert!(matches!(
-            APIError::from(RgbLibError::NoBurnAmount),
-            APIError::InvalidAmount(_)
-        ));
-        assert!(matches!(
-            APIError::from(RgbLibError::UnsupportedBurn {
-                asset_schema: rgb_lib::AssetSchema::Uda,
-            }),
-            APIError::UnsupportedBurn(_)
-        ));
-        assert!(matches!(
-            APIError::from(RgbLibError::InvalidEthRpcUrl {
-                details: s!("Ethereum RPC URL is required for BFA"),
-            }),
-            APIError::InvalidEthRpcUrl(_)
-        ));
     }
 }

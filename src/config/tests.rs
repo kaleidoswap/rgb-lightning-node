@@ -32,7 +32,6 @@ fn defaults_match_hardcoded_values() {
     assert_eq!(c.auth.password_min_length, 8);
     assert_eq!(c.api.default_page_size, 100);
     assert!(c.chain.indexer_url.is_none());
-    assert!(c.chain.eth_rpc_url.is_none());
     assert!(c.chain.proxy_endpoint.is_none());
     assert!(c.node.announce_alias.is_none());
     assert!(c.node.announce_addresses.is_empty());
@@ -61,7 +60,6 @@ announce_addresses = ["1.2.3.4:9735"]
 
 [chain]
 indexer_url = "ssl://electrum.example.com:50002"
-eth_rpc_url = "https://eth.example.com"
 proxy_endpoint = "rpcs://proxy.example.com/0.2/json-rpc"
 
 [rgb]
@@ -96,10 +94,6 @@ default_page_size = 50
     assert_eq!(
         c.chain.indexer_url.as_deref(),
         Some("ssl://electrum.example.com:50002")
-    );
-    assert_eq!(
-        c.chain.eth_rpc_url.as_deref(),
-        Some("https://eth.example.com")
     );
     assert_eq!(
         c.chain.proxy_endpoint.as_deref(),

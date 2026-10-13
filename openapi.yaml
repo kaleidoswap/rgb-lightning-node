@@ -14,12 +14,7 @@ info:
     Authentication and request extraction still apply before handler execution.
     Bitcoin/RGB on-chain APIs (including RGB invoices, transfers and asset linking)
     and shared administration/identity APIs retain their existing requirements.
-    Mainnet unlock starts the wallet and signer without a Lightning runtime.
-    Historical Lightning records remain inactive and do not prevent unlock. They
-    are not decoded, replayed or recovered. The supported mainnet rollout assumes
-    no unresolved historical Lightning obligations; unlock does not verify that
-    assumption or monitor old channels. Lightning APIs on supported non-mainnet
-    networks are unchanged.
+    Lightning APIs on supported non-mainnet networks are unchanged.
   license:
     name: MIT
     url: https://mit-license.org/
@@ -502,8 +497,7 @@ paths:
         - RGB
       summary: Get a send consignment
       description: Get the hex string of the consignment bytes for a send transfer,
-        identified by its asset ID and txid (it also covers burns, where the
-        consignment is the proof of the burn). Useful to hand the consignment to
+        identified by its asset ID and txid. Useful to hand the consignment to
         the counterparty out-of-band when the node filesystem is not accessible
         from the API caller.
       requestBody:
@@ -558,27 +552,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/GetSwapResponse'
-  /burn:
-    post:
-      tags:
-        - RGB
-      summary: Burn RGB assets
-      description: Burn RGB assets on-chain. For BFA assets a 32-byte burn_recipient
-        (hex) is required, telling where the burned amount is released. The burn
-        consignment, which proves the burn, can then be retrieved with
-        /getconsignment using the asset ID and the returned txid.
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/BurnRequest'
-      responses:
-        '200':
-          description: Successful operation
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/BurnResponse'
   /inflate:
     post:
       tags:
@@ -1017,10 +990,7 @@ paths:
       tags:
         - Other
       summary: Get network info
-      description: >-
-        Get the configured Bitcoin network and height. On mainnet the height is
-        read from the wallet indexer on demand; an unavailable or wrong-network
-        indexer returns an error. Other networks report the LDK best-block height.
+      description: Get info on the Bitcoin network where the LN is running
       responses:
         '200':
           description: Successful operation
@@ -1033,10 +1003,7 @@ paths:
       tags:
         - Other
       summary: Get node info
-      description: >-
-        Get node identity, wallet account keys and Lightning information. On mainnet,
-        active Lightning counts and amounts are zero and the RGS timestamp is null.
-        Lightning amounts do not represent the on-chain BTC wallet balance.
+      description: Get the LN node's info
       responses:
         '200':
           description: Successful operation
@@ -1356,16 +1323,7 @@ paths:
       tags:
         - Other
       summary: Unlock the node
-      description: >-
-        Unlock a locked node. Mainnet starts wallet, signer and configured RGB backup
-        services without constructing or starting LDK. The required ldk_chain_sync
-        payload is parsed but its backend and gossip settings are unused on mainnet.
-        Existing Lightning records remain inactive without preventing wallet unlock.
-        Node-store persistence updates only common configuration; historical Lightning
-        records and their pending replication are preserved. RGB wallet backup and
-        restore retain their separate store. The supported rollout assumes no unresolved
-        historical mainnet Lightning obligations. Unlock does not verify that assumption,
-        inspect other devices or remote histories, or monitor old channels.
+      description: Unlock a locked node
       requestBody:
         content:
           application/json:
@@ -1386,9 +1344,8 @@ paths:
       description: >
         Builds a zip of the current RGB wallet directory and uploads it to the
         configured VSS server. Only available when the node was started with
-        --vss-url. The node's active KV state is replicated automatically on every
-        persistence event and is not affected by this endpoint. On mainnet only
-        common configuration is replicated; historical Lightning state remains inactive.
+        --vss-url. The node's KV state is replicated automatically on every
+        persistence event and is not affected by this endpoint.
       responses:
         '200':
           description: Successful operation
@@ -1414,9 +1371,7 @@ paths:
         Returns whether a backup exists on the server, its server-side version,
         whether the local wallet has changes since the last backup, and how
         many KV-stream writes are queued for retry after a replication
-        failure. On mainnet this counts common configuration retries only, excluding
-        preserved historical Lightning intents. Read-only; callable by tokens with
-        the read-only role.
+        failure. Read-only; callable by tokens with the read-only role.
       responses:
         '200':
           description: Successful operation
@@ -1452,8 +1407,7 @@ paths:
                     description: >
                       Number of KV writes that failed to replicate and are
                       queued for retry. A persistently non-zero value
-                      indicates VSS replication is degraded. On mainnet this excludes
-                      inactive historical Lightning intents.
+                      indicates VSS replication is degraded.
         '503':
           description: VSS is not configured or unreachable
   /vssclearfence:
@@ -1857,55 +1811,6 @@ components:
           type:
             - string
             - 'null'
-    AssetBFA:
-      type: object
-      required:
-        - asset_id
-        - ticker
-        - name
-        - precision
-        - initial_supply
-        - timestamp
-        - added_at
-        - balance
-      properties:
-        asset_id:
-          type: string
-          example: rgb:CJkb4YZw-jRiz2sk-~PARPio-wtVYI1c-XAEYCqO-wTfvRZ8
-        ticker:
-          type: string
-          example: USDT
-        name:
-          type: string
-          example: Tether
-        details:
-          type:
-            - string
-            - 'null'
-          example: asset details
-        precision:
-          type: integer
-          example: 6
-        initial_supply:
-          type: integer
-          example: 777
-        timestamp:
-          type: integer
-          example: 1691160565
-        added_at:
-          type: integer
-          example: 1691161979
-        balance:
-          $ref: '#/components/schemas/AssetBalanceResponse'
-        media:
-          oneOf:
-            - $ref: '#/components/schemas/Media'
-            - type: 'null'
-        reject_list_url:
-          type:
-            - string
-            - 'null'
-          example: https://some.domain/someasset/rejectlist
     AssetLinkRequest:
       type: object
       required:
@@ -2064,7 +1969,6 @@ components:
         - Uda
         - Cfa
         - Ifa
-        - Bfa
     AssetUDA:
       type: object
       required:
@@ -2111,7 +2015,6 @@ components:
         - $ref: '#/components/schemas/AssignmentNonFungible'
         - $ref: '#/components/schemas/AssignmentInflationRight'
         - $ref: '#/components/schemas/AssignmentAny'
-        - $ref: '#/components/schemas/AssignmentBridgeRight'
       discriminator:
         propertyName: type
         mapping:
@@ -2119,7 +2022,6 @@ components:
           NonFungible: '#/components/schemas/AssignmentNonFungible'
           InflationRight: '#/components/schemas/AssignmentInflationRight'
           Any: '#/components/schemas/AssignmentAny'
-          BridgeRight: '#/components/schemas/AssignmentBridgeRight'
     AssignmentAny:
       type: object
       required:
@@ -2128,14 +2030,6 @@ components:
         type:
           type: string
           enum: [Any]
-    AssignmentBridgeRight:
-      type: object
-      required:
-        - type
-      properties:
-        type:
-          type: string
-          enum: [BridgeRight]
     AssignmentFungible:
       type: object
       required:
@@ -2779,44 +2673,6 @@ components:
       enum:
         - Electrum
         - Esplora
-    BurnRequest:
-      type: object
-      required:
-        - asset_id
-        - amount
-        - fee_rate
-        - min_confirmations
-      properties:
-        asset_id:
-          type: string
-          example: rgb:CJkb4YZw-jRiz2sk-~PARPio-wtVYI1c-XAEYCqO-wTfvRZ8
-        amount:
-          type: integer
-          example: 100
-        burn_recipient:
-          type:
-            - string
-            - 'null'
-          description: Hex-encoded 32-byte recipient of the burned amount, required for BFA assets
-          example: 000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266
-        fee_rate:
-          type: integer
-          example: 5
-        min_confirmations:
-          type: integer
-          example: 1
-    BurnResponse:
-      type: object
-      required:
-        - txid
-        - batch_transfer_idx
-      properties:
-        txid:
-          type: string
-          example: 7c2c95b9c2aa0a7d140495b664de7973b76561de833f0dd84def3efa08941664
-        batch_transfer_idx:
-          type: integer
-          example: 1
     InflateRequest:
       type: object
       required:
@@ -3178,7 +3034,6 @@ components:
         - uda
         - cfa
         - ifa
-        - bfa
       properties:
         nia:
           type:
@@ -3204,12 +3059,6 @@ components:
             - 'null'
           items:
             $ref: '#/components/schemas/AssetIFA'
-        bfa:
-          type:
-            - array
-            - 'null'
-          items:
-            $ref: '#/components/schemas/AssetBFA'
     ListChannelsResponse:
       type: object
       required:
@@ -4580,13 +4429,6 @@ components:
             - string
             - 'null'
           example: 127.0.0.1:50001
-        eth_rpc_url:
-          type:
-            - string
-            - 'null'
-          description: Ethereum RPC used to validate BFA consignments. When set (here
-            or via the config file) the node supports BFA assets, otherwise BFA is disabled
-          example: http://127.0.0.1:8545
         proxy_endpoint:
           type:
             - string

@@ -146,8 +146,6 @@ pub(crate) enum LdkChainSync {
 pub(crate) struct UnlockRequest {
     pub(crate) ldk_chain_sync: LdkChainSync,
     pub(crate) indexer_url: Option<String>,
-    // enables the BFA schema when set; falls back to the `[chain]` config section when omitted
-    pub(crate) eth_rpc_url: Option<String>,
     pub(crate) proxy_endpoint: Option<String>,
     pub(crate) announce_addresses: Vec<String>,
     pub(crate) announce_alias: Option<String>,

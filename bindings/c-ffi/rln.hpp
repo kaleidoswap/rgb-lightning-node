@@ -45,8 +45,6 @@ CResultString rln_asset_metadata(const COpaqueStruct *node, const char *asset_id
 
 CResultString rln_btc_balance(const COpaqueStruct *node, bool skip_sync);
 
-CResultString rln_burn(const COpaqueStruct *node, const char *request_json);
-
 CResultString rln_cancel_hodl_invoice(const COpaqueStruct *node, const char *request_json);
 
 CResultString rln_check_indexer_url(const COpaqueStruct *node, const char *indexer_url);
@@ -77,18 +75,6 @@ void rln_free_string(char *s);
 CResultString rln_get_asset_media(const COpaqueStruct *node, const char *digest);
 
 CResultString rln_get_channel_id(const COpaqueStruct *node, const char *temporary_channel_id_hex);
-
-/// Returns `{"bytes_hex": ...}` with the consignment of an outgoing transfer (send, burn,
-/// inflation, link), e.g. the proof of a burn to hand to whoever releases the burned amount.
-CResultString rln_get_consignment(const COpaqueStruct *node,
-                                  const char *asset_id,
-                                  const char *txid);
-
-/// Returns `{"path": ...}`: the local path of the same consignment [`rln_get_consignment`]
-/// returns, to read or share the file without copying it through the FFI.
-CResultString rln_get_consignment_path(const COpaqueStruct *node,
-                                       const char *asset_id,
-                                       const char *txid);
 
 CResultString rln_get_payment(const COpaqueStruct *node,
                               const char *payment_hash_hex,

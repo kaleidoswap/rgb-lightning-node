@@ -111,18 +111,6 @@ struct PendingBroadcastTx {
 
 impl WasmChainSyncDriver {
     pub fn new(runtime_key: String, default_network: String) -> Result<Self, JsValue> {
-        let driver = Self::new_without_resume(runtime_key, default_network)?;
-        driver.persist()?;
-        driver.resume_if_running();
-        Ok(driver)
-    }
-
-    pub(crate) fn new_without_resume(
-        runtime_key: String,
-        default_network: String,
-    ) -> Result<Self, JsValue> {
-        #[cfg(test)]
-        crate::ln_node::test_utils::record_startup_call("chain_driver");
         let storage_key = format!("{WASM_CHAIN_SYNC_STORAGE_PREFIX}{runtime_key}");
         let broadcast_queue_key = format!("{WASM_LDK_BROADCAST_QUEUE_STORAGE_PREFIX}{runtime_key}");
         let loaded = load_snapshot(&storage_key)?;
@@ -142,17 +130,11 @@ impl WasmChainSyncDriver {
             state: Rc::new(RefCell::new(snapshot)),
             loop_active: Rc::new(Cell::new(false)),
         };
-        Ok(driver)
-    }
-
-    pub(crate) fn select_network(&self, network: &str) {
-        self.state.borrow_mut().network = network.to_string();
-    }
-
-    pub(crate) fn resume_if_running(&self) {
-        if self.is_running() {
-            self.ensure_background_loop();
+        driver.persist()?;
+        if driver.is_running() {
+            driver.ensure_background_loop();
         }
+        Ok(driver)
     }
 
     pub fn status(&self) -> RlnWasmChainSyncStatusData {
@@ -180,23 +162,6 @@ impl WasmChainSyncDriver {
             rebroadcast_pending,
             rebroadcast_confirmed,
             last_error: snapshot.last_error.clone(),
-        }
-    }
-
-    pub(crate) fn inactive_status(network: String) -> RlnWasmChainSyncStatusData {
-        RlnWasmChainSyncStatusData {
-            network,
-            indexer_url: None,
-            running: false,
-            poll_interval_ms: CHAIN_SYNC_DEFAULT_POLL_INTERVAL_MS,
-            latest_tip_height: None,
-            last_tip_at: None,
-            tip_regressed: false,
-            last_tip_regression_at: None,
-            last_tick_at: None,
-            rebroadcast_pending: 0,
-            rebroadcast_confirmed: 0,
-            last_error: None,
         }
     }
 
@@ -306,8 +271,6 @@ impl WasmChainSyncDriver {
             if self.loop_active.get() {
                 return;
             }
-            #[cfg(test)]
-            crate::ln_node::test_utils::record_startup_call("chain_task");
             self.loop_active.set(true);
             let driver = self.clone();
             spawn_local(async move {

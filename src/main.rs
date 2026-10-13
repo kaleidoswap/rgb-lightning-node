@@ -28,12 +28,9 @@ mod gossip;
 mod kv_store;
 mod ldk;
 mod ldk_chain_backend;
-mod mainnet_state;
-mod node_info;
 mod rgb;
 mod rgb_file_transfer;
 mod rgb_import;
-mod rgb_sweep;
 mod routes;
 mod runtime;
 mod signer;
@@ -79,14 +76,14 @@ use tracing_subscriber::{
 use crate::args::UserArgs;
 use crate::auth::conditional_auth_middleware;
 use crate::error::AppError;
-use crate::ldk::stop_node;
+use crate::ldk::stop_ldk;
 use crate::rgb_file_transfer::MAX_CONSIGNMENT_SIZE;
 use crate::rgb_import::MAX_RGB_IMPORT_BODY_BYTES;
 #[cfg(feature = "remote-signer")]
 use crate::routes::init_external_signer;
 use crate::routes::{
     address, asset_balance, asset_link, asset_metadata, async_order_new,
-    async_order_outbound_invoice, backup, btc_balance, burn, cancel_hodl_invoice, change_password,
+    async_order_outbound_invoice, backup, btc_balance, cancel_hodl_invoice, change_password,
     check_indexer_url, check_proxy_endpoint, claim_hodl_invoice, close_channel, connect_peer,
     create_utxos, decode_ln_invoice, decode_rgb_invoice, decode_swapstring, disconnect_peer,
     estimate_fee, fail_transfers, get_asset_media, get_channel_id, get_consignment, get_payment,
@@ -193,7 +190,6 @@ pub(crate) async fn app(args: UserArgs) -> Result<(Router, Arc<AppState>), AppEr
         .route("/assetmetadata", post(asset_metadata))
         .route("/backup", post(backup))
         .route("/btcbalance", post(btc_balance))
-        .route("/burn", post(burn))
         .route("/cancelhodlinvoice", post(cancel_hodl_invoice))
         .route("/changepassword", post(change_password))
         .route("/checkindexerurl", post(check_indexer_url))
@@ -362,7 +358,7 @@ async fn shutdown_signal(app_state: Arc<AppState>) {
         tracing::info!("Will shutdown after change state is complete");
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
-    stop_node(app_state.clone()).await;
+    stop_ldk(app_state.clone()).await;
 }
 
 // workaround for https://github.com/tokio-rs/tracing/issues/1372

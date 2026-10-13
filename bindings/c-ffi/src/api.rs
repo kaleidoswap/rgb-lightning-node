@@ -378,47 +378,6 @@ pub(crate) fn fail_transfers(
     json(JsonFailTransfersResponse::from(resp))
 }
 
-pub(crate) fn burn(node: &COpaqueStruct, request_json: *const c_char) -> Result<String, Error> {
-    let node = require_handle(node)?;
-    let req: JsonBurnRequest = parse_req(request_json)?;
-    let resp = node.burn(req.try_into()?)?;
-    json(JsonBurnResponse::from(resp))
-}
-
-fn parse_consignment_lookup(
-    asset_id: *const c_char,
-    txid: *const c_char,
-) -> Result<(rln::ContractId, rln::Txid), Error> {
-    let asset_id = parse_contract_id(&ptr_to_string(asset_id))?;
-    let txid = rln::Txid::from_str(&ptr_to_string(txid))
-        .map_err(|e| Error::StringParse(format!("invalid txid: {e}")))?;
-    Ok((asset_id, txid))
-}
-
-pub(crate) fn get_consignment_path(
-    node: &COpaqueStruct,
-    asset_id: *const c_char,
-    txid: *const c_char,
-) -> Result<String, Error> {
-    let node = require_handle(node)?;
-    let (asset_id, txid) = parse_consignment_lookup(asset_id, txid)?;
-    let path = node.get_consignment_path(asset_id, txid)?;
-    json(JsonGetConsignmentPathResponse { path })
-}
-
-pub(crate) fn get_consignment(
-    node: &COpaqueStruct,
-    asset_id: *const c_char,
-    txid: *const c_char,
-) -> Result<String, Error> {
-    let node = require_handle(node)?;
-    let (asset_id, txid) = parse_consignment_lookup(asset_id, txid)?;
-    let bytes = node.get_consignment(asset_id, txid)?;
-    json(JsonGetConsignmentResponse {
-        bytes_hex: bytes.to_lower_hex_string(),
-    })
-}
-
 pub(crate) fn inflate(node: &COpaqueStruct, request_json: *const c_char) -> Result<String, Error> {
     let node = require_handle(node)?;
     let req: JsonInflateRequest = parse_req(request_json)?;
@@ -811,7 +770,14 @@ pub(crate) fn sdk_node_unlock_with_native_external_signer(
     let node = require_handle(node)?;
     let signer = require_signer(signer)?;
     let r: JsonSdkExternalUnlockRequest = parse_req(request_json)?;
-    node.unlock_with_native_external_signer_request(Arc::clone(signer), r.into())?;
+    node.unlock_with_native_external_signer(
+        Arc::clone(signer),
+        r.ldk_chain_sync.into(),
+        r.indexer_url,
+        r.proxy_endpoint,
+        r.announce_addresses,
+        r.announce_alias,
+    )?;
     ok_void()
 }
 
@@ -837,6 +803,12 @@ pub(crate) fn sdk_node_unlock_with_attached_external_signer(
 ) -> Result<String, Error> {
     let node = require_handle(node)?;
     let r: JsonSdkExternalUnlockRequest = parse_req(request_json)?;
-    node.unlock_with_attached_external_signer_request(r.into())?;
+    node.unlock_with_attached_external_signer(
+        r.ldk_chain_sync.into(),
+        r.indexer_url,
+        r.proxy_endpoint,
+        r.announce_addresses,
+        r.announce_alias,
+    )?;
     ok_void()
 }

@@ -339,7 +339,6 @@ pub(crate) fn unlock_request(password: &str) -> SdkUnlockRequest {
             bitcoind_rpc_port: 18443,
         },
         indexer_url: Some("127.0.0.1:50001".to_string()),
-        eth_rpc_url: None,
         proxy_endpoint: Some(PROXY_ENDPOINT_LOCAL.to_string()),
         announce_addresses: vec![],
         announce_alias: Some("RLN_alias".to_string()),

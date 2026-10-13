@@ -40,10 +40,6 @@
 # Default RGB proxy endpoint used when /unlock does not provide one
 # (defaults to a per-network public proxy)
 #proxy_endpoint = ""
-# Default Ethereum RPC URL used when /unlock does not provide one. When set (from
-# either source) the wallet supports BFA assets, validating their consignments
-# against the bridge contract; when unset BFA is disabled
-#eth_rpc_url = ""
 # Socket timeout for the indexer client (seconds)
 #indexer_timeout_secs = 10
 # Interval between fee estimate refreshes (seconds)

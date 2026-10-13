@@ -25,7 +25,6 @@ async fn init_esplora_path_unlocks_without_bitcoind() {
             indexer_url: crate::utils::ESPLORA_URL_REGTEST.to_string(),
         },
         indexer_url: Some(crate::utils::ESPLORA_URL_REGTEST.to_string()),
-        eth_rpc_url: None,
         proxy_endpoint: Some(PROXY_ENDPOINT_LOCAL.to_string()),
         announce_addresses: vec![],
         announce_alias: None,

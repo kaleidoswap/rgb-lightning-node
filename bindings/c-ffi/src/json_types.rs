@@ -14,19 +14,18 @@ use std::str::FromStr;
 use hex::DisplayHex;
 use hex::FromHex;
 use rgb_lightning_node::{
-    AddressInfo, AssetBalanceInfo, AssetBfa, AssetCfa, AssetIfa, AssetLinkRecord,
-    AssetMediaResponse, AssetMetadataInfo, AssetNia, AssetRecipients, AssetUda, AssignmentKind,
-    BlockTime, BtcBalance, BtcBalanceInfo, BurnRequest, BurnResponse, CancelHodlInvoiceRequest,
-    Channel, ChannelId, ChannelStatus, CheckIndexerUrlResponse, ClaimHodlInvoiceRequest,
-    ClaimHodlInvoiceResponse, ContractId, DecodeLnInvoiceResponse, DecodeRgbInvoiceResponse,
-    EmbeddedMedia, EstimateFeeResponse, HtlcStatus, IfaIssuanceType, ImportRgbContractRequest,
-    ImportRgbContractResponse, ImportRgbTransferConsignmentRequest,
-    ImportRgbTransferConsignmentResponse, InflateRequest, InflateResponse, InvoiceStatus,
-    ListAssetsResponse, LnInvoiceRequest, LnInvoiceResponse, Media, MediaAttachment, NetworkInfo,
-    NodeInfo, Payment, PaymentHash, PaymentType, Peer, ProofOfReserves, PublicKey, RecipientId,
-    RgbAllocation, RgbOutpoint, RgbRecipient, SdkAssetLinkRequest, SdkCloseChannelRequest,
-    SdkCreateUtxosRequest, SdkDisconnectPeerRequest, SdkExternalSignerBootstrap,
-    SdkExternalUnlockRequest, SdkFailTransfersRequest, SdkFailTransfersResponse, SdkInitRequest,
+    AddressInfo, AssetBalanceInfo, AssetCfa, AssetIfa, AssetLinkRecord, AssetMediaResponse,
+    AssetMetadataInfo, AssetNia, AssetRecipients, AssetUda, AssignmentKind, BlockTime, BtcBalance,
+    BtcBalanceInfo, CancelHodlInvoiceRequest, Channel, ChannelId, ChannelStatus,
+    CheckIndexerUrlResponse, ClaimHodlInvoiceRequest, ClaimHodlInvoiceResponse, ContractId,
+    DecodeLnInvoiceResponse, DecodeRgbInvoiceResponse, EmbeddedMedia, EstimateFeeResponse,
+    HtlcStatus, IfaIssuanceType, ImportRgbContractRequest, ImportRgbContractResponse,
+    ImportRgbTransferConsignmentRequest, ImportRgbTransferConsignmentResponse, InflateRequest,
+    InflateResponse, InvoiceStatus, ListAssetsResponse, LnInvoiceRequest, LnInvoiceResponse, Media,
+    MediaAttachment, NetworkInfo, NodeInfo, Payment, PaymentHash, PaymentType, Peer,
+    ProofOfReserves, PublicKey, RecipientId, RgbAllocation, RgbOutpoint, RgbRecipient,
+    SdkAssetLinkRequest, SdkCloseChannelRequest, SdkCreateUtxosRequest, SdkDisconnectPeerRequest,
+    SdkExternalSignerBootstrap, SdkFailTransfersRequest, SdkFailTransfersResponse, SdkInitRequest,
     SdkIssueAssetCfaRequest, SdkIssueAssetIfaRequest, SdkIssueAssetNiaRequest,
     SdkIssueAssetUdaRequest, SdkKeysendRequest, SdkKeysendResponse, SdkLdkChainSync,
     SdkMakerExecuteRequest, SdkMakerInitRequest, SdkMakerInitResponse, SdkOpenChannelRequest,
@@ -224,8 +223,6 @@ pub(crate) struct JsonSdkUnlockRequest {
     // gossip integration (#42).
     #[serde(default)]
     pub gossip_rgs_server_url: Option<String>,
-    #[serde(default)]
-    pub eth_rpc_url: Option<String>,
 }
 
 impl From<JsonSdkUnlockRequest> for SdkUnlockRequest {
@@ -238,7 +235,6 @@ impl From<JsonSdkUnlockRequest> for SdkUnlockRequest {
             announce_addresses: j.announce_addresses,
             announce_alias: j.announce_alias,
             gossip_rgs_server_url: j.gossip_rgs_server_url,
-            eth_rpc_url: j.eth_rpc_url,
         }
     }
 }
@@ -273,21 +269,6 @@ pub(crate) struct JsonSdkExternalUnlockRequest {
     pub announce_addresses: Vec<String>,
     #[serde(default)]
     pub announce_alias: Option<String>,
-    #[serde(default)]
-    pub eth_rpc_url: Option<String>,
-}
-
-impl From<JsonSdkExternalUnlockRequest> for SdkExternalUnlockRequest {
-    fn from(request: JsonSdkExternalUnlockRequest) -> Self {
-        Self {
-            ldk_chain_sync: request.ldk_chain_sync.into(),
-            indexer_url: request.indexer_url,
-            proxy_endpoint: request.proxy_endpoint,
-            announce_addresses: request.announce_addresses,
-            announce_alias: request.announce_alias,
-            eth_rpc_url: request.eth_rpc_url,
-        }
-    }
 }
 
 // Bidirectional: Serialize for native-signer output, Deserialize for a host
@@ -1188,61 +1169,6 @@ impl From<SdkFailTransfersResponse> for JsonFailTransfersResponse {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct JsonBurnRequest {
-    pub asset_id: String,
-    pub amount: u64,
-    /// Hex-encoded; required for BFA assets (32 bytes: where the burned amount is released).
-    #[serde(default)]
-    pub burn_recipient: Option<String>,
-    pub fee_rate: u64,
-    pub min_confirmations: u8,
-}
-
-impl TryFrom<JsonBurnRequest> for BurnRequest {
-    type Error = Error;
-    fn try_from(j: JsonBurnRequest) -> Result<Self, Self::Error> {
-        Ok(BurnRequest {
-            asset_id: parse_contract_id(&j.asset_id)?,
-            amount: j.amount,
-            burn_recipient: j
-                .burn_recipient
-                .map(|r| {
-                    Vec::<u8>::from_hex(&r)
-                        .map_err(|e| Error::HexConversion(format!("invalid burn_recipient: {e}")))
-                })
-                .transpose()?,
-            fee_rate: j.fee_rate,
-            min_confirmations: j.min_confirmations,
-        })
-    }
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct JsonBurnResponse {
-    pub txid: String,
-    pub batch_transfer_idx: i32,
-}
-
-impl From<BurnResponse> for JsonBurnResponse {
-    fn from(r: BurnResponse) -> Self {
-        JsonBurnResponse {
-            txid: fmt_txid(&r.txid),
-            batch_transfer_idx: r.batch_transfer_idx,
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct JsonGetConsignmentResponse {
-    pub bytes_hex: String,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct JsonGetConsignmentPathResponse {
-    pub path: String,
-}
-
-#[derive(Debug, Deserialize)]
 pub(crate) struct JsonInflateRequest {
     pub asset_id: String,
     pub inflation_amounts: Vec<u64>,
@@ -1697,39 +1623,6 @@ impl From<AssetIfa> for JsonAssetIfa {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct JsonAssetBfa {
-    pub asset_id: String,
-    pub ticker: String,
-    pub name: String,
-    pub details: Option<String>,
-    pub precision: u8,
-    pub initial_supply: u64,
-    pub timestamp: i64,
-    pub added_at: i64,
-    pub balance: JsonAssetBalanceInfo,
-    pub media: Option<JsonMedia>,
-    pub reject_list_url: Option<String>,
-}
-
-impl From<AssetBfa> for JsonAssetBfa {
-    fn from(a: AssetBfa) -> Self {
-        JsonAssetBfa {
-            asset_id: fmt_contract_id(&a.asset_id),
-            ticker: a.ticker,
-            name: a.name,
-            details: a.details,
-            precision: a.precision,
-            initial_supply: a.initial_supply,
-            timestamp: a.timestamp,
-            added_at: a.added_at,
-            balance: a.balance.into(),
-            media: a.media.map(Into::into),
-            reject_list_url: a.reject_list_url,
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
 pub(crate) struct JsonAssetUda {
     pub asset_id: String,
     pub ticker: String,
@@ -1764,7 +1657,6 @@ pub(crate) struct JsonListAssetsResponse {
     pub uda: Option<Vec<JsonAssetUda>>,
     pub cfa: Option<Vec<JsonAssetCfa>>,
     pub ifa: Option<Vec<JsonAssetIfa>>,
-    pub bfa: Option<Vec<JsonAssetBfa>>,
 }
 
 impl From<ListAssetsResponse> for JsonListAssetsResponse {
@@ -1774,7 +1666,6 @@ impl From<ListAssetsResponse> for JsonListAssetsResponse {
             uda: r.uda.map(|v| v.into_iter().map(Into::into).collect()),
             cfa: r.cfa.map(|v| v.into_iter().map(Into::into).collect()),
             ifa: r.ifa.map(|v| v.into_iter().map(Into::into).collect()),
-            bfa: r.bfa.map(|v| v.into_iter().map(Into::into).collect()),
         }
     }
 }
@@ -2420,73 +2311,6 @@ pub(crate) struct JsonChannelIdResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn external_unlock_json() -> serde_json::Value {
-        serde_json::json!({
-            "ldk_chain_sync": {
-                "mode": "TransactionSync",
-                "config": {"indexer_url": "tcp://127.0.0.1:50001"}
-            }
-        })
-    }
-
-    #[test]
-    fn external_unlock_preserves_eth_rpc_url() {
-        let mut json = external_unlock_json();
-        json["eth_rpc_url"] = "https://ethereum.example/rpc".into();
-        json["indexer_url"] = "tcp://127.0.0.1:50002".into();
-        json["proxy_endpoint"] = "rpc://127.0.0.1:3000/json-rpc".into();
-        json["announce_addresses"] = serde_json::json!(["node.example:9735"]);
-        json["announce_alias"] = "external-bfa".into();
-        let request: JsonSdkExternalUnlockRequest = serde_json::from_value(json).unwrap();
-        let typed: SdkExternalUnlockRequest = request.into();
-
-        assert_eq!(
-            typed.eth_rpc_url.as_deref(),
-            Some("https://ethereum.example/rpc")
-        );
-        assert_eq!(typed.indexer_url.as_deref(), Some("tcp://127.0.0.1:50002"));
-        assert_eq!(
-            typed.proxy_endpoint.as_deref(),
-            Some("rpc://127.0.0.1:3000/json-rpc")
-        );
-        assert_eq!(typed.announce_addresses, ["node.example:9735"]);
-        assert_eq!(typed.announce_alias.as_deref(), Some("external-bfa"));
-        assert!(matches!(typed.ldk_chain_sync,
-            SdkLdkChainSync::TransactionSync { indexer_url }
-                if indexer_url == "tcp://127.0.0.1:50001"));
-    }
-
-    #[test]
-    fn external_unlock_accepts_omitted_and_null_eth_rpc_url() {
-        for explicit_null in [false, true] {
-            let mut json = external_unlock_json();
-            if explicit_null {
-                json["eth_rpc_url"] = serde_json::Value::Null;
-            }
-            let request: JsonSdkExternalUnlockRequest = serde_json::from_value(json).unwrap();
-            let typed: SdkExternalUnlockRequest = request.into();
-            assert!(typed.eth_rpc_url.is_none());
-            assert!(typed.indexer_url.is_none());
-            assert!(typed.proxy_endpoint.is_none());
-            assert!(typed.announce_addresses.is_empty());
-            assert!(typed.announce_alias.is_none());
-        }
-    }
-
-    #[test]
-    fn external_unlock_rejects_non_string_eth_rpc_url() {
-        for value in [
-            serde_json::json!(true),
-            serde_json::json!(123),
-            serde_json::json!([]),
-            serde_json::json!({}),
-        ] {
-            let mut json = external_unlock_json();
-            json["eth_rpc_url"] = value;
-            assert!(serde_json::from_value::<JsonSdkExternalUnlockRequest>(json).is_err());
-        }
-    }
 
     const ASSET_ID: &str = "rgb:CJkb4YZw-jRiz2sk-~PARPio-wtVYI1c-XAEYCqO-wTfvRZ8";
 

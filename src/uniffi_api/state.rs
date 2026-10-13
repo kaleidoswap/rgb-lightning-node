@@ -183,7 +183,6 @@ pub(crate) fn map_api_error(err: APIError) -> RlnError {
         | APIError::InvalidAttachments(_)
         | APIError::InvalidBackupPath
         | APIError::InvalidBiscuitToken
-        | APIError::InvalidBurnRecipient(_)
         | APIError::InvalidChannelID
         | APIError::InvalidContractLink(_)
         | APIError::InvalidRightOutpoint(_)
@@ -191,7 +190,6 @@ pub(crate) fn map_api_error(err: APIError) -> RlnError {
         | APIError::InvalidDescriptionHash(_)
         | APIError::InvalidDetails(_)
         | APIError::InvalidEstimationBlocks
-        | APIError::InvalidEthRpcUrl(_)
         | APIError::InvalidFeeRate(_)
         | APIError::InvalidInvoice(_)
         | APIError::InvalidRgbContract(_)
@@ -221,11 +219,8 @@ pub(crate) fn map_api_error(err: APIError) -> RlnError {
         | APIError::MediaFileNotProvided
         | APIError::MissingSwapPaymentPreimage
         | APIError::OutputBelowDustLimit
-        | APIError::UnsupportedBurn(_)
-        | APIError::UnsupportedSchema(_)
         | APIError::WrongPassword
         | APIError::UnsupportedBackupVersion { .. } => RlnError::InvalidRequest(msg),
-        APIError::ConsignmentNotFound => RlnError::NotFound(msg),
         APIError::RestoredBackupInconsistent(_) => RlnError::Internal(msg),
         APIError::Network(_) | APIError::NoValidTransportEndpoint => RlnError::Conflict(msg),
         APIError::ExternalSignerUnavailable(_) => RlnError::ExternalSignerUnavailable(msg),
