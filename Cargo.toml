@@ -97,7 +97,7 @@ serial_test = "3.1.1"
 tracing-test = "0.2.5"
 
 [patch.crates-io]
-rgb-lib = { git = "https://github.com/RGB-Tools/rgb-lib.git", branch = "master" }
+rgb-lib = { git = "https://github.com/kaleidoswap/rgb-lib.git", rev = "8852b2e55606ebd568f56bdfd9fa9216fbec3435" }
 lightning = { path = "./rust-lightning/lightning" }
 lightning-background-processor = { path = "./rust-lightning/lightning-background-processor"}
 

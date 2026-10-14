@@ -1,6 +1,6 @@
 use amplify::{map, s};
 use bitcoin::blockdata::locktime::absolute::LockTime;
-use bitcoin::hex::DisplayHex;
+use bitcoin::hex::{DisplayHex, FromHex};
 use bitcoin::psbt::{ExtractTxError, Psbt};
 use bitcoin::secp256k1::{All, PublicKey, Secp256k1};
 use bitcoin::{io, Amount, Network};
@@ -2267,11 +2267,43 @@ pub(crate) async fn start_ldk(
     })
     .await
     .unwrap();
-    let rgb_online = rgb_wallet.go_online(OnlineOptions {
+    let online_options = |skip_consistency_check| OnlineOptions {
         indexer_url: indexer_url.to_string(),
-        skip_consistency_check: false,
+        skip_consistency_check,
         vanilla_sync_lookback: VANILLA_SYNC_LOOKBACK,
-    })?;
+    };
+    let rgb_online = match rgb_wallet.go_online(online_options(false)) {
+        // a colored funding broadcast before its bookkeeping completed (e.g. crash while handling
+        // ChannelPending) leaves its inputs spent on-chain but unspent in the rgb-lib DB
+        Err(RgbLibError::Inconsistency { details }) => {
+            let online = rgb_wallet.go_online(online_options(true))?;
+            for entry in fs::read_dir(&ldk_data_dir)?.flatten() {
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                let Some(channel_id) = file_name.strip_prefix("pending_funding_") else {
+                    continue;
+                };
+                let channel_id = ChannelId(<[u8; 32]>::from_hex(channel_id).unwrap());
+                let funding_txid = fs::read_to_string(entry.path())?;
+                let psbt_path = ldk_data_dir.join(format!("psbt_{funding_txid}"));
+                if !is_channel_rgb(&channel_id, &ldk_data_dir) || !psbt_path.exists() {
+                    continue;
+                }
+                let psbt_str = fs::read_to_string(psbt_path)?;
+                let psbt = Psbt::from_str(&psbt_str).unwrap();
+                if psbt
+                    .unsigned_tx
+                    .input
+                    .iter()
+                    .any(|i| details.contains(&format!("\"{}\"", i.previous_output)))
+                {
+                    tracing::warn!("Completing interrupted funding of channel {channel_id}");
+                    rgb_wallet.send_end_db_update_only(online, psbt_str)?;
+                }
+            }
+            rgb_wallet.go_online(online_options(false))?
+        }
+        res => res?,
+    };
     fs::write(
         static_state
             .storage_dir_path
