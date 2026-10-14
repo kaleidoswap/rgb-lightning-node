@@ -13,6 +13,7 @@ use crate::synced_kv_store::SyncedKvStore;
 use amplify::{map, s};
 use bitcoin::blockdata::locktime::absolute::LockTime;
 use bitcoin::hashes::{sha256, Hash as BitcoinHash};
+use bitcoin::hex::FromHex;
 use bitcoin::psbt::{ExtractTxError, Psbt};
 use bitcoin::secp256k1::{All, PublicKey, Secp256k1};
 use bitcoin::Sequence;
@@ -257,6 +258,42 @@ impl_writeable_tlv_based_enum!(InvoiceType,
         (0, async_payment_recipient, (default_value, false)),
     },
 );
+
+/// Colored fundings broadcast before their rgb-lib bookkeeping completed (e.g. a crash while
+/// handling `ChannelPending`): their PSBT spends an outpoint that the rgb-lib consistency check
+/// reports as spent by another wallet. Fundings not yet broadcast never match.
+fn interrupted_colored_fundings(
+    kv_store: &dyn KVStoreSync,
+    inconsistency_details: &str,
+) -> Vec<(ChannelId, String)> {
+    let Ok(channel_ids) = kv_store.list(PENDING_FUNDING_NAMESPACE, "") else {
+        return vec![];
+    };
+    channel_ids
+        .into_iter()
+        .filter_map(|channel_id_hex| {
+            let channel_id =
+                ChannelId(<[u8; 32]>::from_hex(&channel_id_hex).ok()?);
+            if !is_channel_rgb(&channel_id, kv_store) {
+                return None;
+            }
+            let funding_txid = String::from_utf8(
+                kv_store
+                    .read(PENDING_FUNDING_NAMESPACE, "", &channel_id_hex)
+                    .ok()?,
+            )
+            .ok()?;
+            let psbt_str =
+                String::from_utf8(kv_store.read(PSBT_NAMESPACE, "", &funding_txid).ok()?).ok()?;
+            let psbt = Psbt::from_str(&psbt_str).ok()?;
+            psbt.unsigned_tx
+                .input
+                .iter()
+                .any(|i| inconsistency_details.contains(&format!("\"{}\"", i.previous_output)))
+                .then_some((channel_id, psbt_str))
+        })
+        .collect()
+}
 
 /// Save config to database (source of truth) and sync to KVStore for rust-lightning.
 fn save_config(
@@ -5435,6 +5472,7 @@ pub(crate) async fn start_ldk(
     };
     // go_online and configure_vss_backup drive blocking rgb-lib HTTP clients;
     // run them off the async runtime so they don't fail on a single-vCPU host.
+    let recovery_kv_store = Arc::clone(&kv_store);
     let (rgb_wallet, rgb_online) = tokio::task::spawn_blocking(move || {
         let mut rgb_wallet = RgbLibWallet::new(
             WalletData {
@@ -5448,11 +5486,24 @@ pub(crate) async fn start_ldk(
             keys,
         )
         .expect("valid rgb-lib wallet");
-        let rgb_online = rgb_wallet.go_online(OnlineOptions {
-            indexer_url: indexer_url_owned,
-            skip_consistency_check: false,
+        let online_options = |skip_consistency_check| OnlineOptions {
+            indexer_url: indexer_url_owned.clone(),
+            skip_consistency_check,
             vanilla_sync_lookback: 20,
-        })?;
+        };
+        let rgb_online = match rgb_wallet.go_online(online_options(false)) {
+            Err(RgbLibError::Inconsistency { details }) => {
+                let online = rgb_wallet.go_online(online_options(true))?;
+                for (channel_id, psbt_str) in
+                    interrupted_colored_fundings(recovery_kv_store.as_ref(), &details)
+                {
+                    tracing::warn!("Completing interrupted funding of channel {channel_id}");
+                    rgb_wallet.send_end_db_update_only(online, psbt_str)?;
+                }
+                rgb_wallet.go_online(online_options(false))?
+            }
+            res => res?,
+        };
         #[cfg(feature = "vss")]
         if let Some((vss_url, rgb_store_id, signing_key)) = rgb_vss_backup {
             let vss_config =
