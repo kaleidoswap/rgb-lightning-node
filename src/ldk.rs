@@ -1315,9 +1315,9 @@ async fn handle_ldk_events(
                 unlocked_state.update_taker_swap_status(&payment_hash, SwapStatus::Succeeded);
             }
 
+            let channels = unlocked_state.channel_manager.list_channels();
             let read_only_network_graph = unlocked_state.network_graph.read_only();
             let nodes = read_only_network_graph.nodes();
-            let channels = unlocked_state.channel_manager.list_channels();
 
             let node_str = |channel_id: &Option<ChannelId>| match channel_id {
                 None => String::new(),
