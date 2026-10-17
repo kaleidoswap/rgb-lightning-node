@@ -3447,9 +3447,12 @@ pub(crate) async fn node_info(
     };
     let pending_outbound_payments_sat = balances.iter().map(pending_payments_map).sum::<u64>();
 
-    let graph_lock = unlocked_state.network_graph.read_only();
-    let network_nodes = graph_lock.nodes().len();
-    let network_channels = graph_lock.channels().len();
+    // the graph locks must be released before taking any peer lock: LDK takes them in the
+    // opposite order when backfilling gossip to a peer
+    let (network_nodes, network_channels) = {
+        let graph_lock = unlocked_state.network_graph.read_only();
+        (graph_lock.nodes().len(), graph_lock.channels().len())
+    };
 
     Ok(Json(NodeInfoResponse {
         pubkey: unlocked_state.channel_manager.get_our_node_id().to_string(),
