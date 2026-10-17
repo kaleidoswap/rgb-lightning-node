@@ -142,6 +142,11 @@ pub(crate) static DEFER_PAYMENT_CLAIMABLE_ON_NODE: Mutex<Option<PublicKey>> = Mu
 #[cfg(test)]
 pub(crate) static PAYMENT_CLAIMABLE_DEFERRED: AtomicBool = AtomicBool::new(false);
 
+/// Test-only hook: run a full `update_witnesses` right after handing the funding transaction to
+/// LDK, i.e. while the funding is still unbroadcast (as the output sweeper may do)
+#[cfg(test)]
+pub(crate) static UPDATE_WITNESSES_DURING_FUNDING: AtomicBool = AtomicBool::new(false);
+
 // Test-only: a payment is never deferred for longer than this, so that a test failing to release
 // the gate fails on its own assertions instead of hanging the node's event handling
 #[cfg(test)]
@@ -834,7 +839,10 @@ async fn handle_ldk_events(
                     )?;
                     let fascia_str = fs::read_to_string(&res.details.fascia_path).unwrap();
                     let fascia: Fascia = serde_json::from_str(&fascia_str).unwrap();
-                    unlocked_state_copy.rgb_consume_fascia(fascia, None)?;
+                    // the funding is not broadcast until the peer sends funding_signed: keep its
+                    // witness out of update_witnesses (which would archive it as not found) until
+                    // ChannelPending marks it as tentative
+                    unlocked_state_copy.rgb_consume_fascia(fascia, Some(WitnessOrd::Ignored))?;
                     unlocked_state_copy.rgb_create_consignments(res.psbt.clone())?;
                     Ok((res.psbt, res.batch_transfer_idx))
                 })
@@ -918,19 +926,6 @@ async fn handle_ldk_events(
             fs::write(psbt_path, psbt.to_string()).unwrap();
 
             if let Some(asset_id) = asset_id {
-                let unlocked_state_copy = unlocked_state.clone();
-                let witness_id = funding_txid_str.clone();
-                tokio::task::spawn_blocking(move || {
-                    unlocked_state_copy
-                        .rgb_upsert_witness(
-                            RgbTxid::from_str(&witness_id).unwrap(),
-                            WitnessOrd::Tentative,
-                        )
-                        .unwrap()
-                })
-                .await
-                .unwrap();
-
                 // send the consignment to the channel counterparty over the encrypted p2p link
                 let consignment_path =
                     unlocked_state.rgb_get_send_consignment_path(&asset_id, &funding_txid_str);
@@ -1021,6 +1016,19 @@ async fn handle_ldk_events(
                         "ERROR: Channel went away before we could fund it. The peer disconnected or refused the channel.");
                 handle_open_chan_fail(&final_channel_id, &static_state, unlocked_state.clone())
                     .await;
+            }
+
+            #[cfg(test)]
+            if UPDATE_WITNESSES_DURING_FUNDING.swap(false, Ordering::SeqCst) {
+                let unlocked_state_copy = unlocked_state.clone();
+                tokio::task::spawn_blocking(move || {
+                    unlocked_state_copy
+                        .rgb_wallet_wrapper
+                        .update_witnesses(1, vec![])
+                        .unwrap()
+                })
+                .await
+                .unwrap();
             }
         }
         Event::FundingTxBroadcastSafe { .. } => {
@@ -1424,8 +1432,14 @@ async fn handle_ldk_events(
                     is_channel_rgb(&channel_id, &PathBuf::from(&static_state.ldk_data_dir));
                 tracing::info!("Initiator of the channel (colored: {})", is_chan_colored);
 
+                let funding_txid_copy = funding_txid.clone();
                 let _txid = tokio::task::spawn_blocking(move || {
                     if is_chan_colored {
+                        // the funding has now been broadcast
+                        state_copy.rgb_upsert_witness(
+                            RgbTxid::from_str(&funding_txid_copy).unwrap(),
+                            WitnessOrd::Tentative,
+                        )?;
                         // the consignment was already sent to the peer over p2p at funding time, so
                         // only perform the local DB bookkeeping here
                         state_copy
@@ -2297,6 +2311,10 @@ pub(crate) async fn start_ldk(
                     .any(|i| details.contains(&format!("\"{}\"", i.previous_output)))
                 {
                     tracing::warn!("Completing interrupted funding of channel {channel_id}");
+                    rgb_wallet.upsert_witness(
+                        RgbTxid::from_str(&funding_txid).unwrap(),
+                        WitnessOrd::Tentative,
+                    )?;
                     rgb_wallet.send_end_db_update_only(online, psbt_str)?;
                 }
             }

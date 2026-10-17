@@ -2369,6 +2369,7 @@ mod close_force_nobtc_acceptor;
 mod close_force_other_side;
 mod close_force_pending_htlc;
 mod close_force_standard;
+mod colored_funding_window;
 mod concurrent_btc_payments;
 mod concurrent_openchannel;
 mod drop_funding_signed;
