@@ -11,7 +11,7 @@ use lightning::chain;
 #[cfg(feature = "transaction-sync")]
 use lightning::chain::Confirm;
 use lightning::chain::{chainmonitor, ChannelMonitorUpdateStatus};
-use lightning::chain::{BestBlock, Filter};
+use lightning::chain::{BestBlock, Filter, WatchedOutput};
 use lightning::events::bump_transaction::{BumpTransactionEventHandler, Wallet};
 use lightning::events::{Event, PaymentFailureReason, PaymentPurpose, ReplayEvent};
 use lightning::impl_writeable_tlv_based;
@@ -75,22 +75,23 @@ use rgb_lib::{
         WitnessData,
     },
     AssetSchema, Assignment, BitcoinNetwork, ConsignmentExt, ContractId, Error as RgbLibError,
-    Fascia, FileContent, RgbTransfer, RgbTxid, WitnessOrd,
+    Fascia, FileContent, RgbTransfer, RgbTxid, TransferStatus, WitnessOrd,
 };
-use std::collections::HashMap;
+use rgbstd::vm::WitnessPos;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::BufReader;
 use std::net::ToSocketAddrs;
 use std::net::{SocketAddr, TcpListener};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
-#[cfg(test)]
 use std::time::Instant;
 use std::time::{Duration, SystemTime};
 use time::OffsetDateTime;
@@ -128,6 +129,8 @@ pub(crate) const FEE_RATE: u64 = 7;
 pub(crate) const UTXO_SIZE_SAT: u32 = 32000;
 pub(crate) const MIN_CHANNEL_CONFIRMATIONS: u8 = 6;
 const RGB_TRANSFER_CHAN_EXPIRATION_SECS: u64 = 86400;
+// a refused sweep is not retried before this delay, as the same consignment would be refused again
+const REFUSED_SWEEP_RETRY_DELAY: Duration = Duration::from_secs(600);
 const VANILLA_SYNC_LOOKBACK: u32 = 20;
 
 // Test-only: while set, the node with this pubkey defers claiming incoming payments; handling of
@@ -602,7 +605,18 @@ pub(crate) struct RgbOutputSpender {
     rgb_wallet_wrapper: Arc<RgbLibWalletWrapper>,
     keys_manager: Arc<KeysManager>,
     fs_store: Arc<FilesystemStore>,
+    chain_filter: Option<Arc<dyn Filter + Send + Sync>>,
     txes: Arc<Mutex<OutputSpenderTxes>>,
+    // descriptor sets whose sweep consignment was refused, with the time of the refusal
+    refused: Mutex<HashMap<u64, Instant>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum SweepError {
+    #[error("{0}")]
+    Failed(String),
+    #[error("{0}")]
+    Refused(String),
 }
 
 pub(crate) type OutputSweeper = ldk_sweep::OutputSweeper<
@@ -1735,6 +1749,37 @@ async fn handle_ldk_events(
     Ok(())
 }
 
+// LDK passes the descriptors in arbitrary order, so the key must not depend on it
+fn spendable_outputs_key(descriptors: &[&SpendableOutputDescriptor]) -> u64 {
+    let mut descriptor_hashes: Vec<u64> = descriptors
+        .iter()
+        .map(|d| {
+            let mut hasher = DefaultHasher::new();
+            d.hash(&mut hasher);
+            hasher.finish()
+        })
+        .collect();
+    descriptor_hashes.sort_unstable();
+    let mut hasher = DefaultHasher::new();
+    descriptor_hashes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn watched_output(descriptor: &SpendableOutputDescriptor) -> WatchedOutput {
+    let (outpoint, script_pubkey) = match descriptor {
+        SpendableOutputDescriptor::StaticPaymentOutput(d) => (d.outpoint, &d.output.script_pubkey),
+        SpendableOutputDescriptor::DelayedPaymentOutput(d) => (d.outpoint, &d.output.script_pubkey),
+        SpendableOutputDescriptor::StaticOutput {
+            outpoint, output, ..
+        } => (*outpoint, &output.script_pubkey),
+    };
+    WatchedOutput {
+        block_hash: None,
+        outpoint,
+        script_pubkey: script_pubkey.clone(),
+    }
+}
+
 impl RgbOutputSpender {
     fn try_spend_spendable_outputs(
         &self,
@@ -1745,12 +1790,15 @@ impl RgbOutputSpender {
         locktime: Option<LockTime>,
         secp_ctx: &Secp256k1<All>,
     ) -> Result<bitcoin::Transaction, String> {
-        let mut hasher = DefaultHasher::new();
-        descriptors.hash(&mut hasher);
-        let descriptors_hash = hasher.finish();
+        let descriptors_key = spendable_outputs_key(descriptors);
         let mut txes = self.txes.lock().unwrap();
-        if let Some(tx) = txes.get(&descriptors_hash) {
+        if let Some(tx) = txes.get(&descriptors_key) {
             return Ok(tx.clone());
+        }
+        if let Some(refused_at) = self.refused.lock().unwrap().get(&descriptors_key) {
+            if refused_at.elapsed() < REFUSED_SWEEP_RETRY_DELAY {
+                return Err(s!("the sweep of these outputs was recently refused"));
+            }
         }
 
         let mut vout = 0;
@@ -1758,6 +1806,7 @@ impl RgbOutputSpender {
 
         let mut txouts = outputs.clone();
         let mut asset_info: HashMap<ContractId, (u32, u64, String)> = map![];
+        let mut closing_txids = HashSet::new();
 
         for outp in descriptors {
             let outpoint = match outp {
@@ -1788,19 +1837,8 @@ impl RgbOutputSpender {
 
             vanilla_descriptor = false;
 
-            let closing_height = self
-                .rgb_wallet_wrapper
-                .get_tx_height(txid_str.clone())
-                .map_err(|e| format!("cannot get height of {txid_str}: {e}"))?
-                .ok_or_else(|| format!("transaction {txid_str} is not confirmed yet"))?;
-            let update_res = self
-                .rgb_wallet_wrapper
-                .update_witnesses(closing_height, vec![RgbTxid::from_str(&txid_str).unwrap()])
-                .map_err(|e| format!("error while updating witnesses for {txid_str}: {e}"))?;
-            if !update_res.failed.is_empty() {
-                return Err(format!(
-                    "failed to update witnesses for {txid_str}: {update_res:?}"
-                ));
+            if closing_txids.insert(txid) {
+                self.set_closing_witness_mined(&txid_str)?;
             }
 
             let contract_id = transfer_info.contract_id;
@@ -1889,14 +1927,77 @@ impl RgbOutputSpender {
         let consignments = self
             .rgb_wallet_wrapper
             .color_psbt_and_consume(&mut psbt, coloring_info)
-            .expect("coloring matches the amounts assigned to the spent outputs");
+            .map_err(|e| format!("cannot color the spendable outputs PSBT: {e}"))?;
+        let spending_txid = psbt.unsigned_tx.compute_txid().to_string();
 
+        // the consumed fascia commits to a transaction that is only broadcast if this succeeds
+        let spending_tx = self
+            .sign_and_hand_over_sweep(descriptors, psbt, consignments, secp_ctx)
+            .inspect_err(|e| {
+                if let Err(e) = self.rgb_wallet_wrapper.upsert_witness(
+                    RgbTxid::from_str(&spending_txid).unwrap(),
+                    WitnessOrd::Archived,
+                ) {
+                    tracing::error!("cannot archive the abandoned sweep {spending_txid}: {e}");
+                }
+                if let SweepError::Refused(_) = e {
+                    self.refused
+                        .lock()
+                        .unwrap()
+                        .insert(descriptors_key, Instant::now());
+                    // the colored outputs may have already been swept, possibly before a
+                    // restart: have the chain source report that spend to the sweeper
+                    if let Some(filter) = &self.chain_filter {
+                        for descriptor in descriptors {
+                            filter.register_output(watched_output(descriptor));
+                        }
+                    }
+                }
+            })
+            .map_err(|e| e.to_string())?;
+
+        txes.insert(descriptors_key, spending_tx.clone());
+        self.fs_store
+            .write("", "", OUTPUT_SPENDER_TXES, txes.encode())
+            .map_err(|e| format!("cannot persist output spender txes: {e}"))?;
+
+        Ok(spending_tx)
+    }
+
+    // Commitment and closing transactions are consumed as ignored witnesses. Only the closing one
+    // is marked as mined: a full witness update would re-resolve every witness that isn't ignored
+    // and archive the ones that are not broadcast yet, invalidating their allocations.
+    fn set_closing_witness_mined(&self, txid: &str) -> Result<(), String> {
+        let closing_height = self
+            .rgb_wallet_wrapper
+            .get_tx_height(txid.to_string())
+            .map_err(|e| format!("cannot get height of {txid}: {e}"))?
+            .and_then(NonZeroU32::new)
+            .ok_or_else(|| format!("transaction {txid} is not confirmed yet"))?;
+        // witnesses on the same layer 1 are ordered by height, the timestamp is not compared
+        let witness_pos = WitnessPos::bitcoin(closing_height, get_current_timestamp() as i64)
+            .expect("current time is after genesis");
+        self.rgb_wallet_wrapper
+            .upsert_witness(
+                RgbTxid::from_str(txid).unwrap(),
+                WitnessOrd::Mined(witness_pos),
+            )
+            .map_err(|e| format!("cannot update the witness of {txid}: {e}"))
+    }
+
+    fn sign_and_hand_over_sweep(
+        &self,
+        descriptors: &[&SpendableOutputDescriptor],
+        psbt: RgbLibPsbt,
+        consignments: Vec<RgbTransfer>,
+        secp_ctx: &Secp256k1<All>,
+    ) -> Result<bitcoin::Transaction, SweepError> {
         let mut psbt = Psbt::from_str(&psbt.to_string()).expect("valid transaction");
 
         psbt = self
             .keys_manager
             .sign_spendable_outputs_psbt(descriptors, psbt, secp_ctx)
-            .unwrap();
+            .map_err(|()| SweepError::Failed(s!("cannot sign the spendable outputs PSBT")))?;
 
         let spending_tx = match psbt.extract_tx() {
             Ok(tx) => tx,
@@ -1904,7 +2005,7 @@ impl RgbOutputSpender {
             Err(e) => panic!("should never happen: {e}"),
         };
 
-        let closing_txid = spending_tx.compute_txid().to_string();
+        let spending_txid = spending_tx.compute_txid().to_string();
 
         let handle = Handle::current();
         let _ = handle.enter();
@@ -1916,25 +2017,30 @@ impl RgbOutputSpender {
             let consignment_path = self
                 .static_state
                 .ldk_data_dir
-                .join(format!("consignment_{closing_txid}_{contract_id}"));
+                .join(format!("consignment_{spending_txid}_{contract_id}"));
             consignment
                 .save_file(&consignment_path)
-                .map_err(|e| format!("cannot save consignment: {e}"))?;
+                .map_err(|e| SweepError::Failed(format!("cannot save consignment: {e}")))?;
             let consignment_path_str = consignment_path.to_string_lossy().to_string();
             let rgb_wallet_wrapper_copy = self.rgb_wallet_wrapper.clone();
-            futures::executor::block_on(tokio::task::spawn_blocking(move || {
+            let res = futures::executor::block_on(tokio::task::spawn_blocking(move || {
                 rgb_wallet_wrapper_copy
                     .provide_out_of_band_consignment(consignment_path_str, vec![])
             }))
-            .unwrap()
-            .map_err(|e| format!("cannot provide consignment: {e}"))?;
+            .unwrap();
             fs::remove_file(&consignment_path).unwrap();
+            let refreshed =
+                res.map_err(|e| SweepError::Failed(format!("cannot provide consignment: {e}")))?;
+            // an invalid consignment fails the receive instead of returning an error
+            if refreshed
+                .values()
+                .any(|t| t.updated_status == Some(TransferStatus::Failed))
+            {
+                return Err(SweepError::Refused(format!(
+                    "the consignment of sweep {spending_txid} for {contract_id} is invalid"
+                )));
+            }
         }
-
-        txes.insert(descriptors_hash, spending_tx.clone());
-        self.fs_store
-            .write("", "", OUTPUT_SPENDER_TXES, txes.encode())
-            .map_err(|e| format!("cannot persist output spender txes: {e}"))?;
 
         Ok(spending_tx)
     }
@@ -2344,7 +2450,9 @@ pub(crate) async fn start_ldk(
         rgb_wallet_wrapper: rgb_wallet_wrapper.clone(),
         keys_manager: keys_manager.clone(),
         fs_store: fs_store.clone(),
+        chain_filter: chain_filter.clone(),
         txes,
+        refused: Mutex::new(HashMap::new()),
     });
     // `sweeper_best_block` is only used by the block-sync restart path.
     #[cfg_attr(not(feature = "block-sync"), allow(unused_variables))]
@@ -2358,7 +2466,7 @@ pub(crate) async fn start_ldk(
                 channel_manager.current_best_block(),
                 broadcaster.clone(),
                 fee_estimator.clone(),
-                None,
+                chain_filter.clone(),
                 rgb_output_spender,
                 rgb_wallet_wrapper.clone(),
                 fs_store.clone(),
@@ -2370,7 +2478,7 @@ pub(crate) async fn start_ldk(
             let read_args = (
                 broadcaster.clone(),
                 fee_estimator.clone(),
-                None,
+                chain_filter.clone(),
                 rgb_output_spender.clone(),
                 rgb_wallet_wrapper.clone(),
                 fs_store.clone(),
