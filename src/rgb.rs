@@ -12,6 +12,8 @@ use lightning::rgb_utils::{
 };
 use lightning::sign::ChangeDestinationSource;
 use lightning::util::async_poll::AsyncResult;
+#[cfg(test)]
+use rgb_lib::UpdateRes;
 use rgb_lib::{
     bdk_wallet::SignOptions,
     bitcoin::psbt::Psbt as BitcoinPsbt,
@@ -24,7 +26,7 @@ use rgb_lib::{
         Wallet as RgbLibWallet,
     },
     AssetSchema, Assignment, BitcoinNetwork, ContractId, Error as RgbLibError, Fascia, RgbTransfer,
-    RgbTxid, UpdateRes, WitnessOrd,
+    RgbTxid, WitnessOrd,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -755,6 +757,7 @@ impl RgbLibWalletWrapper {
         self.get_rgb_wallet().sync(self.online, options)
     }
 
+    #[cfg(test)]
     pub(crate) fn update_witnesses(
         &self,
         after_height: u32,
