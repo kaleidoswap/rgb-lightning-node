@@ -27,7 +27,10 @@ a comparison with `v0.2.2`, the version we applied the changes to.
 
 ## Install
 
-Clone the project, including (shallow) submodules:
+Prebuilt binaries for Linux (x86_64, aarch64), macOS (x86_64, aarch64) and
+Windows (x86_64) are attached to each [release].
+
+To build from source, clone the project, including (shallow) submodules:
 ```sh
 git clone https://github.com/RGB-Tools/rgb-lightning-node --recurse-submodules --shallow-submodules
 ```
@@ -439,6 +442,25 @@ time via the `ldk_chain_sync` field of the `/unlock` payload (see the
 Both modes are available in a stock build. See
 [Chain sync support](#chain-sync-support) to build with only one of them.
 
+In `TransactionSync` mode, requests to the indexer use a fixed 10 second
+timeout (not configurable), so an unreachable indexer makes `/unlock` fail with
+an `InvalidIndexer` error instead of hanging.
+
+## Interoperability with stock LDK nodes
+
+RLN can open and use regular (non-RGB) BTC channels with nodes running stock,
+unmodified [LDK]. Either side can open the channel, payments flow in both
+directions and the channel can be closed cooperatively.
+
+RGB channels require both peers to run RGB-aware software: a stock LDK node
+rejects the colored funding, so an RGB channel towards it never becomes usable.
+
+These scenarios are covered by tests against a stock [ldk-node] fixture, which
+are ignored by default because they need to build it. To run them:
+```sh
+cargo test interoperability -- --ignored --test-threads=1
+```
+
 ## Test
 
 Tests for a few scenarios using the regtest network are included. The same
@@ -467,11 +489,16 @@ To only run some test(s):
 
 See `./coverage.sh --help` for the available options.
 
+## Security
+
+To report a vulnerability, please follow the [security policy](SECURITY.md)
+instead of opening a public issue.
+
 ## Projects using RLN
 
 Here is a list of projects using RLN, in alphabetical order:
 - [Iris Wallet desktop]
-- [KaleidoSwap]
+- [KaleidoSwap] (RLN powers [KaleidoSwap Desktop])
 - [Lnfi]
 - [Spectrum]
 - [Thunderstack]
@@ -486,6 +513,10 @@ Here is a list of projects using RLN, in alphabetical order:
 [rust-lightning]: https://github.com/lightningdevkit/rust-lightning
 [Iris Wallet desktop]: https://github.com/RGB-Tools/iris-wallet-desktop
 [KaleidoSwap]: https://kaleidoswap.com/
+[KaleidoSwap Desktop]: https://kaleidoswap.com/products/desktop
+[LDK]: https://lightningdevkit.org/
+[ldk-node]: https://github.com/lightningdevkit/ldk-node
+[release]: https://github.com/kaleidoswap/rgb-lightning-node/releases
 [Lnfi]: https://www.lnfi.network/
 [Spectrum]: https://rgbspectrum.pages.dev/
 [Thunderstack]: https://thunderstack.org/
