@@ -91,7 +91,7 @@ async fn transaction_sync_roundtrip(test_dir_base: &str, ln_indexer_url: String)
         Some(&asset_id),
     )
     .await;
-    let _channel_23 = open_channel(
+    let channel_23 = open_channel(
         node2_addr,
         &node3_pubkey,
         Some(NODE3_PEER_PORT),
@@ -134,6 +134,12 @@ async fn transaction_sync_roundtrip(test_dir_base: &str, ln_indexer_url: String)
     close_channel(node2_addr, &channel_12.channel_id, &node1_pubkey, false).await;
     wait_for_balance(node1_addr, &asset_id, 550).await;
     wait_for_balance(node2_addr, &asset_id, 150).await;
+
+    // force close the node2 -> node3 channel: node2 already swept the cooperative close output, its
+    // force close output must still be swept
+    close_channel(node2_addr, &channel_23.channel_id, &node3_pubkey, true).await;
+    wait_for_balance(node2_addr, &asset_id, 400).await;
+    wait_for_balance(node3_addr, &asset_id, 50).await;
 }
 
 #[cfg(feature = "electrum")]
