@@ -2340,7 +2340,7 @@ pub(crate) async fn start_ldk(
                 channel_manager.current_best_block(),
                 broadcaster.clone(),
                 fee_estimator.clone(),
-                None,
+                chain_filter.clone(),
                 rgb_output_spender,
                 rgb_wallet_wrapper.clone(),
                 fs_store.clone(),
@@ -2352,7 +2352,7 @@ pub(crate) async fn start_ldk(
             let read_args = (
                 broadcaster.clone(),
                 fee_estimator.clone(),
-                None,
+                chain_filter.clone(),
                 rgb_output_spender.clone(),
                 rgb_wallet_wrapper.clone(),
                 fs_store.clone(),
